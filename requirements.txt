@@ -3,3 +3,10 @@ uvicorn
 gunicorn
 psycopg2-binary
 passlib[bcrypt]
+python-multipart
+python-dotenv
+sqlalchemy
+jinja2
+pillow
+reportlab
+xhtml2pdf
