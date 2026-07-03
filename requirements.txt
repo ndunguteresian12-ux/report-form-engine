@@ -2,7 +2,6 @@ fastapi
 uvicorn
 gunicorn
 psycopg2-binary
-psycopg
 passlib[bcrypt]
 python-multipart
 python-dotenv

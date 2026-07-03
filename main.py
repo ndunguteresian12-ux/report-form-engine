@@ -10,7 +10,7 @@ from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
-import psycopg
+import psycopg2 as psycopg
 import psycopg.errors
 from psycopg.rows import dict_row
 from dotenv import load_dotenv
