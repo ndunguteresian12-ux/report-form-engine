@@ -251,13 +251,14 @@ def login_portal():
     </body>
     </html>
     """
-
 @app.post("/api/v1/auth/login")
 def process_login(username: str = Form(...), password: str = Form(...)):
     safe_password = password[:72]
     
-    with get_db_connection(row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
+    # 1. Get the raw connection
+    with get_db_connection() as conn:
+        # 2. Create the dictionary cursor here
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM users WHERE email = %s;", (username,))
             user = cur.fetchone()
             
@@ -268,6 +269,7 @@ def process_login(username: str = Form(...), password: str = Form(...)):
                 except Exception:
                     is_valid = False
                 
+                # Logic for password migration (if stored as plain text, re-hash it)
                 if not is_valid and user['password_hash'] == password:
                     hashed_password = pwd_context.hash(safe_password)
                     cur.execute("""
@@ -297,7 +299,6 @@ def process_login(username: str = Form(...), password: str = Form(...)):
                     return response
                     
     raise HTTPException(status_code=401, detail="Invalid credential combination provided.")
-
 
 @app.get("/register", response_class=HTMLResponse)
 def public_registration_portal():
