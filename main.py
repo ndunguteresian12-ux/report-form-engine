@@ -10,8 +10,8 @@ from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
-import psycopg2 as psycopg
-import psycopg.errors
+import psycopg2
+psycopg2.errors
 from psycopg.rows import dict_row
 from dotenv import load_dotenv
 
@@ -31,32 +31,27 @@ try:
 except ImportError:
     create_client = None
 
-# --- Environment / configuration validation ---------------------------------
 # --- INITIALIZE DATABASE CONNECTION -----------------------------------------
+import os
+import logging
+from sqlalchemy import create_engine
 
+logger = logging.getLogger("cbe_engine")
+
+# Get the URL directly
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-if DATABASE_URL:
-    # If the full URL is provided, we use it directly
-    DB_CONNECTION_STRING = DATABASE_URL
-    logger.info("Using DATABASE_URL from environment for cloud connection.")
-else:
-    # Fallback to the individual components (for local development)
-    DB_NAME = os.getenv("DB_NAME", "report_form_engine")
-    DB_USER = os.getenv("DB_USER", "postgres")
-    DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-    DB_HOST = os.getenv("DB_HOST", "localhost")
-    DB_PORT = os.getenv("DB_PORT", "5432")
+if not DATABASE_URL:
+    logger.error("CRITICAL: DATABASE_URL is missing!")
+    raise ValueError("DATABASE_URL must be set in Render environment variables.")
 
-    try:
-        DB_CONNECTION_STRING = psycopg.conninfo.make_conninfo(
-            dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
-        )
-    except Exception as conninfo_err:
-        logger.error(f"Invalid database configuration: {conninfo_err}")
-        DB_CONNECTION_STRING = f"dbname={DB_NAME} user={DB_USER} host={DB_HOST} port={DB_PORT}"
+# Clean the URL to ensure it's compatible with SQLAlchemy
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
-
+# Create the engine
+engine = create_engine(DATABASE_URL)
+logger.info("Engine configured successfully.")
 @contextmanager
 def get_db_connection(row_factory=None):
     """
@@ -91,7 +86,7 @@ if os.path.exists("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # --- Global error handlers ---------------------------------------------------
-@app.exception_handler(psycopg.errors.UniqueViolation)
+@app.exception_handler(psycopg2.errors.UniqueViolation)
 async def handle_unique_violation(request: Request, exc: psycopg.errors.UniqueViolation):
     logger.warning(f"Unique constraint violation on {request.url.path}: {exc}")
     return PlainTextResponse(
@@ -100,7 +95,7 @@ async def handle_unique_violation(request: Request, exc: psycopg.errors.UniqueVi
     )
 
 
-@app.exception_handler(psycopg.errors.ForeignKeyViolation)
+@app.exception_handler(psycopg2.errors.ForeignKeyViolation)
 async def handle_fk_violation(request: Request, exc: psycopg.errors.ForeignKeyViolation):
     logger.warning(f"Foreign key violation on {request.url.path}: {exc}")
     return PlainTextResponse(
