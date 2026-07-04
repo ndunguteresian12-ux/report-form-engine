@@ -2,6 +2,7 @@ import os
 import html
 import logging
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
@@ -38,15 +39,11 @@ engine = create_engine(DATABASE_URL)
 logger.info("Engine configured successfully.")
 
 @contextmanager
-def get_db_connection(row_factory=None):
+def get_db_connection():
     conn = None
     try:
         conn = psycopg2.connect(DATABASE_URL)
-        # Use RealDictCursor to achieve the dict_row functionality
-        if row_factory:
-            yield conn.cursor(cursor_factory=RealDictCursor)
-        else:
-            yield conn.cursor()
+        yield conn  # Yield the connection object
     except psycopg2.OperationalError as e:
         logger.error(f"Database connection failure: {e}")
         raise HTTPException(status_code=503, detail="Database is temporarily unavailable.")
@@ -66,6 +63,7 @@ async def handle_fk_violation(request: Request, exc: psycopg2.errors.ForeignKeyV
 def bootstrap_database_schema():
     """Initializes tables ensuring strict data schema compliance and indices."""
     with get_db_connection() as conn:
+        # Create a cursor from the connection object yielded by the context manager
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS schools (
@@ -73,7 +71,7 @@ def bootstrap_database_schema():
                     name VARCHAR(255) NOT NULL,
                     sub_county VARCHAR(255) NOT NULL,
                     physical_address VARCHAR(255) NOT NULL,
-                    logo_url VARCHAR(512), -- Expanded to support cloud URL length strings cleanly
+                    logo_url VARCHAR(512),
                     wallet_balance NUMERIC(12, 2) DEFAULT 0.00,
                     theme_color VARCHAR(50) DEFAULT 'emerald'
                 );
@@ -92,27 +90,27 @@ def bootstrap_database_schema():
                     id SERIAL PRIMARY KEY,
                     email VARCHAR(255) UNIQUE NOT NULL,
                     password_hash VARCHAR(255) NOT NULL,
-                    role VARCHAR(50) NOT NULL, -- 'admin' or 'staff'
+                    role VARCHAR(50) NOT NULL,
                     school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
                     is_verified BOOLEAN DEFAULT TRUE
                 );
 
                 CREATE TABLE IF NOT EXISTS classes (
                     id SERIAL PRIMARY KEY,
-                    grade_name VARCHAR(100) NOT NULL,         -- e.g., 'Grade 7', 'Grade 8'
-                    education_level VARCHAR(100) NOT NULL    -- e.g., 'Junior School'
+                    grade_name VARCHAR(100) NOT NULL,
+                    education_level VARCHAR(100) NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS students (
                     id SERIAL PRIMARY KEY,
                     school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    class_id INTEGER REFERENCES classes(id) ON DELETE CASCADE, -- Linked class reference
+                    class_id INTEGER REFERENCES classes(id) ON DELETE CASCADE,
                     admission_number VARCHAR(100) NOT NULL,
                     first_name VARCHAR(100) NOT NULL,
                     last_name VARCHAR(100) NOT NULL,
                     stream VARCHAR(50) NOT NULL,
-                    education_level VARCHAR(100) NOT NULL, -- 'Junior School', 'Upper Primary', 'Lower Primary'
-                    status VARCHAR(50) DEFAULT 'ACTIVE',    -- Supports checking status != 'GRADUATED'
+                    education_level VARCHAR(100) NOT NULL,
+                    status VARCHAR(50) DEFAULT 'ACTIVE',
                     knec_lan VARCHAR(100) DEFAULT 'N/A',
                     UNIQUE(school_id, admission_number)
                 );
@@ -128,12 +126,13 @@ def bootstrap_database_schema():
                     id SERIAL PRIMARY KEY,
                     student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
                     learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
-                    cycle_name VARCHAR(50) NOT NULL, -- 'Opener', 'Midterm', 'End Term'
+                    cycle_name VARCHAR(50) NOT NULL,
                     raw_score NUMERIC(5, 2) NOT NULL,
                     entered_by_user_id INTEGER REFERENCES users(id),
                     UNIQUE(student_id, learning_area_id, cycle_name)
                 );
             """)
+
             classes_payload = [
                 (1, 'Grade 1', 'Lower Primary'), (2, 'Grade 2', 'Lower Primary'), (3, 'Grade 3', 'Lower Primary'),
                 (4, 'Grade 4', 'Upper Primary'), (5, 'Grade 5', 'Upper Primary'), (6, 'Grade 6', 'Upper Primary'),
@@ -144,9 +143,13 @@ def bootstrap_database_schema():
                     INSERT INTO classes (id, grade_name, education_level)
                     VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING;
                 """, (class_id, grade_name, education_level))
+
             cur.execute("""
                 SELECT setval(pg_get_serial_sequence('classes', 'id'), COALESCE((SELECT MAX(id) FROM classes), 1));
             """)
+            
+            # Commit the transaction so changes are saved to the database
+            conn.commit()
 
             subjects_payload = [
                 ('Junior School', 'Mathematics'), ('Junior School', 'English'), ('Junior School', 'Kiswahili'),
