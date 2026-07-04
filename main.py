@@ -1,126 +1,66 @@
 import os
-import re
 import html
-import uuid
 import logging
-import urllib.parse
-from contextlib import contextmanager
-
-from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from passlib.context import CryptContext
-import psycopg2
-psycopg2.errors
-from psycopg.rows import dict_row
 from dotenv import load_dotenv
+
+import psycopg2
+import psycopg2.extras
+from psycopg2.extras import RealDictCursor
+from sqlalchemy import create_engine
+from contextlib import contextmanager
 
 load_dotenv()
 
-# --- Logging ---------------------------------------------------------------
+# Logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("cbe_engine")
 
 app = FastAPI(title="Kenyan CBE Multi-Tenant Enterprise Engine")
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# --- SAFELY ADD SUPABASE CLIENT CONDITIONAL IMPORT ------------------------
-try:
-    from supabase import create_client
-except ImportError:
-    create_client = None
-
-# --- INITIALIZE DATABASE CONNECTION -----------------------------------------
-import os
-import logging
-from sqlalchemy import create_engine
-
-logger = logging.getLogger("cbe_engine")
-
-# Get the URL directly
+# --- DATABASE INITIALIZATION ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     logger.error("CRITICAL: DATABASE_URL is missing!")
     raise ValueError("DATABASE_URL must be set in Render environment variables.")
 
-# Clean the URL to ensure it's compatible with SQLAlchemy
+# Clean the URL for SQLAlchemy
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
-# Create the engine
+# Configure Engine
 engine = create_engine(DATABASE_URL)
 logger.info("Engine configured successfully.")
+
 @contextmanager
 def get_db_connection(row_factory=None):
-    """
-    Central place to obtain a database connection. Ensures failures surface as
-    a clean HTTP 503 instead of an unhandled crash, and always closes the
-    connection when done.
-    """
     conn = None
     try:
-        conn = psycopg.connect(DB_CONNECTION_STRING, row_factory=row_factory)
-        try:
-            yield conn
-        finally:
+        conn = psycopg2.connect(DATABASE_URL)
+        # Use RealDictCursor to achieve the dict_row functionality
+        if row_factory:
+            yield conn.cursor(cursor_factory=RealDictCursor)
+        else:
+            yield conn.cursor()
+    except psycopg2.OperationalError as e:
+        logger.error(f"Database connection failure: {e}")
+        raise HTTPException(status_code=503, detail="Database is temporarily unavailable.")
+    finally:
+        if conn:
             conn.close()
-    except psycopg.OperationalError as db_conn_err:
-        logger.error(f"Database connection failure: {db_conn_err}")
-        raise HTTPException(status_code=503, detail="Database is temporarily unavailable. Please try again shortly.")
-
-
-def esc(value) -> str:
-    """Escape a value for safe interpolation into HTML templates."""
-    if value is None:
-        return ""
-    return html.escape(str(value), quote=True)
-
-
-UPLOAD_DIR = "static/logos"
-ALLOWED_LOGO_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-MAX_LOGO_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-if os.path.exists("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# --- Global error handlers ---------------------------------------------------
+# --- Exception Handlers (using psycopg2) ---
 @app.exception_handler(psycopg2.errors.UniqueViolation)
-async def handle_unique_violation(request: Request, exc: psycopg.errors.UniqueViolation):
-    logger.warning(f"Unique constraint violation on {request.url.path}: {exc}")
-    return PlainTextResponse(
-        "That record already exists (duplicate email, admission number, or similar unique field).",
-        status_code=409,
-    )
-
+async def handle_unique_violation(request: Request, exc: psycopg2.errors.UniqueViolation):
+    return PlainTextResponse("Record already exists.", status_code=409)
 
 @app.exception_handler(psycopg2.errors.ForeignKeyViolation)
-async def handle_fk_violation(request: Request, exc: psycopg.errors.ForeignKeyViolation):
-    logger.warning(f"Foreign key violation on {request.url.path}: {exc}")
-    return PlainTextResponse(
-        "That request references a record that doesn't exist (invalid class, student, or school reference).",
-        status_code=400,
-    )
-
-
-@app.exception_handler(psycopg.Error)
-async def handle_db_error(request: Request, exc: psycopg.Error):
-    logger.error(f"Unhandled database error on {request.url.path}: {exc}")
-    return PlainTextResponse(
-        "A database error occurred while processing your request. Please try again.",
-        status_code=500,
-    )
-
-
-@app.exception_handler(Exception)
-async def handle_unexpected_error(request: Request, exc: Exception):
-    logger.exception(f"Unhandled exception on {request.url.path}")
-    return PlainTextResponse(
-        "An unexpected error occurred. Please try again, and contact support if it persists.",
-        status_code=500,
-    )
-
+async def handle_fk_violation(request: Request, exc: psycopg2.errors.ForeignKeyViolation):
+    return PlainTextResponse("Invalid reference (foreign key violation).", status_code=400)
 
 # --- Automated Database Schema Architecture Optimization ---
 def bootstrap_database_schema():
