@@ -1,4 +1,6 @@
 import os
+import uuid
+from markupsafe import escape as esc
 import html
 import logging
 from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile
@@ -19,6 +21,9 @@ load_dotenv()
 # Logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("cbe_engine")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 app = FastAPI(title="Kenyan CBE Multi-Tenant Enterprise Engine")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -432,7 +437,7 @@ async def register_new_tenant_pipeline(
     hashed_password = pwd_context.hash(safe_password)
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT id FROM users WHERE email = %s;", (admin_email,))
             if cur.fetchone():
                 raise HTTPException(status_code=400, detail="Registration Refused: Email already allocated.")
@@ -476,11 +481,13 @@ def administrative_dashboard(school_id: int, request: Request):
             detail="Access Denied: You do not have administrative privileges for this institution."
         )
 
-    with get_db_connection(row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
+    # Use the connection context manager directly
+    with get_db_connection() as conn:
+    # Use RealDictCursor to get dictionary-like rows
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
-            
+        
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             
