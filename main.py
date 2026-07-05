@@ -39,14 +39,27 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL must be set in Render environment variables.")
 
+import psycopg2
+import os
+from contextlib import contextmanager
+
+# 1. Simple Context Manager
 @contextmanager
 def get_db_connection():
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
     try:
         yield conn
     finally:
         conn.close()
-        cur.execute("""
+
+# 2. Bootstrap Function
+def bootstrap_database_schema():
+    """Initializes tables and populates base data."""
+    print("Bootstrapping database schema...")
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # Create Tables
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS schools (
                     id SERIAL PRIMARY KEY,
                     name VARCHAR(255) NOT NULL,
@@ -113,25 +126,18 @@ def get_db_connection():
                     UNIQUE(student_id, learning_area_id, cycle_name)
                 );
             """)
-    classes_payload = [
+
+            # Populate Classes
+            classes_payload = [
                 (1, 'Grade 1', 'Lower Primary'), (2, 'Grade 2', 'Lower Primary'), (3, 'Grade 3', 'Lower Primary'),
                 (4, 'Grade 4', 'Upper Primary'), (5, 'Grade 5', 'Upper Primary'), (6, 'Grade 6', 'Upper Primary'),
                 (7, 'Grade 7', 'Junior School'), (8, 'Grade 8', 'Junior School'), (9, 'Grade 9', 'Junior School'),
             ]
-    for class_id, grade_name, education_level in classes_payload:
-                cur.execute("""
-                    INSERT INTO classes (id, grade_name, education_level)
-                    VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING;
-                """, (class_id, grade_name, education_level))
+            for class_id, grade, level in classes_payload:
+                cur.execute("INSERT INTO classes (id, grade_name, education_level) VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING;", (class_id, grade, level))
 
-    cur.execute("""
-                SELECT setval(pg_get_serial_sequence('classes', 'id'), COALESCE((SELECT MAX(id) FROM classes), 1));
-            """)
-            
-            # Commit the transaction so changes are saved to the database
-    conn.commit()
-
-    subjects_payload = [
+            # Populate Subjects
+            subjects_payload = [
                 ('Junior School', 'Mathematics'), ('Junior School', 'English'), ('Junior School', 'Kiswahili'),
                 ('Junior School', 'Creative arts and sports.'), ('Junior School', 'Integrated science.'),
                 ('Junior School', 'Agriculture'), ('Junior School', 'Social studies'),
@@ -144,18 +150,14 @@ def get_db_connection():
                 ('Lower Primary', 'Environment studies'), ('Lower Primary', 'Science'),
                 ('Lower Primary', 'Creative activities'), ('Lower Primary', 'Social studies')
             ]
-    for lvl, name in subjects_payload:
-                cur.execute("""
-                    INSERT INTO learning_areas (education_level, name) 
-                    VALUES (%s, %s) ON CONFLICT (education_level, name) DO NOTHING;
-                """, (lvl, name))
-    conn.commit()
+            for lvl, name in subjects_payload:
+                cur.execute("INSERT INTO learning_areas (education_level, name) VALUES (%s, %s) ON CONFLICT (education_level, name) DO NOTHING;", (lvl, name))
+            
+            conn.commit()
+            print("Database initialized successfully.")
 
-try:
-    bootstrap_database_schema()
-except Exception as schema_err:
-    print(f"[Warning] Database schema bootstrap omitted or deferred: {schema_err}")
-
+# 3. Call it on startup
+bootstrap_database_schema()
 # --- Core Business & CBE Analytics Helper Logic ---
 def evaluate_performance_metrics(score: float) -> dict:
     try:
