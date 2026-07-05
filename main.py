@@ -50,6 +50,14 @@ def get_db_connection():
     finally:
         if conn:
             conn.close()
+
+ALLOWED_LOGO_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+MAX_LOGO_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
+UPLOAD_DIR = "uploads" # Ensure this folder exists
+
+# Ensure the upload directory exists on startup
+import os
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 # --- Exception Handlers (using psycopg2) ---
 @app.exception_handler(psycopg2.errors.UniqueViolation)
 async def handle_unique_violation(request: Request, exc: psycopg2.errors.UniqueViolation):
