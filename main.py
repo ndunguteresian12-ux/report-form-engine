@@ -38,18 +38,22 @@ if DATABASE_URL.startswith("postgres://"):
 engine = create_engine(DATABASE_URL)
 logger.info("Engine configured successfully.")
 
+from contextlib import contextmanager
+import psycopg2
+import os
+
 @contextmanager
 def get_db_connection():
     conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
-        yield conn  # Yield the connection object
-    except psycopg2.OperationalError as e:
-        logger.error(f"Database connection failure: {e}")
-        raise HTTPException(status_code=503, detail="Database is temporarily unavailable.")
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        yield conn  # Use 'yield' to provide the connection to the 'with' block
+    except Exception as e:
+        print(f"DATABASE CONNECTION ERROR: {str(e)}") 
+        raise e 
     finally:
         if conn:
-            conn.close()
+            conn.close() # Ensure the connection is closed after use
 
 ALLOWED_LOGO_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
 MAX_LOGO_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
@@ -240,7 +244,7 @@ def login_portal():
             <form action="/api/v1/auth/login" method="post" class="space-y-4">
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">Access Email</label>
-                    <input type="email" name="username" class="w-full p-3 border rounded-lg mt-1 focus:ring-2 focus:ring-emerald-600 outline-none" required>
+                    <input type="email" name="email" class="w-full p-3 border rounded-lg mt-1 focus:ring-2 focus:ring-emerald-600 outline-none" required>
                 </div>
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">Security Passphrase</label>
@@ -259,15 +263,15 @@ def login_portal():
     </body>
     </html>
     """
+
 @app.post("/api/v1/auth/login")
-def process_login(username: str = Form(...), password: str = Form(...)):
+def process_login(email: str = Form(...), password: str = Form(...)):
     safe_password = password[:72]
     
-    # 1. Get the raw connection
     with get_db_connection() as conn:
-        # 2. Create the dictionary cursor here
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM users WHERE email = %s;", (username,))
+            # Querying using the correct column 'email'
+            cur.execute("SELECT * FROM users WHERE email = %s;", (email,))
             user = cur.fetchone()
             
             if user:
@@ -277,7 +281,7 @@ def process_login(username: str = Form(...), password: str = Form(...)):
                 except Exception:
                     is_valid = False
                 
-                # Logic for password migration (if stored as plain text, re-hash it)
+                # Logic for password migration
                 if not is_valid and user['password_hash'] == password:
                     hashed_password = pwd_context.hash(safe_password)
                     cur.execute("""
@@ -302,9 +306,12 @@ def process_login(username: str = Form(...), password: str = Form(...)):
                         httponly=True,
                         samesite="lax",
                         secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
-                        max_age=60 * 60 * 24 * 7,  # 7 days
+                        max_age=60 * 60 * 24 * 7,
                     )
                     return response
+    
+    # If no user found or password invalid
+    raise HTTPException(status_code=401, detail="Invalid credentials")
                     
     raise HTTPException(status_code=401, detail="Invalid credential combination provided.")
 
