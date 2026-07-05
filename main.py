@@ -1,25 +1,31 @@
 import os
 import uuid
-from markupsafe import escape as esc
 import html
 import logging
-from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile 
-from supabase import create_client
-from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
-from fastapi.responses import PlainTextResponse
-from fastapi.staticfiles import StaticFiles
-from passlib.context import CryptContext
-from dotenv import load_dotenv
-
+import bcrypt
 import psycopg2
-import psycopg2.extras
-from psycopg2.extras import RealDictCursor
-from sqlalchemy import create_engine
 from contextlib import contextmanager
 
-load_dotenv()
+from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from supabase import create_client
+from dotenv import load_dotenv
+from psycopg2.extras import RealDictCursor
+from sqlalchemy import create_engine
 
-# Logging
+# Ensure load_dotenv is called immediately
+load_dotenv()
+# --- Security: Direct bcrypt implementation ---
+def get_password_hash(password: str) -> str:
+    """Hashes a password using bcrypt."""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifies a password against a stored hash."""
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+# --- Logging & Initialization ---
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("cbe_engine")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -27,63 +33,20 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 app = FastAPI(title="Kenyan CBE Multi-Tenant Enterprise Engine")
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# --- DATABASE INITIALIZATION ---
+# --- Database Setup ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not DATABASE_URL:
-    logger.error("CRITICAL: DATABASE_URL is missing!")
     raise ValueError("DATABASE_URL must be set in Render environment variables.")
-
-# Clean the URL for SQLAlchemy
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
-
-# Configure Engine
-engine = create_engine(DATABASE_URL)
-logger.info("Engine configured successfully.")
-
-from contextlib import contextmanager
-import psycopg2
-import os
 
 @contextmanager
 def get_db_connection():
-    conn = None
+    conn = psycopg2.connect(DATABASE_URL)
     try:
-        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-        yield conn  # Use 'yield' to provide the connection to the 'with' block
-    except Exception as e:
-        print(f"DATABASE CONNECTION ERROR: {str(e)}") 
-        raise e 
+        yield conn
     finally:
-        if conn:
-            conn.close() # Ensure the connection is closed after use
-
-ALLOWED_LOGO_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
-MAX_LOGO_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
-UPLOAD_DIR = "uploads" # Ensure this folder exists
-
-# Ensure the upload directory exists on startup
-import os
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-# --- Exception Handlers (using psycopg2) ---
-@app.exception_handler(psycopg2.errors.UniqueViolation)
-async def handle_unique_violation(request: Request, exc: psycopg2.errors.UniqueViolation):
-    return PlainTextResponse("Record already exists.", status_code=409)
-
-@app.exception_handler(psycopg2.errors.ForeignKeyViolation)
-async def handle_fk_violation(request: Request, exc: psycopg2.errors.ForeignKeyViolation):
-    return PlainTextResponse("Invalid reference (foreign key violation).", status_code=400)
-
-# --- Automated Database Schema Architecture Optimization ---
-def bootstrap_database_schema():
-    """Initializes tables ensuring strict data schema compliance and indices."""
-    with get_db_connection() as conn:
-        # Create a cursor from the connection object yielded by the context manager
-        with conn.cursor() as cur:
-            cur.execute("""
+        conn.close()
+        cur.execute("""
                 CREATE TABLE IF NOT EXISTS schools (
                     id SERIAL PRIMARY KEY,
                     name VARCHAR(255) NOT NULL,
@@ -150,26 +113,25 @@ def bootstrap_database_schema():
                     UNIQUE(student_id, learning_area_id, cycle_name)
                 );
             """)
-
-            classes_payload = [
+    classes_payload = [
                 (1, 'Grade 1', 'Lower Primary'), (2, 'Grade 2', 'Lower Primary'), (3, 'Grade 3', 'Lower Primary'),
                 (4, 'Grade 4', 'Upper Primary'), (5, 'Grade 5', 'Upper Primary'), (6, 'Grade 6', 'Upper Primary'),
                 (7, 'Grade 7', 'Junior School'), (8, 'Grade 8', 'Junior School'), (9, 'Grade 9', 'Junior School'),
             ]
-            for class_id, grade_name, education_level in classes_payload:
+    for class_id, grade_name, education_level in classes_payload:
                 cur.execute("""
                     INSERT INTO classes (id, grade_name, education_level)
                     VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING;
                 """, (class_id, grade_name, education_level))
 
-            cur.execute("""
+    cur.execute("""
                 SELECT setval(pg_get_serial_sequence('classes', 'id'), COALESCE((SELECT MAX(id) FROM classes), 1));
             """)
             
             # Commit the transaction so changes are saved to the database
-            conn.commit()
+    conn.commit()
 
-            subjects_payload = [
+    subjects_payload = [
                 ('Junior School', 'Mathematics'), ('Junior School', 'English'), ('Junior School', 'Kiswahili'),
                 ('Junior School', 'Creative arts and sports.'), ('Junior School', 'Integrated science.'),
                 ('Junior School', 'Agriculture'), ('Junior School', 'Social studies'),
@@ -182,12 +144,12 @@ def bootstrap_database_schema():
                 ('Lower Primary', 'Environment studies'), ('Lower Primary', 'Science'),
                 ('Lower Primary', 'Creative activities'), ('Lower Primary', 'Social studies')
             ]
-            for lvl, name in subjects_payload:
+    for lvl, name in subjects_payload:
                 cur.execute("""
                     INSERT INTO learning_areas (education_level, name) 
                     VALUES (%s, %s) ON CONFLICT (education_level, name) DO NOTHING;
                 """, (lvl, name))
-            conn.commit()
+    conn.commit()
 
 try:
     bootstrap_database_schema()
