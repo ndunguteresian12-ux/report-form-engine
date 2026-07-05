@@ -3,7 +3,8 @@ import uuid
 from markupsafe import escape as esc
 import html
 import logging
-from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile
+from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile 
+from supabase import create_client
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles

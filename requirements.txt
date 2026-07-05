@@ -10,3 +10,4 @@ jinja2
 pillow
 reportlab
 xhtml2pdf
+supabase
