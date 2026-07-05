@@ -2,7 +2,7 @@ fastapi
 uvicorn
 gunicorn
 psycopg2-binary
-passlib[bcrypt]
+bcrypt
 python-multipart
 python-dotenv
 sqlalchemy
@@ -11,3 +11,4 @@ pillow
 reportlab
 xhtml2pdf
 supabase
+markupsafe
