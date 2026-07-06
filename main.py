@@ -33,7 +33,14 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 app = FastAPI(title="Kenyan CBE Multi-Tenant Enterprise Engine")
+# --- Configuration Constants ---
+ALLOWED_LOGO_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+MAX_LOGO_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
+UPLOAD_DIR = "uploads"
 
+# Ensure the directory exists
+import os
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 # --- Database Setup ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
