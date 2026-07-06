@@ -577,28 +577,12 @@ def administrative_dashboard(school_id: int, request: Request):
             detail="Access Denied: You do not have administrative privileges for this institution."
         )
 
-    # Use the connection context manager directly
     with get_db_connection() as conn:
-    # Use RealDictCursor to get dictionary-like rows
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
-        
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
-            
-            cur.execute("""
-                SELECT s.id, s.admission_number, s.first_name, s.last_name, s.stream, 
-                       c.grade_name, c.education_level
-                FROM students s
-                JOIN classes c ON s.class_id = c.id
-                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
-                ORDER BY c.id ASC, s.stream ASC, s.admission_number ASC;
-            """, (school_id,))
-            students = cur.fetchall()
-            
-            cur.execute("SELECT id, email, is_verified FROM users WHERE school_id = %s AND role='staff';", (school_id,))
-            staff_members = cur.fetchall()
             
             cur.execute("""
                 SELECT DISTINCT c.id, c.grade_name, s.stream, c.education_level
@@ -612,47 +596,15 @@ def administrative_dashboard(school_id: int, request: Request):
     if not school:
         raise HTTPException(status_code=404, detail="Institution Tenant Context Missed.")
     
-    st = settings or {
-        'active_term': 'Term 1', 
-        'active_cycle': 'End Term', 
-        'opening_date': '', 
-        'closing_date': '', 
-        'is_single_stream': False
-    }
+    st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'opening_date': '', 'closing_date': '', 'is_single_stream': False}
     is_single_stream = st.get('is_single_stream', False)
-
-    # Dynamic Student Rows Generation
-    student_rows = ""
-    for s in students:
-        display_stream = "Single Stream" if (is_single_stream or not s['stream'] or s['stream'].upper() == "SINGLE STREAM") else s['stream']
-        stream_td = "" if is_single_stream else f"<td class='p-4 text-slate-600 font-medium'>{display_stream}</td>"
-        
-        student_rows += f"""
-            <tr class='border-b border-slate-100 hover:bg-slate-50/80 transition-colors text-sm text-slate-700'>
-                <td class='p-4 font-mono font-medium text-slate-500'>{esc(s['admission_number'])}</td>
-                <td class='p-4 font-semibold text-slate-900'>{esc(s['first_name'])} {esc(s['last_name'])}</td>
-                <td class='p-4'>
-                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-800">{s['grade_name']}</span>
-                    <span class="text-xs text-slate-400 ml-1">({s['education_level']})</span>
-                </td>
-                {stream_td}
-                <td class='p-4 text-right'>
-                    <a href='/admin/scores/manage/{school_id}?student_id={s['id']}' class='inline-flex items-center font-bold text-xs text-blue-600 hover:text-blue-800 transition'>Modify Scores →</a>
-                </td>
-            </tr>
-        """
 
     # Dynamic Class Cards Generation
     class_blocks = []
     for c in classes:
         is_stream_blank = not c['stream'] or c['stream'].strip() == "" or c['stream'].upper() == "SINGLE STREAM"
-        
-        if is_single_stream or is_stream_blank:
-            display_title = c['grade_name']
-            stream_param = "SINGLE STREAM"
-        else:
-            display_title = f"{c['grade_name']} — Stream: {esc(c['stream'])}"
-            stream_param = c['stream']
+        display_title = c['grade_name'] if (is_single_stream or is_stream_blank) else f"{c['grade_name']} — {c['stream']}"
+        stream_param = "SINGLE STREAM" if (is_single_stream or is_stream_blank) else c['stream']
         
         encoded_grade = urllib.parse.quote(c['grade_name'])
         encoded_stream = urllib.parse.quote(stream_param)
@@ -662,231 +614,56 @@ def administrative_dashboard(school_id: int, request: Request):
             <div class='bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs hover:shadow-md transition-all flex flex-col justify-between group'>
                 <div>
                     <span class='text-[10px] bg-slate-100 text-slate-600 px-2.5 py-1 rounded-md font-bold uppercase tracking-wider'>{c['education_level']}</span>
-                    <h3 class='text-base font-black text-slate-800 mt-2.5 group-hover:text-slate-900'>{display_title}</h3>
+                    <h3 class='text-base font-black text-slate-800 mt-2.5'>{display_title}</h3>
                 </div>
                 <div class='grid grid-cols-2 gap-2 mt-5'>
-                    <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-blue-950 hover:bg-blue-900 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
-                    <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
+                    <button onclick="loadRoster('{c['grade_name']}', '{stream_param}')" class='bg-slate-800 text-white text-xs py-2 rounded-xl font-semibold hover:bg-slate-900 cursor-pointer'>View List</button>
+                    <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition'>Print</a>
                 </div>
             </div>
         """)
+    
     class_blocks_html = "".join(class_blocks)
-    stream_header_th = "" if is_single_stream else "<th class='p-4 text-slate-500 font-semibold'>Stream</th>"
-
-    # Robust Logo configuration injection
-    logo_html = ""
-    logo_src = school.get('logo_url')
-    if logo_src:
-        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
-        logo_html = f"""
-        <a href='/admin/school/update-logo/{school_id}' class='w-11 h-11 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-center p-1.5 shadow-2xs hover:border-emerald-400 transition' title='Update school logo'>
-            <img src='{final_src}' class='max-w-full max-h-full object-contain' />
-        </a>
-        """
-    else:
-        logo_html = f"""
-        <a href='/admin/school/update-logo/{school_id}' class='w-11 h-11 rounded-xl bg-slate-50 border border-dashed border-slate-300 flex items-center justify-center text-slate-400 hover:border-emerald-400 hover:text-emerald-600 transition text-[9px] font-bold text-center leading-tight' title='Add school logo'>
-            ADD<br/>LOGO
-        </a>
-        """
 
     return HTMLResponse(f"""
     <!DOCTYPE html>
     <html class="h-full">
     <head>
-        <title>Control Deck - {esc(school['name'])}</title>
+        <title>Dashboard - {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
-    </head>
-    <body class="bg-[#F8FAFC] text-slate-800 antialiased min-h-full flex flex-col relative">
-        
-        <header class="bg-white border-b border-slate-200/80 px-8 py-4 flex justify-between items-center sticky top-0 z-40 backdrop-blur-md bg-white/90 shadow-2xs">
-            <div class="flex items-center space-x-4">
-                {logo_html}
-                <div>
-                    <h1 class="text-base font-bold text-slate-900 tracking-tight">{esc(school['name'])}</h1>
-                    <p class="text-xs text-slate-500">{esc(school['physical_address'])} • {esc(school['sub_county'])} Sub-County</p>
-                </div>
-            </div>
-            <div class="flex items-center space-x-3 text-xs font-semibold mr-14">
-                <span class="bg-slate-50 text-slate-700 px-3 py-2 rounded-xl border border-slate-200/60 shadow-2xs">System Wallet: <span class="text-slate-900 font-bold">KSh {float(school['wallet_balance']):,.2f}</span></span>
-                <span class="bg-blue-950 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
-            </div>
-        </header>
-
-        <div class="fixed top-4 right-4 z-50">
-            <button onclick="document.getElementById('settingsModal').classList.remove('hidden')" class="bg-white hover:bg-slate-100 text-slate-700 p-2.5 rounded-full border border-slate-200 shadow-md transition duration-200 cursor-pointer flex items-center justify-center">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5 animate-[spin_12s_linear_infinite]">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.43l-1.003.767a1.123 1.123 0 0 0-.417 1.03c.004.074.006.148.006.222 0 .074-.002.148-.006.222a1.123 1.123 0 0 0 .417 1.03l1.003.767a1.125 1.125 0 0 1 .26 1.43l-1.296 2.247a1.125 1.125 0 0 1-1.37.49l-1.216-.456a1.125 1.125 0 0 0-1.076.124a6.57 6.57 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281a1.125 1.125 0 0 0-.646-.87a6.512 6.512 0 0 1-.22-.127c-.331-.182-.581-.495-.644-.869l-.213-1.281a1.125 1.125 0 0 1 .26-1.43l1.003-.767a1.12 1.12 0 0 0 .417-1.03a6.445 6.445 0 0 1-.006-.222c0-.074.002-.148.006-.222a1.12 1.12 0 0 0-.417-1.03l-1.003-.767a1.125 1.125 0 0 1-.26-1.43l1.296-2.247a1.125 1.125 0 0 1 1.37-.49l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128c.332-.183.582-.495.644-.869l.214-1.28Z" />
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
-                </svg>
-            </button>
-        </div>
-
-        <div class="p-8 max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">
-            <div class="lg:col-span-2 space-y-8">
-                <div>
-                    <div class="flex items-center justify-between mb-4">
-                        <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Classroom Cohorts Grouping</h2>
-                    </div>
-                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                        {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No registered student profiles logged inside streams.</p>"}
-                    </div>
-                </div>
-
-                <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs overflow-hidden">
-                    <div class="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50/40">
-                        <div>
-                            <h2 class="text-base font-bold text-slate-900">🗂️ Master School Ledger Roster</h2>
-                            <p class="text-xs text-slate-400 mt-0.5">Active database context monitoring active operational tiers</p>
-                        </div>
-                        <a href="/admin/student/new/{school_id}" class="bg-blue-950 hover:bg-blue-900 text-white text-xs px-3.5 py-2 rounded-xl font-semibold transition shadow-xs">+ Register New Student</a>
-                    </div>
-                    <div class="overflow-x-auto">
-                        <table class="w-full text-left border-collapse">
-                            <thead>
-                                <tr class="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-100">
-                                    <th class="p-4">Adm No.</th>
-                                    <th class="p-4">Full Student Name</th>
-                                    <th class="p-4">Education Segment</th>
-                                    {stream_header_th}
-                                    <th class="p-4 text-right">Operations</th>
-                                </tr>
-                            </tbody>
-                            <tbody>
-                                {student_rows or "<tr><td colspan='5' class='text-center p-8 text-slate-400 text-sm italic'>No active institutional records logged.</td></tr>"}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-
-            <div class="space-y-6">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-4">
-                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400 border-b border-slate-100 pb-3">⚙️ Core Parameters</h2>
-                    <form action="/api/v1/settings/update/{school_id}" method="post" class="space-y-4">
-                        <div class="grid grid-cols-2 gap-3">
-                            <div>
-                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Academic Term</label>
-                                <select name="active_term" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
-                                    <option value="Term 1" {"selected" if st['active_term'] == 'Term 1' else ""}>Term 1</option>
-                                    <option value="Term 2" {"selected" if st['active_term'] == 'Term 2' else ""}>Term 2</option>
-                                    <option value="Term 3" {"selected" if st['active_term'] == 'Term 3' else ""}>Term 3</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Assessment Phase</label>
-                                <select name="active_cycle" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
-                                    <option value="Opener" {"selected" if st['active_cycle'] == 'Opener' else ""}>Opener Exam</option>
-                                    <option value="Midterm" {"selected" if st['active_cycle'] == 'Midterm' else ""}>Midterm Exam</option>
-                                    <option value="End Term" {"selected" if st['active_cycle'] == 'End Term' else ""}>End Term Synthesis</option>
-                                </select>
-                            </div>
-                        </div>
-                        
-                        <div class="bg-slate-50 p-3 rounded-xl border border-slate-100 flex items-center justify-between">
-                            <div>
-                                <label class="text-xs font-bold text-slate-800 block">Single Stream Mode</label>
-                                <span class="text-[10px] text-slate-400 block">Hides class sorting columns</span>
-                            </div>
-                            <input type="checkbox" name="is_single_stream" value="true" {"checked" if is_single_stream else ""} class="w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500 cursor-pointer">
-                        </div>
-
-                        <div class="grid grid-cols-2 gap-2">
-                            <div>
-                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Opening Date</label>
-                                <input type="date" name="opening_date" value="{esc(st['opening_date'])}" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
-                            </div>
-                            <div>
-                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Closing Date</label>
-                                <input type="date" name="closing_date" value="{esc(st['closing_date'])}" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
-                            </div>
-                        </div>
-                        <input type="hidden" name="theme_color" value="emerald">
-                        <button type="submit" class="w-full bg-blue-950 hover:bg-blue-900 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">Commit Engine Settings</button>
-                    </form>
-
-                    <div class="mt-2 pt-4 border-t border-slate-100">
-                        <form action="/api/v1/school/promote-classes/{school_id}" method="post" 
-                              onsubmit="return confirm('CRITICAL WARNING: Are you sure you want to promote all active student cohorts up 1 Grade Level? Grade 9 cohorts will safely move into Graduated Status.');">
-                            <button type="submit" class="w-full bg-amber-50 border border-amber-200/80 text-amber-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-amber-100/70 transition cursor-pointer">
-                                🔄 Advance All Classes 1 Year
-                            </button>
-                        </form>
-                    </div>
-                </div>
-
-                <div class="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-4">
-                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400 border-b border-slate-100 pb-3">💳 Wallet Billing</h2>
-                    <form action="/api/v1/wallet/stkpush/{school_id}" method="post" class="space-y-3">
-                        <div>
-                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Lipa na M-PESA Phone Number</label>
-                            <input type="text" name="phone_number" placeholder="07XXXXXXXX" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400" required>
-                        </div>
-                        <div>
-                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Topup Amount (KSh)</label>
-                            <input type="number" name="amount" value="500" min="10" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400" required>
-                        </div>
-                        <button type="submit" class="w-full bg-emerald-600 text-white text-xs py-2.5 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs cursor-pointer">🚀 Request STK Push</button>
-                    </form>
-                </div>
-            </div>
-        </div>
-
-        <div id="settingsModal" class="hidden fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-            <div class="bg-white rounded-2xl border shadow-xl max-w-md w-full overflow-hidden">
-                <div class="p-5 border-b flex justify-between items-center bg-slate-50">
-                    <h3 class="font-black text-slate-800 text-base">⚙️ System Node Configurations</h3>
-                    <button onclick="document.getElementById('settingsModal').classList.add('hidden')" class="text-slate-400 hover:text-slate-600 font-bold text-sm cursor-pointer">✕</button>
-                </div>
+        <script>
+            async function loadRoster(grade, stream) {{
+                const modal = document.getElementById('rosterModal');
+                const content = document.getElementById('modalContent');
+                document.getElementById('modalTitle').innerText = grade + (stream !== 'SINGLE STREAM' ? ' - ' + stream : '');
+                content.innerHTML = 'Loading...';
+                modal.classList.remove('hidden');
                 
-                <form action="/api/v1/settings/update/{school_id}" method="post" class="p-6 space-y-4 text-xs">
-                    <div>
-                        <label class="block font-bold text-slate-600 mb-1">Active Operations Term</label>
-                        <select name="active_term" class="w-full border border-slate-200 p-2 rounded-lg font-semibold bg-white">
-                            <option value="Term 1" {"selected" if st['active_term'] == 'Term 1' else ""}>Term 1</option>
-                            <option value="Term 2" {"selected" if st['active_term'] == 'Term 2' else ""}>Term 2</option>
-                            <option value="Term 3" {"selected" if st['active_term'] == 'Term 3' else ""}>Term 3</option>
-                        </select>
-                    </div>
+                try {{
+                    const response = await fetch(`/api/v1/students/list/{school_id}?grade=${{encodeURIComponent(grade)}}&stream=${{encodeURIComponent(stream)}}`);
+                    const data = await response.text();
+                    content.innerHTML = data;
+                }} catch (e) {{
+                    content.innerHTML = 'Error loading roster.';
+                }}
+            }}
+        </script>
+    </head>
+    <body class="bg-[#F8FAFC] min-h-full">
+        <div class="p-8 max-w-7xl mx-auto">
+            <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-4">🏫 Classroom Cohorts</h2>
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+                {class_blocks_html or "<p>No classes found.</p>"}
+            </div>
+        </div>
 
-                    <div>
-                        <label class="block font-bold text-slate-600 mb-1">Active Evaluation Cycle</label>
-                        <select name="active_cycle" class="w-full border border-slate-200 p-2 rounded-lg font-semibold bg-white">
-                            <option value="Opener" {"selected" if st['active_cycle'] == 'Opener' else ""}>Opener Phase</option>
-                            <option value="Midterm" {"selected" if st['active_cycle'] == 'Midterm' else ""}>Midterm Cycle</option>
-                            <option value="End Term" {"selected" if st['active_cycle'] == 'End Term' else ""}>End Term Synthesis</option>
-                        </select>
-                    </div>
-
-                    <div class="grid grid-cols-2 gap-3">
-                        <div>
-                            <label class="block font-bold text-slate-600 mb-1">Opening Date</label>
-                            <input type="date" name="opening_date" value="{esc(st['opening_date'])}" required class="w-full border border-slate-200 p-2 rounded-lg font-semibold text-slate-700">
-                        </div>
-                        <div>
-                            <label class="block font-bold text-slate-600 mb-1">Closing Date</label>
-                            <input type="date" name="closing_date" value="{esc(st['closing_date'])}" required class="w-full border border-slate-200 p-2 rounded-lg font-semibold text-slate-700">
-                        </div>
-                    </div>
-
-                    <div>
-                        <label class="block font-bold text-slate-600 mb-1">Theme Branding Color</label>
-                        <select name="theme_color" class="w-full border border-slate-200 p-2 rounded-lg font-semibold bg-white">
-                            <option value="emerald">Emerald Dynamic Green</option>
-                            <option value="indigo">Indigo Corporate Blue</option>
-                            <option value="slate">Slate Minimalistic Gray</option>
-                        </select>
-                    </div>
-
-                    <div class="pt-4 border-t flex justify-end space-x-2">
-                        <button type="button" onclick="document.getElementById('settingsModal').classList.add('hidden')" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold py-2 px-4 rounded-xl cursor-pointer">Cancel</button>
-                        <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2 px-5 rounded-xl shadow-xs cursor-pointer">Save Settings</button>
-                    </div>
-                </form>
+        <div id="rosterModal" class="hidden fixed inset-0 bg-slate-900/50 flex items-center justify-center p-4 z-50">
+            <div class="bg-white rounded-2xl w-full max-w-2xl max-h-[80vh] flex flex-col overflow-hidden">
+                <div class="p-4 border-b flex justify-between items-center bg-slate-50">
+                    <h3 id="modalTitle" class="font-bold">Class Roster</h3>
+                    <button onclick="document.getElementById('rosterModal').classList.add('hidden')" class="font-bold">✕</button>
+                </div>
+                <div id="modalContent" class="p-6 overflow-y-auto"></div>
             </div>
         </div>
     </body>
@@ -935,6 +712,21 @@ def add_student_view(school_id: int):
     </body>
     </html>
     """
+@app.get("/api/v1/students/list/{school_id}", response_class=HTMLResponse)
+def get_student_list(school_id: int, grade: str, stream: str):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT s.admission_number, s.first_name, s.last_name 
+                FROM students s 
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND c.grade_name = %s AND s.stream = %s
+                ORDER BY s.admission_number ASC;
+            """, (school_id, grade, stream))
+            students = cur.fetchall()
+            
+    rows = "".join([f"<li class='py-2 border-b'>{s['admission_number']} - {s['first_name']} {s['last_name']}</li>" for s in students])
+    return f"<ul>{rows or 'No students found.'}</ul>"
 
 @app.get("/staff/register-panel/{school_id}", response_class=HTMLResponse)
 def staff_registration_panel(school_id: int):
