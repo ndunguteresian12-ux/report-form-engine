@@ -424,7 +424,7 @@ async def register_new_tenant_pipeline(
                 INSERT INTO schools (name, sub_county, physical_address, logo_url, wallet_balance, theme_color)
                 VALUES (%s, %s, %s, %s, 0.00, 'emerald') RETURNING id;
             """, (school_name, sub_county, physical_address, logo_resolved_url))
-            new_school_id = cur.fetchone()[0]
+            new_school_id = cur.fetchone()['id']
 
             cur.execute("""
                 INSERT INTO school_settings (school_id, active_year, active_term, active_cycle, closing_date, opening_date)
