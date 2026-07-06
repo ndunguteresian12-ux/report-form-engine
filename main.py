@@ -1330,7 +1330,12 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                 mid_avg = (midterm_sum / mid_count) if mid_count > 0 else 0.0
                 end_avg = (endterm_sum / end_count) if end_count > 0 else 0.0
 
-                logo_markup = f'<img src="/{school["logo_url"]}" style="width:105px; height:105px; object-fit:contain; margin-right:16px;" />' if school['logo_url'] else f'<div style="width:105px; height:105px; border:3px solid {theme["hex"]}; display:flex; align-items:center; justify-content:center; font-weight:bold; margin-right:16px; font-size:14px;">CREST</div>'
+                report_logo_src = school.get('logo_url')
+                if report_logo_src:
+                    report_final_logo_src = report_logo_src if report_logo_src.startswith("http") else f"/{report_logo_src.lstrip('/')}"
+                    logo_markup = f'<img src="{report_final_logo_src}" style="width:105px; height:105px; object-fit:contain; margin-right:16px;" />'
+                else:
+                    logo_markup = f'<div style="width:105px; height:105px; border:3px solid {theme["hex"]}; display:flex; align-items:center; justify-content:center; font-weight:bold; margin-right:16px; font-size:14px;">CREST</div>'
 
                 report_cards_html.append(f"""
                 <div class="report-card-container" style="background: white; padding: 24px; border: 5px solid {theme['hex']}; border-radius: 12px; max-width: 820px; box-sizing: border-box; margin: 0 auto; font-family: 'Arial', sans-serif; display: flex; flex-direction: column; justify-content: space-between;">
