@@ -47,6 +47,12 @@ UPLOAD_DIR = "uploads"
 # Ensure the directory exists
 import os
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Serve locally-saved logos (fallback path only — Supabase Storage is primary
+# and durable; this local mount is a safety net and will NOT survive a
+# redeploy on Render since local disk is ephemeral there).
+app.mount(f"/{UPLOAD_DIR}", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
 # --- Database Setup ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -446,6 +452,118 @@ async def register_new_tenant_pipeline(
     """)
 
 
+@app.get("/admin/school/update-logo/{school_id}", response_class=HTMLResponse)
+def update_school_logo_form(school_id: int, request: Request):
+    session_school_id = request.cookies.get("session_school_id")
+    if not session_school_id:
+        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
+    if str(session_school_id) != str(school_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: You do not have administrative privileges for this institution."
+        )
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+    logo_src = school.get('logo_url')
+    current_logo_html = ""
+    if logo_src:
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        current_logo_html = f"""
+        <div class="mb-4">
+            <p class="text-xs font-bold text-slate-600 mb-2">Current Logo</p>
+            <img src='{final_src}' class="w-24 h-24 object-contain border rounded-xl p-1 bg-slate-50" />
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Update School Logo</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-900 flex items-center justify-center min-h-screen font-sans p-6">
+        <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
+            <h2 class="text-xl font-black text-slate-800 mb-1">Update School Logo</h2>
+            <p class="text-xs text-slate-400 mb-6">{esc(school['name'])}</p>
+
+            {current_logo_html}
+
+            <form action="/api/v1/school/update-logo/{school_id}" method="post" enctype="multipart/form-data" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">New Logo Image File</label>
+                    <input type="file" name="logo_file" accept="image/*" class="w-full p-2.5 border rounded-lg mt-1 bg-white" required>
+                </div>
+                <div class="flex items-center justify-between pt-2">
+                    <a href="/admin/dashboard/{school_id}" class="text-slate-500 font-bold hover:underline text-xs">← Back to Dashboard</a>
+                    <button type="submit" class="bg-emerald-700 text-white px-6 py-3 rounded-lg font-black tracking-wide hover:bg-emerald-800 transition shadow-md text-xs">Upload Logo</button>
+                </div>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/api/v1/school/update-logo/{school_id}")
+async def update_school_logo_submit(school_id: int, request: Request, logo_file: UploadFile = File(...)):
+    session_school_id = request.cookies.get("session_school_id")
+    if not session_school_id:
+        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
+    if str(session_school_id) != str(school_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: You do not have administrative privileges for this institution."
+        )
+
+    if not logo_file or not logo_file.filename:
+        raise HTTPException(status_code=400, detail="A logo image file is required.")
+
+    file_extension = os.path.splitext(logo_file.filename)[1].lower()
+    if file_extension not in ALLOWED_LOGO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported logo file type. Use PNG, JPG, GIF, or WEBP.")
+
+    contents = await logo_file.read()
+    if len(contents) > MAX_LOGO_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="Logo file is too large (5MB max).")
+
+    safe_filename = f"logo_{uuid.uuid4().hex}{file_extension}"
+    logo_resolved_url = None
+
+    # 1. Primary Cloud Architecture Path: Process via Supabase Client Gate
+    if supabase_client:
+        try:
+            supabase_client.storage.from_("logos").upload(
+                path=safe_filename,
+                file=contents,
+                file_options={"content-type": logo_file.content_type}
+            )
+            logo_resolved_url = supabase_client.storage.from_("logos").get_public_url(safe_filename)
+        except Exception as storage_err:
+            logger.error(f"Supabase Cloud upload failed, reverting locally: {storage_err}")
+
+    # 2. Fallback Pipeline Path: Write asset block to local server disk
+    if not logo_resolved_url:
+        local_path = f"{UPLOAD_DIR}/{safe_filename}"
+        try:
+            with open(local_path, "wb") as f:
+                f.write(contents)
+            logo_resolved_url = f"/{local_path}"
+        except OSError as io_err:
+            logger.error(f"Failed to save uploaded logo locally: {io_err}")
+            raise HTTPException(status_code=500, detail="Could not save the uploaded logo. Please try again.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE schools SET logo_url = %s WHERE id = %s;", (logo_resolved_url, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
+
+
 @app.get("/admin/dashboard/{school_id}", response_class=HTMLResponse)
 def administrative_dashboard(school_id: int, request: Request):  
     session_school_id = request.cookies.get("session_school_id")
@@ -561,9 +679,15 @@ def administrative_dashboard(school_id: int, request: Request):
     if logo_src:
         final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
         logo_html = f"""
-        <div class='w-11 h-11 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-center p-1.5 shadow-2xs'>
+        <a href='/admin/school/update-logo/{school_id}' class='w-11 h-11 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-center p-1.5 shadow-2xs hover:border-emerald-400 transition' title='Update school logo'>
             <img src='{final_src}' class='max-w-full max-h-full object-contain' />
-        </div>
+        </a>
+        """
+    else:
+        logo_html = f"""
+        <a href='/admin/school/update-logo/{school_id}' class='w-11 h-11 rounded-xl bg-slate-50 border border-dashed border-slate-300 flex items-center justify-center text-slate-400 hover:border-emerald-400 hover:text-emerald-600 transition text-[9px] font-bold text-center leading-tight' title='Add school logo'>
+            ADD<br/>LOGO
+        </a>
         """
 
     return HTMLResponse(f"""
