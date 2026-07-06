@@ -1,10 +1,16 @@
 import os
+import re
 import uuid
 import html
+import urllib.parse
 import logging
 import bcrypt
 import psycopg2
 from contextlib import contextmanager
+
+# Used throughout the HTML-rendering routes to escape user-supplied text
+# before splicing it into inline HTML (prevents XSS).
+esc = html.escape
 
 from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
@@ -254,13 +260,13 @@ def process_login(email: str = Form(...), password: str = Form(...)):
             if user:
                 is_valid = False
                 try:
-                    is_valid = pwd_context.verify(safe_password, user['password_hash'])
+                    is_valid = verify_password(safe_password, user['password_hash'])
                 except Exception:
                     is_valid = False
                 
                 # Logic for password migration
                 if not is_valid and user['password_hash'] == password:
-                    hashed_password = pwd_context.hash(safe_password)
+                    hashed_password = get_password_hash(safe_password)
                     cur.execute("""
                         UPDATE users 
                         SET password_hash = %s 
@@ -406,7 +412,7 @@ async def register_new_tenant_pipeline(
                 raise HTTPException(status_code=500, detail="Could not save the uploaded logo. Please try again.")
 
     safe_password = admin_password[:72]
-    hashed_password = pwd_context.hash(safe_password)
+    hashed_password = get_password_hash(safe_password)
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -852,8 +858,8 @@ def delete_staff_permanently(staff_id: int, school_id: int):
 
 @app.get("/admin/scores/manage/{school_id}", response_class=HTMLResponse)
 def manage_individual_scores_view(school_id: int, student_id: int):
-    with get_db_connection(row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
             student = cur.fetchone()
             if not student:
@@ -947,8 +953,8 @@ def educators_bulk_entry_grid(
     learning_area_id: int = None, 
     cycle_name: str = "End Term"
 ):
-    with get_db_connection(row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
             
@@ -1053,8 +1059,8 @@ def educators_bulk_entry_grid(
 @app.get("/api/v1/reports/bulk-print/{school_id}", response_class=HTMLResponse)
 def output_batch_class_report_forms(school_id: int, grade_name: str, education_level: str, stream: str):
     # Utilizing connection context manager/pool cleanly
-    with get_db_connection(row_factory=dict_row) as conn:
-        with conn.cursor() as cur:
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # 1. Look up institutional profiles dynamically
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
@@ -1449,7 +1455,7 @@ def add_staff_node(school_id: int, email: str = Form(...), password: str = Form(
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
 
     safe_staff_password = password[:72]
-    hashed_password = pwd_context.hash(safe_staff_password)
+    hashed_password = get_password_hash(safe_staff_password)
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
