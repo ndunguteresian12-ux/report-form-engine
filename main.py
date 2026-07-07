@@ -621,26 +621,80 @@ def administrative_dashboard(school_id: int, request: Request):
     }
     is_single_stream = st.get('is_single_stream', False)
 
-    # Dynamic Student Rows Generation
-    student_rows = ""
+    # Group students by class+stream for stat cards and the sidebar roster panel
+    grouped_students = {}
+    class_group_order = []
     for s in students:
-        display_stream = "Single Stream" if (is_single_stream or not s['stream'] or s['stream'].upper() == "SINGLE STREAM") else s['stream']
-        stream_td = "" if is_single_stream else f"<td class='p-4 text-slate-600 font-medium'>{display_stream}</td>"
-        
-        student_rows += f"""
-            <tr class='border-b border-slate-100 hover:bg-slate-50/80 transition-colors text-sm text-slate-700'>
-                <td class='p-4 font-mono font-medium text-slate-500'>{esc(s['admission_number'])}</td>
-                <td class='p-4 font-semibold text-slate-900'>{esc(s['first_name'])} {esc(s['last_name'])}</td>
-                <td class='p-4'>
-                    <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-800">{s['grade_name']}</span>
-                    <span class="text-xs text-slate-400 ml-1">({s['education_level']})</span>
-                </td>
-                {stream_td}
-                <td class='p-4 text-right'>
-                    <a href='/admin/scores/manage/{school_id}?student_id={s['id']}' class='inline-flex items-center font-bold text-xs text-blue-600 hover:text-blue-800 transition'>Modify Scores →</a>
-                </td>
-            </tr>
-        """
+        disp_stream = "Single Stream" if (is_single_stream or not s['stream'] or s['stream'].upper() == "SINGLE STREAM") else s['stream']
+        key = (s['grade_name'], disp_stream, s['education_level'], s['stream'])
+        if key not in grouped_students:
+            grouped_students[key] = []
+            class_group_order.append(key)
+        grouped_students[key].append(s)
+
+    total_students = len(students)
+    total_grades = len({c['grade_name'] for c in classes})
+    total_sections = len(classes)
+    total_levels = len({c['education_level'] for c in classes})
+
+    stats_html = f"""
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
+            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Total Students</p>
+            <p class="text-2xl font-black text-slate-900 mt-1">{total_students}</p>
+        </div>
+        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
+            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Grade Cohorts</p>
+            <p class="text-2xl font-black text-slate-900 mt-1">{total_grades}</p>
+        </div>
+        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
+            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Class Sections</p>
+            <p class="text-2xl font-black text-slate-900 mt-1">{total_sections}</p>
+        </div>
+        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
+            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Education Segments</p>
+            <p class="text-2xl font-black text-slate-900 mt-1">{total_levels}</p>
+        </div>
+    </div>
+    """
+
+    # Sidebar: collapsible, printable per-class roster panels
+    roster_sections = []
+    for (grade_name, disp_stream, education_level, raw_stream) in class_group_order:
+        group_students = grouped_students[(grade_name, disp_stream, education_level, raw_stream)]
+        is_stream_blank = not raw_stream or raw_stream.strip() == "" or raw_stream.upper() == "SINGLE STREAM"
+        stream_param = "SINGLE STREAM" if (is_single_stream or is_stream_blank) else raw_stream
+
+        encoded_grade = urllib.parse.quote(grade_name)
+        encoded_stream = urllib.parse.quote(stream_param)
+        encoded_level = urllib.parse.quote(education_level)
+
+        title_label = grade_name if (is_single_stream or is_stream_blank) else f"{grade_name} — {esc(disp_stream)}"
+
+        rows_html = "".join(f"""
+            <li class='flex justify-between items-center gap-2 py-1.5 border-b border-slate-50 last:border-0'>
+                <span class='text-slate-700 truncate'>{esc(st['first_name'])} {esc(st['last_name'])}
+                    <span class='text-slate-400 font-mono text-[10px] block'>#{esc(st['admission_number'])}</span>
+                </span>
+                <a href='/admin/scores/manage/{school_id}?student_id={st['id']}' class='text-blue-600 hover:text-blue-800 text-[10px] font-bold shrink-0'>Scores →</a>
+            </li>
+        """ for st in group_students)
+
+        roster_sections.append(f"""
+        <details class='border border-slate-100 rounded-xl overflow-hidden'>
+            <summary class='cursor-pointer list-none flex items-center justify-between px-3 py-2.5 bg-slate-50 hover:bg-slate-100 transition'>
+                <span class='text-xs font-bold text-slate-700'>{title_label}</span>
+                <span class='flex items-center gap-2'>
+                    <span class='text-[10px] bg-white border border-slate-200 px-1.5 py-0.5 rounded-full font-bold text-slate-500'>{len(group_students)}</span>
+                    <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' onclick='event.stopPropagation()' class='text-[10px] text-emerald-700 font-bold hover:underline'>🖨 Print</a>
+                </span>
+            </summary>
+            <ul class='px-3 py-2 text-xs max-h-56 overflow-y-auto'>
+                {rows_html or "<li class='text-slate-400 italic py-2'>No students</li>"}
+            </ul>
+        </details>
+        """)
+    roster_sidebar_html = "".join(roster_sections)
 
     # Dynamic Class Cards Generation
     class_blocks = []
@@ -664,14 +718,14 @@ def administrative_dashboard(school_id: int, request: Request):
                     <span class='text-[10px] bg-slate-100 text-slate-600 px-2.5 py-1 rounded-md font-bold uppercase tracking-wider'>{c['education_level']}</span>
                     <h3 class='text-base font-black text-slate-800 mt-2.5 group-hover:text-slate-900'>{display_title}</h3>
                 </div>
-                <div class='grid grid-cols-2 gap-2 mt-5'>
+                <div class='grid grid-cols-3 gap-2 mt-5'>
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-blue-950 hover:bg-blue-900 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
+                    <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
                 </div>
             </div>
         """)
     class_blocks_html = "".join(class_blocks)
-    stream_header_th = "" if is_single_stream else "<th class='p-4 text-slate-500 font-semibold'>Stream</th>"
 
     # Robust Logo configuration injection
     logo_html = ""
@@ -679,9 +733,15 @@ def administrative_dashboard(school_id: int, request: Request):
     if logo_src:
         final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
         logo_html = f"""
-        <div class='w-11 h-11 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-center p-1.5 shadow-2xs'>
+        <a href='/admin/school/update-logo/{school_id}' class='w-11 h-11 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-center p-1.5 shadow-2xs hover:border-emerald-400 transition' title='Update school logo'>
             <img src='{final_src}' class='max-w-full max-h-full object-contain' />
-        </div>
+        </a>
+        """
+    else:
+        logo_html = f"""
+        <a href='/admin/school/update-logo/{school_id}' class='w-11 h-11 rounded-xl bg-slate-50 border border-dashed border-slate-300 flex items-center justify-center text-slate-400 hover:border-emerald-400 hover:text-emerald-600 transition text-[9px] font-bold text-center leading-tight' title='Add school logo'>
+            ADD<br/>LOGO
+        </a>
         """
 
     return HTMLResponse(f"""
@@ -722,43 +782,26 @@ def administrative_dashboard(school_id: int, request: Request):
 
         <div class="p-8 max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">
             <div class="lg:col-span-2 space-y-8">
+                {stats_html}
                 <div>
                     <div class="flex items-center justify-between mb-4">
                         <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Classroom Cohorts Grouping</h2>
+                        <a href="/admin/student/new/{school_id}" class="bg-blue-950 hover:bg-blue-900 text-white text-xs px-3.5 py-2 rounded-xl font-semibold transition shadow-xs">+ Register New Student</a>
                     </div>
                     <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                         {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No registered student profiles logged inside streams.</p>"}
                     </div>
                 </div>
-
-                <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs overflow-hidden">
-                    <div class="p-5 border-b border-slate-100 flex justify-between items-center bg-slate-50/40">
-                        <div>
-                            <h2 class="text-base font-bold text-slate-900">🗂️ Master School Ledger Roster</h2>
-                            <p class="text-xs text-slate-400 mt-0.5">Active database context monitoring active operational tiers</p>
-                        </div>
-                        <a href="/admin/student/new/{school_id}" class="bg-blue-950 hover:bg-blue-900 text-white text-xs px-3.5 py-2 rounded-xl font-semibold transition shadow-xs">+ Register New Student</a>
-                    </div>
-                    <div class="overflow-x-auto">
-                        <table class="w-full text-left border-collapse">
-                            <thead>
-                                <tr class="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-100">
-                                    <th class="p-4">Adm No.</th>
-                                    <th class="p-4">Full Student Name</th>
-                                    <th class="p-4">Education Segment</th>
-                                    {stream_header_th}
-                                    <th class="p-4 text-right">Operations</th>
-                                </tr>
-                            </tbody>
-                            <tbody>
-                                {student_rows or "<tr><td colspan='5' class='text-center p-8 text-slate-400 text-sm italic'>No active institutional records logged.</td></tr>"}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
             </div>
 
             <div class="space-y-6">
+                <div class="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-3">
+                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400 border-b border-slate-100 pb-3">📚 Class Rosters</h2>
+                    <div class="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+                        {roster_sidebar_html or "<p class='text-slate-400 text-xs italic text-center py-6'>No classes with students yet.</p>"}
+                    </div>
+                </div>
+
                 <div class="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-4">
                     <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400 border-b border-slate-100 pb-3">⚙️ Core Parameters</h2>
                     <form action="/api/v1/settings/update/{school_id}" method="post" class="space-y-4">
@@ -886,6 +929,82 @@ def administrative_dashboard(school_id: int, request: Request):
     </body>
     </html>
     """)
+
+
+@app.get("/admin/students/roster/{school_id}", response_class=HTMLResponse)
+def print_class_roster(school_id: int, grade_name: str, education_level: str, stream: str, request: Request):
+    session_school_id = request.cookies.get("session_school_id")
+    if not session_school_id:
+        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
+    if str(session_school_id) != str(school_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: You do not have administrative privileges for this institution."
+        )
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("""
+                SELECT s.admission_number, s.first_name, s.last_name, s.stream
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
+                  AND (s.status IS NULL OR s.status != 'GRADUATED')
+                  AND (%s = 'SINGLE STREAM' OR s.stream = %s)
+                ORDER BY s.admission_number ASC;
+            """, (school_id, grade_name, education_level, stream, stream))
+            roster_students = cur.fetchall()
+
+    logo_src = school.get('logo_url')
+    logo_html = ""
+    if logo_src:
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
+
+    rows_html = "".join(
+        f"<tr><td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;'>{esc(st['admission_number'])}</td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{esc(st['first_name'])} {esc(st['last_name'])}</td></tr>"
+        for st in roster_students
+    )
+
+    class_title = grade_name if stream == "SINGLE STREAM" else f"{grade_name} — {stream}"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Class Roster — {esc(class_title)}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
+            @media print {{ .no-print {{ display: none !important; }} }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+            th {{ text-align:left; padding:8px 12px; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:12px; text-transform:uppercase; color:#64748b; }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            <button onclick="window.print()" style="background:#059669;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #059669;padding-bottom:12px;">
+            {logo_html}
+            <div>
+                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">{esc(class_title)} — Class Roster ({len(roster_students)} students)</p>
+            </div>
+        </div>
+        <table>
+            <thead><tr><th>Adm No.</th><th>Full Name</th></tr></thead>
+            <tbody>{rows_html or "<tr><td colspan='2' style='padding:20px;text-align:center;color:#94a3b8;'>No students in this class.</td></tr>"}</tbody>
+        </table>
+    </body>
+    </html>
+    """
+
 # --- GET View Routes for Administration Subsystems ---
 @app.get("/admin/student/new/{school_id}", response_class=HTMLResponse)
 def add_student_view(school_id: int):
@@ -929,21 +1048,6 @@ def add_student_view(school_id: int):
     </body>
     </html>
     """
-@app.get("/api/v1/students/list/{school_id}", response_class=HTMLResponse)
-def get_student_list(school_id: int, grade: str, stream: str):
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT s.admission_number, s.first_name, s.last_name 
-                FROM students s 
-                JOIN classes c ON s.class_id = c.id
-                WHERE s.school_id = %s AND c.grade_name = %s AND s.stream = %s
-                ORDER BY s.admission_number ASC;
-            """, (school_id, grade, stream))
-            students = cur.fetchall()
-            
-    rows = "".join([f"<li class='py-2 border-b'>{s['admission_number']} - {s['first_name']} {s['last_name']}</li>" for s in students])
-    return f"<ul>{rows or 'No students found.'}</ul>"
 
 @app.get("/staff/register-panel/{school_id}", response_class=HTMLResponse)
 def staff_registration_panel(school_id: int):
