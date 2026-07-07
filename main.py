@@ -71,6 +71,34 @@ def get_db_connection():
     finally:
         conn.close()
 
+def require_school_session(request: Request, school_id: int):
+    """Confirms the request carries a valid session cookie for this school.
+    Returns a redirect Response if unauthenticated, or None if OK to proceed."""
+    session_school_id = request.cookies.get("session_school_id")
+    if not session_school_id:
+        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
+    if str(session_school_id) != str(school_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: You do not have privileges for this institution."
+        )
+    return None
+
+def require_admin_session(request: Request, school_id: int):
+    """Like require_school_session, but also blocks staff-role sessions.
+    Sessions with no role cookie (pre-existing logins from before staff
+    accounts existed) are treated as admin for backward compatibility."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+    role = request.cookies.get("session_role")
+    if role == "staff":
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: Administrator privileges required for this action."
+        )
+    return None
+
 # 2. Bootstrap Function
 def bootstrap_database_schema():
     """Initializes tables and populates base data."""
@@ -297,6 +325,22 @@ def process_login(email: str = Form(...), password: str = Form(...)):
                         secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
                         max_age=60 * 60 * 24 * 7,
                     )
+                    response.set_cookie(
+                        key="session_role",
+                        value=str(user['role']),
+                        httponly=True,
+                        samesite="lax",
+                        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
+                        max_age=60 * 60 * 24 * 7,
+                    )
+                    response.set_cookie(
+                        key="session_user_id",
+                        value=str(user['id']),
+                        httponly=True,
+                        samesite="lax",
+                        secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
+                        max_age=60 * 60 * 24 * 7,
+                    )
                     return response
     
     # If no user found or password invalid
@@ -454,14 +498,9 @@ async def register_new_tenant_pipeline(
 
 @app.get("/admin/school/update-logo/{school_id}", response_class=HTMLResponse)
 def update_school_logo_form(school_id: int, request: Request):
-    session_school_id = request.cookies.get("session_school_id")
-    if not session_school_id:
-        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
-    if str(session_school_id) != str(school_id):
-        raise HTTPException(
-            status_code=403,
-            detail="Access Denied: You do not have administrative privileges for this institution."
-        )
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -510,14 +549,9 @@ def update_school_logo_form(school_id: int, request: Request):
 
 @app.post("/api/v1/school/update-logo/{school_id}")
 async def update_school_logo_submit(school_id: int, request: Request, logo_file: UploadFile = File(...)):
-    session_school_id = request.cookies.get("session_school_id")
-    if not session_school_id:
-        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
-    if str(session_school_id) != str(school_id):
-        raise HTTPException(
-            status_code=403,
-            detail="Access Denied: You do not have administrative privileges for this institution."
-        )
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
 
     if not logo_file or not logo_file.filename:
         raise HTTPException(status_code=400, detail="A logo image file is required.")
@@ -566,16 +600,9 @@ async def update_school_logo_submit(school_id: int, request: Request, logo_file:
 
 @app.get("/admin/dashboard/{school_id}", response_class=HTMLResponse)
 def administrative_dashboard(school_id: int, request: Request):  
-    session_school_id = request.cookies.get("session_school_id")
-    
-    if not session_school_id:
-        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
-        
-    if str(session_school_id) != str(school_id):
-        raise HTTPException(
-            status_code=403, 
-            detail="Access Denied: You do not have administrative privileges for this institution."
-        )
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
 
     # Use the connection context manager directly
     with get_db_connection() as conn:
@@ -636,25 +663,26 @@ def administrative_dashboard(school_id: int, request: Request):
     total_grades = len({c['grade_name'] for c in classes})
     total_sections = len(classes)
     total_levels = len({c['education_level'] for c in classes})
+    total_staff = len(staff_members)
+    active_staff = len([m for m in staff_members if m['is_verified']])
+
+    def _stat_card(label, value, accent_hex, sub=None):
+        sub_html = f"<p class='text-[10px] text-slate-400 mt-0.5'>{sub}</p>" if sub else ""
+        return f"""
+        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 border-l-4" style="border-left-color:{accent_hex};">
+            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">{label}</p>
+            <p class="text-2xl font-black text-slate-900 mt-1">{value}</p>
+            {sub_html}
+        </div>
+        """
 
     stats_html = f"""
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
-            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Total Students</p>
-            <p class="text-2xl font-black text-slate-900 mt-1">{total_students}</p>
-        </div>
-        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
-            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Grade Cohorts</p>
-            <p class="text-2xl font-black text-slate-900 mt-1">{total_grades}</p>
-        </div>
-        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
-            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Class Sections</p>
-            <p class="text-2xl font-black text-slate-900 mt-1">{total_sections}</p>
-        </div>
-        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
-            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Education Segments</p>
-            <p class="text-2xl font-black text-slate-900 mt-1">{total_levels}</p>
-        </div>
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+        {_stat_card("Total Students", total_students, "#4f46e5")}
+        {_stat_card("Grade Cohorts", total_grades, "#7c3aed")}
+        {_stat_card("Class Sections", total_sections, "#0d9488")}
+        {_stat_card("Education Segments", total_levels, "#d97706")}
+        {_stat_card("Staff", f"{active_staff}/{total_staff}", "#e11d48", sub="active / total")}
     </div>
     """
 
@@ -696,6 +724,35 @@ def administrative_dashboard(school_id: int, request: Request):
         """)
     roster_sidebar_html = "".join(roster_sections)
 
+    # Staff panel: list with activate/deactivate/delete controls
+    staff_rows = []
+    for m in staff_members:
+        is_active = m['is_verified']
+        status_badge = (
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>Active</span>"
+            if is_active else
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Pending</span>"
+        )
+        toggle_label = "Deactivate" if is_active else "Activate"
+        toggle_classes = "text-amber-700 hover:text-amber-900" if is_active else "text-emerald-700 hover:text-emerald-900"
+        staff_rows.append(f"""
+            <div class='flex items-center justify-between gap-2 py-2 border-b border-slate-50 last:border-0'>
+                <div class="min-w-0">
+                    <p class="text-xs font-semibold text-slate-800 truncate">{esc(m['email'])}</p>
+                    {status_badge}
+                </div>
+                <div class="flex items-center gap-2 shrink-0 text-[10px] font-bold">
+                    <form action="/api/v1/staff/toggle-status/{m['id']}/{school_id}" method="post">
+                        <button type="submit" class="{toggle_classes}">{toggle_label}</button>
+                    </form>
+                    <form action="/api/v1/staff/delete/{m['id']}/{school_id}" method="post" onsubmit="return confirm('Remove {esc(m['email'])} permanently? This cannot be undone.');">
+                        <button type="submit" class="text-rose-600 hover:text-rose-800">Delete</button>
+                    </form>
+                </div>
+            </div>
+        """)
+    staff_panel_html = "".join(staff_rows)
+
     # Dynamic Class Cards Generation
     class_blocks = []
     for c in classes:
@@ -719,7 +776,7 @@ def administrative_dashboard(school_id: int, request: Request):
                     <h3 class='text-base font-black text-slate-800 mt-2.5 group-hover:text-slate-900'>{display_title}</h3>
                 </div>
                 <div class='grid grid-cols-3 gap-2 mt-5'>
-                    <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-blue-950 hover:bg-blue-900 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
+                    <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
                 </div>
@@ -767,7 +824,8 @@ def administrative_dashboard(school_id: int, request: Request):
             </div>
             <div class="flex items-center space-x-3 text-xs font-semibold mr-14">
                 <span class="bg-slate-50 text-slate-700 px-3 py-2 rounded-xl border border-slate-200/60 shadow-2xs">System Wallet: <span class="text-slate-900 font-bold">KSh {float(school['wallet_balance']):,.2f}</span></span>
-                <span class="bg-blue-950 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
+                <span class="bg-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
+                <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
 
@@ -786,7 +844,7 @@ def administrative_dashboard(school_id: int, request: Request):
                 <div>
                     <div class="flex items-center justify-between mb-4">
                         <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Classroom Cohorts Grouping</h2>
-                        <a href="/admin/student/new/{school_id}" class="bg-blue-950 hover:bg-blue-900 text-white text-xs px-3.5 py-2 rounded-xl font-semibold transition shadow-xs">+ Register New Student</a>
+                        <a href="/admin/student/new/{school_id}" class="bg-indigo-900 hover:bg-indigo-800 text-white text-xs px-3.5 py-2 rounded-xl font-semibold transition shadow-xs">+ Register New Student</a>
                     </div>
                     <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                         {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No registered student profiles logged inside streams.</p>"}
@@ -799,6 +857,16 @@ def administrative_dashboard(school_id: int, request: Request):
                     <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400 border-b border-slate-100 pb-3">📚 Class Rosters</h2>
                     <div class="space-y-2 max-h-[420px] overflow-y-auto pr-1">
                         {roster_sidebar_html or "<p class='text-slate-400 text-xs italic text-center py-6'>No classes with students yet.</p>"}
+                    </div>
+                </div>
+
+                <div class="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-3">
+                    <div class="flex items-center justify-between border-b border-slate-100 pb-3">
+                        <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400">🧑‍🏫 Staff</h2>
+                        <a href="/staff/register-panel/{school_id}" class="bg-indigo-700 hover:bg-indigo-800 text-white text-[10px] px-2.5 py-1.5 rounded-lg font-bold transition">+ Add Staff</a>
+                    </div>
+                    <div class="max-h-64 overflow-y-auto pr-1">
+                        {staff_panel_html or "<p class='text-slate-400 text-xs italic text-center py-6'>No staff accounts yet.</p>"}
                     </div>
                 </div>
 
@@ -843,7 +911,7 @@ def administrative_dashboard(school_id: int, request: Request):
                             </div>
                         </div>
                         <input type="hidden" name="theme_color" value="emerald">
-                        <button type="submit" class="w-full bg-blue-950 hover:bg-blue-900 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">Commit Engine Settings</button>
+                        <button type="submit" class="w-full bg-indigo-900 hover:bg-indigo-800 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">Commit Engine Settings</button>
                     </form>
 
                     <div class="mt-2 pt-4 border-t border-slate-100">
@@ -924,6 +992,132 @@ def administrative_dashboard(school_id: int, request: Request):
                         <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2 px-5 rounded-xl shadow-xs cursor-pointer">Save Settings</button>
                     </div>
                 </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.get("/logout")
+def logout():
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie("session_school_id")
+    response.delete_cookie("session_role")
+    response.delete_cookie("session_user_id")
+    return response
+
+
+@app.get("/staff/dashboard/{school_id}", response_class=HTMLResponse)
+def staff_dashboard(school_id: int, request: Request, user_id: int = None):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings = cur.fetchone()
+
+            staff_email = None
+            if user_id:
+                cur.execute("SELECT email FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (user_id, school_id))
+                staff_user = cur.fetchone()
+                if staff_user:
+                    staff_email = staff_user['email']
+
+            cur.execute("""
+                SELECT DISTINCT c.id, c.grade_name, s.stream, c.education_level
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                ORDER BY c.id ASC, s.stream ASC;
+            """, (school_id,))
+            classes = cur.fetchall()
+
+    st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'is_single_stream': False}
+    is_single_stream = st.get('is_single_stream', False)
+
+    logo_src = school.get('logo_url')
+    logo_html = ""
+    if logo_src:
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        logo_html = f"""
+        <div class='w-11 h-11 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-center p-1.5 shadow-2xs'>
+            <img src='{final_src}' class='max-w-full max-h-full object-contain' />
+        </div>
+        """
+
+    class_blocks = []
+    for c in classes:
+        is_stream_blank = not c['stream'] or c['stream'].strip() == "" or c['stream'].upper() == "SINGLE STREAM"
+        if is_single_stream or is_stream_blank:
+            display_title = c['grade_name']
+            stream_param = "SINGLE STREAM"
+        else:
+            display_title = f"{c['grade_name']} — Stream: {esc(c['stream'])}"
+            stream_param = c['stream']
+
+        encoded_grade = urllib.parse.quote(c['grade_name'])
+        encoded_stream = urllib.parse.quote(stream_param)
+        encoded_level = urllib.parse.quote(c['education_level'])
+
+        class_blocks.append(f"""
+            <div class='bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs hover:shadow-md transition-all flex flex-col justify-between group'>
+                <div>
+                    <span class='text-[10px] bg-slate-100 text-slate-600 px-2.5 py-1 rounded-md font-bold uppercase tracking-wider'>{c['education_level']}</span>
+                    <h3 class='text-base font-black text-slate-800 mt-2.5 group-hover:text-slate-900'>{display_title}</h3>
+                </div>
+                <div class='grid grid-cols-3 gap-2 mt-5'>
+                    <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
+                    <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
+                    <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
+                </div>
+            </div>
+        """)
+    class_blocks_html = "".join(class_blocks)
+
+    identity_html = f"<p class='text-xs text-slate-500'>{esc(staff_email)}</p>" if staff_email else ""
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html class="h-full">
+    <head>
+        <title>Staff Portal - {esc(school['name'])}</title>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
+    </head>
+    <body class="bg-[#F8FAFC] text-slate-800 antialiased min-h-full flex flex-col relative">
+
+        <header class="bg-white border-b border-slate-200/80 px-8 py-4 flex justify-between items-center sticky top-0 z-40 backdrop-blur-md bg-white/90 shadow-2xs">
+            <div class="flex items-center space-x-4">
+                {logo_html}
+                <div>
+                    <h1 class="text-base font-bold text-slate-900 tracking-tight">{esc(school['name'])}</h1>
+                    {identity_html}
+                </div>
+            </div>
+            <div class="flex items-center space-x-3 text-xs font-semibold">
+                <span class="bg-indigo-50 text-indigo-700 border border-indigo-100 px-3 py-2 rounded-xl">Staff Portal</span>
+                <span class="bg-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
+                <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
+            </div>
+        </header>
+
+        <div class="p-8 max-w-6xl mx-auto w-full flex-1">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Your Classroom Cohorts</h2>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+                {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No classes have been set up for this school yet.</p>"}
             </div>
         </div>
     </body>
@@ -1050,33 +1244,59 @@ def add_student_view(school_id: int):
     """
 
 @app.get("/staff/register-panel/{school_id}", response_class=HTMLResponse)
-def staff_registration_panel(school_id: int):
+def staff_registration_panel(school_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><title>Add Staff</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
-    <body class="bg-slate-100 flex items-center justify-center min-h-screen">
-        <div class="bg-white p-6 rounded-xl border shadow w-full max-w-sm">
-            <h2 class="text-lg font-black mb-3">Onboard Educator Node</h2>
-            <form action="/api/v1/staff/add/{school_id}" method="post" class="space-y-3">
-                <div><label class="text-xs font-bold text-slate-600">Staff Email Address</label><input type="email" name="email" class="w-full border p-2 rounded text-sm mt-1" required></div>
-                <div><label class="text-xs font-bold text-slate-600">Initial Password String</label><input type="password" name="password" class="w-full border p-2 rounded text-sm mt-1" required></div>
-                <button type="submit" class="w-full bg-slate-900 text-white font-bold py-2 rounded text-sm hover:bg-black transition">Create Staff Account</button>
+    <head><title>Add Staff — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-indigo-950 flex items-center justify-center min-h-screen font-sans p-6">
+        <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-sm border-t-8 border-indigo-700">
+            <h2 class="text-xl font-black text-slate-800 mb-1">Add Staff Member</h2>
+            <p class="text-xs text-slate-400 mb-6">{esc(school['name'])}</p>
+            <form action="/api/v1/staff/add/{school_id}" method="post" class="space-y-4">
+                <div>
+                    <label class="text-xs font-bold uppercase tracking-wider text-slate-600">Staff Email Address</label>
+                    <input type="email" name="email" class="w-full border border-slate-200 p-2.5 rounded-lg text-sm mt-1" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold uppercase tracking-wider text-slate-600">Initial Password</label>
+                    <input type="password" name="password" minlength="6" class="w-full border border-slate-200 p-2.5 rounded-lg text-sm mt-1" required>
+                    <p class="text-[10px] text-slate-400 mt-1">At least 6 characters. They can change it after logging in.</p>
+                </div>
+                <div class="flex items-center justify-between pt-2">
+                    <a href="/admin/dashboard/{school_id}" class="text-slate-500 font-bold hover:underline text-xs">← Back to Dashboard</a>
+                    <button type="submit" class="bg-indigo-700 text-white px-6 py-3 rounded-lg font-black tracking-wide hover:bg-indigo-800 transition shadow-md text-xs">Create Account</button>
+                </div>
             </form>
         </div>
     </body>
     </html>
     """
 @app.post("/api/v1/staff/toggle-status/{staff_id}/{school_id}")
-def toggle_staff_active_status(staff_id: int, school_id: int):
+def toggle_staff_active_status(staff_id: int, school_id: int, request: Request):
     """Safely disables or enables a staff account without wiping historical records."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             # Flips the current boolean value of is_verified (acting as our active flag)
             cur.execute("""
                 UPDATE users 
                 SET is_verified = NOT is_verified 
-                WHERE id = %s AND school_id = %s;
+                WHERE id = %s AND school_id = %s AND role = 'staff';
             """, (staff_id, school_id))
             conn.commit()
             
@@ -1084,8 +1304,12 @@ def toggle_staff_active_status(staff_id: int, school_id: int):
 
 
 @app.post("/api/v1/staff/delete/{staff_id}/{school_id}")
-def delete_staff_permanently(staff_id: int, school_id: int):
+def delete_staff_permanently(staff_id: int, school_id: int, request: Request):
     """Hard deletes a staff record. Use cautiously."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (staff_id, school_id))
@@ -1603,12 +1827,17 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
 @app.post("/api/v1/settings/update/{school_id}")
 def update_settings_endpoint(
     school_id: int, 
+    request: Request,
     active_term: str = Form(...), 
     active_cycle: str = Form(...), 
     opening_date: str = Form(...), 
     closing_date: str = Form(...), 
     theme_color: str = Form(...)
 ):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     # Constrain free-text-ish fields to known-good values so a crafted POST
     # can't smuggle unexpected data (defense in depth beyond output escaping).
     allowed_terms = {"Term 1", "Term 2", "Term 3"}
@@ -1689,7 +1918,11 @@ def backend_add_student(
 
 
 @app.post("/api/v1/staff/add/{school_id}")
-def add_staff_node(school_id: int, email: str = Form(...), password: str = Form(...)):
+def add_staff_node(school_id: int, request: Request, email: str = Form(...), password: str = Form(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     email = email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="A staff email address is required.")
@@ -1699,19 +1932,26 @@ def add_staff_node(school_id: int, email: str = Form(...), password: str = Form(
     safe_staff_password = password[:72]
     hashed_password = get_password_hash(safe_staff_password)
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM users WHERE email = %s;", (email,))
+            if cur.fetchone():
+                raise HTTPException(status_code=400, detail="That email is already registered to an account.")
             cur.execute("""
                 INSERT INTO users (email, password_hash, role, school_id, is_verified)
-                VALUES (%s, %s, 'staff', %s, TRUE);
+                VALUES (%s, %s, 'staff', %s, FALSE);
             """, (email, hashed_password, school_id))
             conn.commit()
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
 @app.post("/api/v1/staff/toggle-verification/{school_id}")
-def toggle_staff_verification(school_id: int, user_id: int = Form(...)):
+def toggle_staff_verification(school_id: int, request: Request, user_id: int = Form(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE users SET is_verified = NOT is_verified WHERE id = %s AND school_id = %s;", (user_id, school_id))
+            cur.execute("UPDATE users SET is_verified = NOT is_verified WHERE id = %s AND school_id = %s AND role = 'staff';", (user_id, school_id))
             conn.commit()
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
@@ -1795,7 +2035,11 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
 @app.post("/api/v1/wallet/stkpush/{school_id}")
-def process_simulated_mpesa_stk_push(school_id: int, phone_number: str = Form(...), amount: float = Form(...)):
+def process_simulated_mpesa_stk_push(school_id: int, request: Request, phone_number: str = Form(...), amount: float = Form(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     phone_number = phone_number.strip()
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Top-up amount must be greater than zero.")
@@ -1821,7 +2065,11 @@ def process_simulated_mpesa_stk_push(school_id: int, phone_number: str = Form(..
     """)
 
 @app.post("/api/v1/school/promote-classes/{school_id}")
-def promote_school_classes(school_id: int):
+def promote_school_classes(school_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     # Map current class_id to the next consecutive class_id
     # 1: Grade 1 -> 2: Grade 2, ..., 9: Grade 9
     promotion_map = {
