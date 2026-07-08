@@ -145,8 +145,17 @@ def bootstrap_database_schema():
                     password_hash VARCHAR(255) NOT NULL,
                     role VARCHAR(50) NOT NULL,
                     school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    is_verified BOOLEAN DEFAULT TRUE
+                    is_verified BOOLEAN DEFAULT TRUE,
+                    full_name VARCHAR(255),
+                    tsc_number VARCHAR(100),
+                    phone_number VARCHAR(50)
                 );
+
+                -- Safe, idempotent migrations for the fields above on a table that
+                -- already existed in production before this version.
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(255);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS tsc_number VARCHAR(100);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number VARCHAR(50);
 
                 CREATE TABLE IF NOT EXISTS classes (
                     id SERIAL PRIMARY KEY,
@@ -640,7 +649,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             """, (school_id,))
             students = cur.fetchall()
             
-            cur.execute("SELECT id, email, is_verified FROM users WHERE school_id = %s AND role='staff';", (school_id,))
+            cur.execute("SELECT id, email, is_verified, full_name, tsc_number, phone_number FROM users WHERE school_id = %s AND role='staff' ORDER BY full_name NULLS LAST, email ASC;", (school_id,))
             staff_members = cur.fetchall()
             
             cur.execute("""
@@ -751,17 +760,22 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         )
         toggle_label = "Deactivate" if is_active else "Activate"
         toggle_classes = "text-amber-700 hover:text-amber-900" if is_active else "text-emerald-700 hover:text-emerald-900"
+        display_name = m.get('full_name') or "(Name not set — added before this feature)"
+        tsc_display = m.get('tsc_number') or "—"
+        phone_display = m.get('phone_number') or "—"
         staff_rows.append(f"""
-            <div class='flex items-center justify-between gap-2 py-2 border-b border-slate-50 last:border-0'>
-                <div class="min-w-0">
-                    <p class="text-xs font-semibold text-slate-800 truncate">{esc(m['email'])}</p>
+            <div class='py-2.5 border-b border-slate-50 last:border-0'>
+                <div class="flex items-center justify-between gap-2">
+                    <p class="text-xs font-bold text-slate-800 truncate">{esc(display_name)}</p>
                     {status_badge}
                 </div>
-                <div class="flex items-center gap-2 shrink-0 text-[10px] font-bold">
+                <p class="text-[10px] text-slate-500 mt-0.5">TSC No: <span class="font-semibold text-slate-600">{esc(tsc_display)}</span> • {esc(phone_display)}</p>
+                <p class="text-[10px] text-slate-400 truncate">{esc(m['email'])}</p>
+                <div class="flex items-center gap-3 shrink-0 text-[10px] font-bold mt-1.5">
                     <form action="/api/v1/staff/toggle-status/{m['id']}/{school_id}" method="post">
                         <button type="submit" class="{toggle_classes}">{toggle_label}</button>
                     </form>
-                    <form action="/api/v1/staff/delete/{m['id']}/{school_id}" method="post" onsubmit="return confirm('Remove {esc(m['email'])} permanently? This cannot be undone.');">
+                    <form action="/api/v1/staff/delete/{m['id']}/{school_id}" method="post" onsubmit="return confirm('Remove {esc(display_name)} permanently? This cannot be undone.');">
                         <button type="submit" class="text-rose-600 hover:text-rose-800">Delete</button>
                     </form>
                 </div>
@@ -804,7 +818,6 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
 
     # Robust Logo configuration injection
     logo_html = ""
-    logo_warning_html = ""
     logo_src = school.get('logo_url')
     if logo_src:
         final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
@@ -813,14 +826,6 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             <img src='{final_src}' class='max-w-full max-h-full object-contain' />
         </a>
         """
-        if not logo_src.startswith("http"):
-            logo_warning_html = """
-            <div class="bg-amber-50 border border-amber-200 text-amber-800 text-xs px-4 py-2.5 rounded-xl mb-4 flex items-center gap-2">
-                ⚠️ Your logo is stored on this server's temporary disk, not in cloud storage — it will be lost on the next deploy or restart.
-                This means <code>SUPABASE_URL</code>/<code>SUPABASE_KEY</code> aren't set (or the upload failed) on your hosting platform.
-                Fix that, then re-upload the logo once via the logo icon above to make it permanent.
-            </div>
-            """
     else:
         logo_html = f"""
         <a href='/admin/school/update-logo/{school_id}' class='w-11 h-11 rounded-xl bg-slate-50 border border-dashed border-slate-300 flex items-center justify-center text-slate-400 hover:border-emerald-400 hover:text-emerald-600 transition text-[9px] font-bold text-center leading-tight' title='Add school logo'>
@@ -867,11 +872,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             </button>
         </div>
 
-        <div class="px-8 pt-6 max-w-7xl mx-auto w-full">
-            {logo_warning_html}
-        </div>
-
-        <div class="p-8 pt-2 max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">
+        <div class="p-8 max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">
             <div class="lg:col-span-2 space-y-8">
                 {stats_html}
                 <div>
@@ -1564,6 +1565,20 @@ def staff_registration_panel(school_id: int, request: Request):
             <p class="text-xs text-slate-400 mb-6">{esc(school['name'])}</p>
             <form action="/api/v1/staff/add/{school_id}" method="post" class="space-y-4">
                 <div>
+                    <label class="text-xs font-bold uppercase tracking-wider text-slate-600">Full Name</label>
+                    <input type="text" name="full_name" class="w-full border border-slate-200 p-2.5 rounded-lg text-sm mt-1" required>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="text-xs font-bold uppercase tracking-wider text-slate-600">TSC No.</label>
+                        <input type="text" name="tsc_number" class="w-full border border-slate-200 p-2.5 rounded-lg text-sm mt-1" required>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold uppercase tracking-wider text-slate-600">Phone Number</label>
+                        <input type="tel" name="phone_number" placeholder="07XXXXXXXX" class="w-full border border-slate-200 p-2.5 rounded-lg text-sm mt-1" required>
+                    </div>
+                </div>
+                <div>
                     <label class="text-xs font-bold uppercase tracking-wider text-slate-600">Staff Email Address</label>
                     <input type="email" name="email" class="w-full border border-slate-200 p-2.5 rounded-lg text-sm mt-1" required>
                 </div>
@@ -2216,14 +2231,31 @@ def backend_add_student(
 
 
 @app.post("/api/v1/staff/add/{school_id}")
-def add_staff_node(school_id: int, request: Request, email: str = Form(...), password: str = Form(...)):
+def add_staff_node(
+    school_id: int,
+    request: Request,
+    full_name: str = Form(...),
+    tsc_number: str = Form(...),
+    phone_number: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...),
+):
     auth_error = require_admin_session(request, school_id)
     if auth_error:
         return auth_error
 
     email = email.strip().lower()
+    full_name = full_name.strip()
+    tsc_number = tsc_number.strip()
+    phone_number = phone_number.strip()
     if not email:
         raise HTTPException(status_code=400, detail="A staff email address is required.")
+    if not full_name:
+        raise HTTPException(status_code=400, detail="Staff full name is required.")
+    if not tsc_number:
+        raise HTTPException(status_code=400, detail="Staff TSC number is required.")
+    if not phone_number:
+        raise HTTPException(status_code=400, detail="Staff phone number is required.")
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
 
@@ -2235,9 +2267,9 @@ def add_staff_node(school_id: int, request: Request, email: str = Form(...), pas
             if cur.fetchone():
                 raise HTTPException(status_code=400, detail="That email is already registered to an account.")
             cur.execute("""
-                INSERT INTO users (email, password_hash, role, school_id, is_verified)
-                VALUES (%s, %s, 'staff', %s, FALSE);
-            """, (email, hashed_password, school_id))
+                INSERT INTO users (email, password_hash, role, school_id, is_verified, full_name, tsc_number, phone_number)
+                VALUES (%s, %s, 'staff', %s, FALSE, %s, %s, %s);
+            """, (email, hashed_password, school_id, full_name, tsc_number, phone_number))
             conn.commit()
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
