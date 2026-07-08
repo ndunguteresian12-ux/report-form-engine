@@ -214,13 +214,22 @@ def bootstrap_database_schema():
                 ('Upper Primary', 'Creative arts and sports.'), ('Upper Primary', 'Integrated science.'),
                 ('Upper Primary', 'Agriculture'), ('Upper Primary', 'Social studies'),
                 ('Upper Primary', 'Christian religious education'),
-                ('Lower Primary', 'Mathematics'), ('Lower Primary', 'English lugha'),
-                ('Lower Primary', 'Environment studies'), ('Lower Primary', 'Science'),
-                ('Lower Primary', 'Creative activities'), ('Lower Primary', 'Social studies')
+                ('Lower Primary', 'MATHEMATICS'), ('Lower Primary', 'ENGLISH'),
+                ('Lower Primary', 'LUGHA'), ('Lower Primary', 'INTEGRATED SCIENCE'),
             ]
             for lvl, name in subjects_payload:
                 cur.execute("INSERT INTO learning_areas (education_level, name) VALUES (%s, %s) ON CONFLICT (education_level, name) DO NOTHING;", (lvl, name))
-            
+
+            # One-time cleanup migration: remove the old Lower Primary subject set
+            # that was seeded before this change. NOTE: learning_areas.id cascades
+            # to student_scores, so this also deletes any scores already recorded
+            # against the old Lower Primary subjects.
+            cur.execute("""
+                DELETE FROM learning_areas
+                WHERE education_level = 'Lower Primary'
+                AND name NOT IN ('MATHEMATICS', 'ENGLISH', 'LUGHA', 'INTEGRATED SCIENCE');
+            """)
+
             conn.commit()
             print("Database initialized successfully.")
 
