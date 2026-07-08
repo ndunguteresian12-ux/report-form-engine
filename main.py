@@ -34,9 +34,21 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 # --- Logging & Initialization ---
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("cbe_engine")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip() or None
+SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip() or None
 supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+if supabase_client:
+    logger.info("Supabase Storage configured — logo uploads will be persisted to the cloud.")
+else:
+    logger.warning(
+        "Supabase Storage NOT configured (SUPABASE_URL / SUPABASE_KEY missing or empty). "
+        "Logo uploads will fall back to local disk, which is NOT persistent on Render."
+    )
+
+# Tracks the most recent Supabase Storage error so an admin can self-diagnose
+# via /admin/system/diagnostics/{school_id} without needing server log access.
+_last_storage_error = None
 
 app = FastAPI(title="Kenyan CBE Multi-Tenant Enterprise Engine")
 # --- Configuration Constants ---
@@ -448,9 +460,9 @@ async def register_new_tenant_pipeline(
                 # Capture absolute public URL reference network asset string
                 logo_resolved_url = supabase_client.storage.from_("logos").get_public_url(safe_filename)
             except Exception as storage_err:
+                global _last_storage_error
+                _last_storage_error = f"{type(storage_err).__name__}: {storage_err}"
                 logger.error(f"Supabase Cloud upload failed, reverting locally: {storage_err}")
-
-        # 2. Fallback Pipeline Path: Write asset block to local server disk
         if not logo_resolved_url:
             local_path = f"{UPLOAD_DIR}/{safe_filename}"
             try:
@@ -541,6 +553,7 @@ def update_school_logo_form(school_id: int, request: Request):
                     <button type="submit" class="bg-emerald-700 text-white px-6 py-3 rounded-lg font-black tracking-wide hover:bg-emerald-800 transition shadow-md text-xs">Upload Logo</button>
                 </div>
             </form>
+            <a href="/admin/system/diagnostics/{school_id}" class="block text-center text-[10px] text-slate-400 hover:text-slate-600 hover:underline mt-4">Logo not saving? Check storage diagnostics →</a>
         </div>
     </body>
     </html>
@@ -577,6 +590,8 @@ async def update_school_logo_submit(school_id: int, request: Request, logo_file:
             )
             logo_resolved_url = supabase_client.storage.from_("logos").get_public_url(safe_filename)
         except Exception as storage_err:
+            global _last_storage_error
+            _last_storage_error = f"{type(storage_err).__name__}: {storage_err}"
             logger.error(f"Supabase Cloud upload failed, reverting locally: {storage_err}")
 
     # 2. Fallback Pipeline Path: Write asset block to local server disk
@@ -595,11 +610,12 @@ async def update_school_logo_submit(school_id: int, request: Request, logo_file:
             cur.execute("UPDATE schools SET logo_url = %s WHERE id = %s;", (logo_resolved_url, school_id))
             conn.commit()
 
-    return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
+    storage_flag = "cloud" if logo_resolved_url.startswith("http") else "local"
+    return RedirectResponse(url=f"/admin/dashboard/{school_id}?logo_storage={storage_flag}", status_code=303)
 
 
 @app.get("/admin/dashboard/{school_id}", response_class=HTMLResponse)
-def administrative_dashboard(school_id: int, request: Request):  
+def administrative_dashboard(school_id: int, request: Request, logo_storage: str = None):  
     auth_error = require_admin_session(request, school_id)
     if auth_error:
         return auth_error
@@ -779,6 +795,8 @@ def administrative_dashboard(school_id: int, request: Request):
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
+                    <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
+                    <a href='/admin/reports/subject-analysis/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-amber-600 hover:bg-amber-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Subj. Analysis</a>
                 </div>
             </div>
         """)
@@ -786,6 +804,7 @@ def administrative_dashboard(school_id: int, request: Request):
 
     # Robust Logo configuration injection
     logo_html = ""
+    logo_warning_html = ""
     logo_src = school.get('logo_url')
     if logo_src:
         final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
@@ -794,6 +813,14 @@ def administrative_dashboard(school_id: int, request: Request):
             <img src='{final_src}' class='max-w-full max-h-full object-contain' />
         </a>
         """
+        if not logo_src.startswith("http"):
+            logo_warning_html = """
+            <div class="bg-amber-50 border border-amber-200 text-amber-800 text-xs px-4 py-2.5 rounded-xl mb-4 flex items-center gap-2">
+                ⚠️ Your logo is stored on this server's temporary disk, not in cloud storage — it will be lost on the next deploy or restart.
+                This means <code>SUPABASE_URL</code>/<code>SUPABASE_KEY</code> aren't set (or the upload failed) on your hosting platform.
+                Fix that, then re-upload the logo once via the logo icon above to make it permanent.
+            </div>
+            """
     else:
         logo_html = f"""
         <a href='/admin/school/update-logo/{school_id}' class='w-11 h-11 rounded-xl bg-slate-50 border border-dashed border-slate-300 flex items-center justify-center text-slate-400 hover:border-emerald-400 hover:text-emerald-600 transition text-[9px] font-bold text-center leading-tight' title='Add school logo'>
@@ -829,6 +856,8 @@ def administrative_dashboard(school_id: int, request: Request):
             </div>
         </header>
 
+        {"<div class='bg-amber-50 border-b border-amber-200 text-amber-800 text-xs px-8 py-2.5 text-center font-semibold'>⚠️ That logo was saved to temporary server storage, not cloud storage — it will likely disappear the next time the server restarts. Check that SUPABASE_URL and SUPABASE_KEY are set correctly on Render, and that a public 'logos' bucket exists in Supabase, then re-upload.</div>" if logo_storage == "local" else ""}
+
         <div class="fixed top-4 right-4 z-50">
             <button onclick="document.getElementById('settingsModal').classList.remove('hidden')" class="bg-white hover:bg-slate-100 text-slate-700 p-2.5 rounded-full border border-slate-200 shadow-md transition duration-200 cursor-pointer flex items-center justify-center">
                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5 animate-[spin_12s_linear_infinite]">
@@ -838,7 +867,11 @@ def administrative_dashboard(school_id: int, request: Request):
             </button>
         </div>
 
-        <div class="p-8 max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">
+        <div class="px-8 pt-6 max-w-7xl mx-auto w-full">
+            {logo_warning_html}
+        </div>
+
+        <div class="p-8 pt-2 max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">
             <div class="lg:col-span-2 space-y-8">
                 {stats_html}
                 <div>
@@ -1008,6 +1041,54 @@ def logout():
     return response
 
 
+@app.get("/admin/system/diagnostics/{school_id}", response_class=HTMLResponse)
+def storage_diagnostics(school_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    configured = supabase_client is not None
+    status_html = (
+        "<span style='color:#059669;font-weight:bold;'>✅ Configured</span>" if configured
+        else "<span style='color:#dc2626;font-weight:bold;'>❌ Not configured</span>"
+    )
+    url_present = "Set" if SUPABASE_URL else "Missing"
+    key_present = "Set" if SUPABASE_KEY else "Missing"
+    last_error_html = (
+        f"<pre style='background:#fef2f2;color:#991b1b;padding:12px;border-radius:8px;white-space:pre-wrap;font-size:12px;'>{esc(_last_storage_error)}</pre>"
+        if _last_storage_error else
+        "<p style='color:#64748b;font-size:12px;'>No upload errors recorded since the app last started.</p>"
+    )
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Storage Diagnostics</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-8 font-sans">
+        <div class="max-w-lg mx-auto bg-white rounded-2xl border shadow p-6 space-y-4">
+            <h2 class="text-lg font-black text-slate-800">🔧 Logo Storage Diagnostics</h2>
+            <div class="text-sm space-y-1">
+                <p><b>Supabase Storage:</b> {status_html}</p>
+                <p><b>SUPABASE_URL env var:</b> {url_present}</p>
+                <p><b>SUPABASE_KEY env var:</b> {key_present}</p>
+            </div>
+            <div>
+                <p class="text-xs font-bold uppercase text-slate-500 mb-1">Last upload error (this server process)</p>
+                {last_error_html}
+            </div>
+            <p class="text-[11px] text-slate-400">
+                If Supabase shows "Not configured", add SUPABASE_URL and SUPABASE_KEY in Render → Environment,
+                using your Supabase project URL and <b>service_role</b> key, then redeploy. If it shows
+                Configured but there's a recorded error, that error message is exactly what Supabase's API
+                returned when the upload was attempted (e.g. bucket not found, or an access-policy rejection).
+            </p>
+            <a href="/admin/dashboard/{school_id}" class="text-xs font-bold text-indigo-700 hover:underline">← Back to Dashboard</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
 @app.get("/staff/dashboard/{school_id}", response_class=HTMLResponse)
 def staff_dashboard(school_id: int, request: Request, user_id: int = None):
     auth_error = require_school_session(request, school_id)
@@ -1077,6 +1158,8 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None):
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
+                    <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
+                    <a href='/admin/reports/subject-analysis/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-amber-600 hover:bg-amber-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Subj. Analysis</a>
                 </div>
             </div>
         """)
@@ -1195,6 +1278,221 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
             <thead><tr><th>Adm No.</th><th>Full Name</th></tr></thead>
             <tbody>{rows_html or "<tr><td colspan='2' style='padding:20px;text-align:center;color:#94a3b8;'>No students in this class.</td></tr>"}</tbody>
         </table>
+    </body>
+    </html>
+    """
+
+
+@app.get("/admin/reports/merit-list/{school_id}", response_class=HTMLResponse)
+def print_merit_list(school_id: int, grade_name: str, education_level: str, stream: str, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings = cur.fetchone()
+            st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term'}
+
+            cur.execute("""
+                WITH subject_averages AS (
+                    SELECT sc.student_id, sc.learning_area_id, AVG(sc.raw_score) AS subject_avg
+                    FROM student_scores sc
+                    WHERE sc.cycle_name IN ('Opener', 'Midterm', 'End Term')
+                    GROUP BY sc.student_id, sc.learning_area_id
+                ),
+                student_mean_scores AS (
+                    SELECT s.id AS student_id, s.admission_number, s.first_name, s.last_name, s.stream,
+                           COALESCE(AVG(sa.subject_avg), 0) AS final_calculated_mean,
+                           COUNT(sa.subject_avg) AS subjects_evaluated
+                    FROM students s
+                    JOIN classes c ON s.class_id = c.id
+                    LEFT JOIN subject_averages sa ON s.id = sa.student_id
+                    WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
+                      AND (s.status IS NULL OR s.status != 'GRADUATED')
+                      AND (%s = 'SINGLE STREAM' OR s.stream = %s)
+                    GROUP BY s.id, s.admission_number, s.first_name, s.last_name, s.stream
+                )
+                SELECT *, RANK() OVER (ORDER BY final_calculated_mean DESC) AS position, COUNT(*) OVER () AS total_students
+                FROM student_mean_scores
+                ORDER BY final_calculated_mean DESC, admission_number ASC;
+            """, (school_id, grade_name, education_level, stream, stream))
+            ranked_students = cur.fetchall()
+
+    logo_src = school.get('logo_url')
+    logo_html = ""
+    if logo_src:
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
+
+    rows_html = "".join(
+        f"""<tr>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['position']}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;'>{esc(r['admission_number'])}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{esc(r['first_name'])} {esc(r['last_name'])}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{float(r['final_calculated_mean']):.1f}%</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{evaluate_performance_metrics(float(r['final_calculated_mean']))['pld']}</td>
+        </tr>"""
+        for r in ranked_students
+    )
+
+    class_title = grade_name if stream == "SINGLE STREAM" else f"{grade_name} — {stream}"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Merit List — {esc(class_title)}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
+            @media print {{ .no-print {{ display: none !important; }} }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+            th {{ text-align:left; padding:8px 12px; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:12px; text-transform:uppercase; color:#64748b; }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
+            {logo_html}
+            <div>
+                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">{esc(class_title)} — Merit List ({st['active_term']} • {st['active_cycle']}) — {len(ranked_students)} students</p>
+            </div>
+        </div>
+        <table>
+            <thead><tr><th style="text-align:center;">Pos.</th><th>Adm No.</th><th>Full Name</th><th style="text-align:center;">Mean Score</th><th style="text-align:center;">Level</th></tr></thead>
+            <tbody>{rows_html or "<tr><td colspan='5' style='padding:20px;text-align:center;color:#94a3b8;'>No scores recorded yet for this class.</td></tr>"}</tbody>
+        </table>
+    </body>
+    </html>
+    """
+
+
+@app.get("/admin/reports/subject-analysis/{school_id}", response_class=HTMLResponse)
+def print_subject_analysis(school_id: int, grade_name: str, education_level: str, stream: str, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings = cur.fetchone()
+            st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term'}
+
+            cur.execute("""
+                SELECT s.id
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
+                  AND (s.status IS NULL OR s.status != 'GRADUATED')
+                  AND (%s = 'SINGLE STREAM' OR s.stream = %s);
+            """, (school_id, grade_name, education_level, stream, stream))
+            student_ids = [row['id'] for row in cur.fetchall()]
+
+            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
+            subjects = cur.fetchall()
+
+            score_map = {}
+            if student_ids:
+                cur.execute("""
+                    SELECT student_id, learning_area_id, cycle_name, raw_score
+                    FROM student_scores
+                    WHERE student_id = ANY(%s);
+                """, (student_ids,))
+                for row in cur.fetchall():
+                    score_map.setdefault(row['student_id'], {}).setdefault(row['learning_area_id'], {})[row['cycle_name']] = float(row['raw_score'])
+
+    subject_stats = []
+    for sub in subjects:
+        subject_means = []
+        level_counts = {'EE': 0, 'ME': 0, 'AE': 0, 'BE': 0}
+        for sid in student_ids:
+            cycles = score_map.get(sid, {}).get(sub['id'], {})
+            if cycles:
+                m = sum(cycles.values()) / len(cycles)
+                subject_means.append(m)
+                pld = evaluate_performance_metrics(m)['pld']
+                bucket = pld[:2]
+                if bucket in level_counts:
+                    level_counts[bucket] += 1
+        subject_mean = sum(subject_means) / len(subject_means) if subject_means else 0
+        subject_stats.append({
+            'name': sub['name'],
+            'mean': subject_mean,
+            'entries': len(subject_means),
+            'levels': level_counts,
+        })
+
+    subject_stats.sort(key=lambda x: x['mean'], reverse=True)
+
+    logo_src = school.get('logo_url')
+    logo_html = ""
+    if logo_src:
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
+
+    rows_html = "".join(
+        f"""<tr>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:bold;'>{esc(sub['name'])}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{sub['mean']:.1f}%</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{evaluate_performance_metrics(sub['mean'])['pld'] if sub['entries'] else '-'}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{sub['levels']['EE']}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{sub['levels']['ME']}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{sub['levels']['AE']}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{sub['levels']['BE']}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{sub['entries']}/{len(student_ids)}</td>
+        </tr>"""
+        for sub in subject_stats
+    )
+
+    class_title = grade_name if stream == "SINGLE STREAM" else f"{grade_name} — {stream}"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Subject Analysis — {esc(class_title)}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
+            @media print {{ .no-print {{ display: none !important; }} }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+            th {{ text-align:left; padding:8px 12px; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:12px; text-transform:uppercase; color:#64748b; }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            <button onclick="window.print()" style="background:#0d9488;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #0d9488;padding-bottom:12px;">
+            {logo_html}
+            <div>
+                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">{esc(class_title)} — Subject Analysis ({st['active_term']} • {st['active_cycle']}) — {len(student_ids)} students</p>
+            </div>
+        </div>
+        <table>
+            <thead><tr>
+                <th>Subject</th><th style="text-align:center;">Mean Score</th><th style="text-align:center;">Level</th>
+                <th style="text-align:center;">EE</th><th style="text-align:center;">ME</th><th style="text-align:center;">AE</th><th style="text-align:center;">BE</th>
+                <th style="text-align:center;">Entries</th>
+            </tr></thead>
+            <tbody>{rows_html or "<tr><td colspan='8' style='padding:20px;text-align:center;color:#94a3b8;'>No subjects or scores found for this class.</td></tr>"}</tbody>
+        </table>
+        <p style="font-size:10px;color:#94a3b8;margin-top:12px;">EE = Exceeding Expectations · ME = Meeting Expectations · AE = Approaching Expectations · BE = Below Expectations. Counts reflect students with at least one score recorded for that subject.</p>
     </body>
     </html>
     """
