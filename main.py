@@ -1598,8 +1598,6 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
 
-            # Whole grade, every stream combined — matches how this report is
-            # actually used at the school (one merit list per grade, not per stream).
             cur.execute("""
                 SELECT s.id, s.admission_number, s.first_name, s.last_name, s.stream
                 FROM students s
@@ -1625,8 +1623,6 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                     score_map.setdefault(row['student_id'], {})[row['learning_area_id']] = float(row['raw_score'])
 
     total_subjects = len(subjects)
-
-    # Per-student computed metrics for this single exam sitting
     computed = []
     for s in students:
         s_scores = score_map.get(s['id'], {})
@@ -1659,7 +1655,6 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             'overall_level': overall_level,
         })
 
-    # Rank by total marks: overall (whole grade) and within-stream
     def _rank_by_total_marks(rows):
         ranked = sorted(rows, key=lambda r: r['total_marks'], reverse=True)
         positions = {}
@@ -1680,7 +1675,9 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
     for stream_name, rows in stream_groups.items():
         stream_positions.update(_rank_by_total_marks(rows))
 
-    # Class-wide averages per subject, for the footer summary table
+    # --- KEY CHANGE: Sort by Total Marks for Merit Ranking ---
+    computed.sort(key=lambda x: x['total_marks'], reverse=True)
+
     subject_footer = []
     for sub in subjects:
         vals = [c['subject_cells'][sub['id']][0] for c in computed if c['subject_cells'][sub['id']] is not None]
@@ -1694,29 +1691,15 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         subject_footer.append({'name': sub['name'], 'avg_mark': avg_mark, 'avg_pts': avg_pts, 'level': level})
 
     class_average_marks = (sum(c['total_marks'] for c in computed) / len(computed)) if computed else 0.0
-
     logo_src = school.get('logo_url')
-    logo_html = ""
-    if logo_src:
-        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
-        logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
-
+    logo_html = f"<img src='{logo_src if logo_src and logo_src.startswith('http') else '/' + (logo_src.lstrip('/') if logo_src else '')}' style='width:64px;height:64px;object-fit:contain;' />" if logo_src else ""
     exam_code = f"{grade_name.replace(' ', '').upper()}{st.get('active_year', 2026)}{str(st['active_cycle']).upper().replace(' ', '')}"
-
     subject_header_cells = "".join(f"<th style='text-align:center;'>{esc(abbreviate_subject(sub['name']))}</th>" for sub in subjects)
 
     body_rows = []
     for i, row in enumerate(computed, start=1):
         s = row['student']
-        subject_cells_html = ""
-        for sub in subjects:
-            cell = row['subject_cells'][sub['id']]
-            if cell is None:
-                subject_cells_html += "<td style='text-align:center;color:#cbd5e1;'>-</td>"
-            else:
-                score, pld = cell
-                subject_cells_html += f"<td style='text-align:center;white-space:nowrap;'>{score:.0f} {pld}</td>"
-
+        subject_cells_html = "".join([f"<td style='text-align:center;white-space:nowrap;'>{cell[0]:.0f} {cell[1]}</td>" if cell else "<td style='text-align:center;color:#cbd5e1;'>-</td>" for cell in [row['subject_cells'][sub['id']] for sub in subjects]])
         body_rows.append(f"""
             <tr>
                 <td style='text-align:center;'>{i}</td>
@@ -1737,7 +1720,6 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             </tr>
         """)
     rows_html = "".join(body_rows)
-
     footer_subject_cells = "".join(
         f"<th style='text-align:center;'>{esc(abbreviate_subject(f['name']))}</th>" for f in subject_footer
     )
