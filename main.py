@@ -6,6 +6,7 @@ import random
 import urllib.parse
 import logging
 import bcrypt
+import psycopg2
 from psycopg2 import pool as psycopg2_pool
 import requests as http_requests
 from datetime import datetime, timedelta
@@ -133,25 +134,65 @@ if not DATABASE_URL:
 # (not SimpleConnectionPool) because FastAPI's sync routes run across
 # multiple worker threads. Sized generously for 4-8 schools; adjust via
 # env vars if you scale well beyond that.
-_db_pool = psycopg2_pool.ThreadedConnectionPool(
-    int(os.getenv("DB_POOL_MIN_CONN", "2")),
-    int(os.getenv("DB_POOL_MAX_CONN", "20")),
-    dsn=DATABASE_URL,
-)
+# 1. Connection pool — reuses a small set of open connections instead of
+# opening/closing a new one on every request. Uses ThreadedConnectionPool
+# (not SimpleConnectionPool) because FastAPI's sync routes run across
+# multiple worker threads. Sized generously for 4-8 schools; adjust via
+# env vars if you scale well beyond that.
+#
+# Created lazily (on first actual use) rather than at import time — so if
+# Neon happens to be unreachable at the exact moment the app starts up, the
+# app still boots, and the pool just gets created on the first request that
+# needs it (matching how the old per-request connect() behaved).
+_db_pool = None
+
+def _get_pool():
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = psycopg2_pool.ThreadedConnectionPool(
+            int(os.getenv("DB_POOL_MIN_CONN", "2")),
+            int(os.getenv("DB_POOL_MAX_CONN", "20")),
+            dsn=DATABASE_URL,
+        )
+    return _db_pool
 
 @contextmanager
 def get_db_connection():
-    conn = _db_pool.getconn()
+    pool = _get_pool()
+    conn = pool.getconn()
+
+    # Neon (especially on autosuspend/free tiers) can silently close idle
+    # connections. A connection sitting in our pool can go stale between
+    # requests without psycopg2 immediately knowing — catch that here rather
+    # than handing a dead connection to a route.
+    if conn.closed:
+        pool.putconn(conn, close=True)
+        conn = pool.getconn()
+
     try:
         yield conn
     except Exception:
         # If something went wrong mid-transaction, roll back before the
         # connection goes back in the pool so the next borrower doesn't
-        # inherit a half-finished transaction.
-        conn.rollback()
+        # inherit a half-finished transaction. Guard against the connection
+        # itself having died during the request (rollback would then raise).
+        try:
+            if not conn.closed:
+                conn.rollback()
+        except psycopg2.InterfaceError:
+            pass
         raise
     finally:
-        _db_pool.putconn(conn)
+        # Never return a dead connection to the pool — that just hands the
+        # same crash to the next request. Discard it so the pool opens a
+        # fresh one next time it's needed.
+        try:
+            if conn.closed:
+                pool.putconn(conn, close=True)
+            else:
+                pool.putconn(conn)
+        except psycopg2_pool.PoolError:
+            pass
 
 def get_current_session_user(request: Request):
     """Looks up the actual logged-in user's role and school_id from the
