@@ -6,7 +6,7 @@ import random
 import urllib.parse
 import logging
 import bcrypt
-import psycopg2
+from psycopg2 import pool as psycopg2_pool
 import requests as http_requests
 from datetime import datetime, timedelta
 from contextlib import contextmanager
@@ -128,26 +128,59 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL must be set in Render environment variables.")
 
-import psycopg2
-import os
-from contextlib import contextmanager
+# 1. Connection pool — reuses a small set of open connections instead of
+# opening/closing a new one on every request. Uses ThreadedConnectionPool
+# (not SimpleConnectionPool) because FastAPI's sync routes run across
+# multiple worker threads. Sized generously for 4-8 schools; adjust via
+# env vars if you scale well beyond that.
+_db_pool = psycopg2_pool.ThreadedConnectionPool(
+    int(os.getenv("DB_POOL_MIN_CONN", "2")),
+    int(os.getenv("DB_POOL_MAX_CONN", "20")),
+    dsn=DATABASE_URL,
+)
 
-# 1. Simple Context Manager
 @contextmanager
 def get_db_connection():
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    conn = _db_pool.getconn()
     try:
         yield conn
+    except Exception:
+        # If something went wrong mid-transaction, roll back before the
+        # connection goes back in the pool so the next borrower doesn't
+        # inherit a half-finished transaction.
+        conn.rollback()
+        raise
     finally:
-        conn.close()
+        _db_pool.putconn(conn)
+
+def get_current_session_user(request: Request):
+    """Looks up the actual logged-in user's role and school_id from the
+    database via session_user_id, rather than trusting the session_role /
+    session_school_id cookie values directly. Cookies (even httponly ones)
+    can be edited client-side via browser dev tools, so authorization
+    decisions must never trust their contents — only use session_user_id
+    as a lookup key. Returns a dict {id, role, school_id, is_verified} or
+    None if there's no valid session."""
+    user_id = request.cookies.get("session_user_id")
+    if not user_id:
+        return None
+    try:
+        user_id = int(user_id)
+    except ValueError:
+        return None
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, role, school_id, is_verified FROM users WHERE id = %s;", (user_id,))
+            return cur.fetchone()
 
 def require_school_session(request: Request, school_id: int):
-    """Confirms the request carries a valid session cookie for this school.
-    Returns a redirect Response if unauthenticated, or None if OK to proceed."""
-    session_school_id = request.cookies.get("session_school_id")
-    if not session_school_id:
+    """Confirms the request belongs to a real, currently valid account tied
+    to this school. Returns a redirect Response if unauthenticated, or None
+    if OK to proceed."""
+    user = get_current_session_user(request)
+    if not user:
         return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
-    if str(session_school_id) != str(school_id):
+    if user['role'] != 'superadmin' and str(user['school_id']) != str(school_id):
         raise HTTPException(
             status_code=403,
             detail="Access Denied: You do not have privileges for this institution."
@@ -155,14 +188,17 @@ def require_school_session(request: Request, school_id: int):
     return None
 
 def require_admin_session(request: Request, school_id: int):
-    """Like require_school_session, but also blocks staff-role sessions.
-    Sessions with no role cookie (pre-existing logins from before staff
-    accounts existed) are treated as admin for backward compatibility."""
-    auth_error = require_school_session(request, school_id)
-    if auth_error:
-        return auth_error
-    role = request.cookies.get("session_role")
-    if role == "staff":
+    """Like require_school_session, but also blocks staff-role accounts —
+    verified from the database, not from a client-supplied cookie value."""
+    user = get_current_session_user(request)
+    if not user:
+        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
+    if user['role'] != 'superadmin' and str(user['school_id']) != str(school_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: You do not have privileges for this institution."
+        )
+    if user['role'] == 'staff':
         raise HTTPException(
             status_code=403,
             detail="Access Denied: Administrator privileges required for this action."
@@ -172,16 +208,16 @@ def require_admin_session(request: Request, school_id: int):
 def get_dashboard_url(request: Request, school_id: int) -> str:
     """Returns the correct 'home' dashboard URL for whoever is logged in —
     staff go back to their own portal, not the admin-only dashboard."""
-    role = request.cookies.get("session_role")
-    if role == "staff":
-        user_id = request.cookies.get("session_user_id", "")
-        return f"/staff/dashboard/{school_id}?user_id={user_id}"
+    user = get_current_session_user(request)
+    if user and user['role'] == 'staff':
+        return f"/staff/dashboard/{school_id}?user_id={user['id']}"
     return f"/admin/dashboard/{school_id}"
 
 def require_superadmin_session(request: Request):
-    """Gates the super admin portal — not tied to any single school_id."""
-    role = request.cookies.get("session_role")
-    if role != "superadmin":
+    """Gates the super admin portal — not tied to any single school_id.
+    Verified from the database, not from a client-supplied cookie value."""
+    user = get_current_session_user(request)
+    if not user or user['role'] != 'superadmin':
         return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
     return None
 
@@ -352,6 +388,16 @@ def bootstrap_database_schema():
                 WHERE education_level = 'Lower Primary'
                 AND name NOT IN ('MATHEMATICS', 'ENGLISH', 'LUGHA', 'INTEGRATED SCIENCE');
             """)
+
+            # Indexes on columns hit by frequent WHERE/JOIN clauses. Several
+            # tables already get useful leftmost-prefix coverage from their
+            # UNIQUE constraints (e.g. students(school_id, admission_number),
+            # student_scores(student_id, learning_area_id, cycle_name)) — these
+            # add explicit coverage for the access patterns those don't reach.
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_students_class_id ON students (class_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_students_school_status ON students (school_id, status);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_area_cycle ON student_scores (learning_area_id, cycle_name);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_users_school_role ON users (school_id, role);")
 
             conn.commit()
             logger.info("Database initialized successfully.")
