@@ -169,10 +169,49 @@ def require_admin_session(request: Request, school_id: int):
         )
     return None
 
+def get_dashboard_url(request: Request, school_id: int) -> str:
+    """Returns the correct 'home' dashboard URL for whoever is logged in —
+    staff go back to their own portal, not the admin-only dashboard."""
+    role = request.cookies.get("session_role")
+    if role == "staff":
+        user_id = request.cookies.get("session_user_id", "")
+        return f"/staff/dashboard/{school_id}?user_id={user_id}"
+    return f"/admin/dashboard/{school_id}"
+
+def require_superadmin_session(request: Request):
+    """Gates the super admin portal — not tied to any single school_id."""
+    role = request.cookies.get("session_role")
+    if role != "superadmin":
+        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
+    return None
+
+# --- Login rate limiting (brute-force protection) ---
+# DB-backed (not an in-memory dict) so it works correctly across multiple
+# gunicorn worker processes, which don't share memory.
+LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
+LOGIN_RATE_LIMIT_WINDOW_MINUTES = 15
+
+def is_login_rate_limited(cur, identifier: str) -> bool:
+    """Returns True if this identifier (email, lowercased) has had too many
+    failed login attempts within the recent window."""
+    cur.execute(f"""
+        SELECT COUNT(*) AS cnt FROM login_attempts
+        WHERE identifier = %s AND attempted_at > NOW() - INTERVAL '{LOGIN_RATE_LIMIT_WINDOW_MINUTES} minutes';
+    """, (identifier,))
+    return cur.fetchone()['cnt'] >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS
+
+def record_failed_login(cur, identifier: str):
+    cur.execute("INSERT INTO login_attempts (identifier) VALUES (%s);", (identifier,))
+    # Opportunistic cleanup so this table doesn't grow unbounded.
+    cur.execute("DELETE FROM login_attempts WHERE attempted_at < NOW() - INTERVAL '1 day';")
+
+def clear_failed_logins(cur, identifier: str):
+    cur.execute("DELETE FROM login_attempts WHERE identifier = %s;", (identifier,))
+
 # 2. Bootstrap Function
 def bootstrap_database_schema():
     """Initializes tables and populates base data."""
-    print("Bootstrapping database schema...")
+    logger.info("Bootstrapping database schema...")
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             # Create Tables
@@ -184,8 +223,18 @@ def bootstrap_database_schema():
                     physical_address VARCHAR(255) NOT NULL,
                     logo_url VARCHAR(512),
                     wallet_balance NUMERIC(12, 2) DEFAULT 0.00,
-                    theme_color VARCHAR(50) DEFAULT 'emerald'
+                    theme_color VARCHAR(50) DEFAULT 'emerald',
+                    status VARCHAR(20) NOT NULL DEFAULT 'active',
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    terms_accepted_at TIMESTAMP
                 );
+
+                -- Safe, idempotent migration for schools that already existed
+                -- before this version — they default to 'active' so nobody
+                -- already using the system gets locked out.
+                ALTER TABLE schools ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';
+                ALTER TABLE schools ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+                ALTER TABLE schools ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMP;
 
                 CREATE TABLE IF NOT EXISTS school_settings (
                     school_id INTEGER PRIMARY KEY REFERENCES schools(id) ON DELETE CASCADE,
@@ -223,6 +272,13 @@ def bootstrap_database_schema():
                     used BOOLEAN DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
+
+                CREATE TABLE IF NOT EXISTS login_attempts (
+                    id SERIAL PRIMARY KEY,
+                    identifier VARCHAR(255) NOT NULL,
+                    attempted_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_login_attempts_identifier ON login_attempts (identifier, attempted_at);
 
                 CREATE TABLE IF NOT EXISTS classes (
                     id SERIAL PRIMARY KEY,
@@ -298,10 +354,44 @@ def bootstrap_database_schema():
             """)
 
             conn.commit()
-            print("Database initialized successfully.")
+            logger.info("Database initialized successfully.")
+
+def bootstrap_super_admin():
+    """Creates (or updates the password of) a platform super admin account
+    from environment variables. There is deliberately no public signup form
+    for this role — set SUPERADMIN_EMAIL and SUPERADMIN_PASSWORD on Render
+    to control who can access the super admin portal."""
+    email = (os.getenv("SUPERADMIN_EMAIL") or "").strip().lower()
+    password = os.getenv("SUPERADMIN_PASSWORD") or ""
+
+    if not email or not password:
+        logger.warning(
+            "SUPERADMIN_EMAIL / SUPERADMIN_PASSWORD not set — the super admin "
+            "portal has no account to log into until these are configured."
+        )
+        return
+
+    hashed_password = get_password_hash(password[:72])
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE email = %s;", (email,))
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    "UPDATE users SET password_hash = %s, role = 'superadmin', is_verified = TRUE WHERE id = %s;",
+                    (hashed_password, existing[0]),
+                )
+            else:
+                cur.execute("""
+                    INSERT INTO users (email, password_hash, role, school_id, is_verified)
+                    VALUES (%s, %s, 'superadmin', NULL, TRUE);
+                """, (email, hashed_password))
+            conn.commit()
+    logger.info(f"Super admin account ready: {email}")
 
 # 3. Call it on startup
 bootstrap_database_schema()
+bootstrap_super_admin()
 # --- Core Business & CBE Analytics Helper Logic ---
 def evaluate_performance_metrics(score: float) -> dict:
     try:
@@ -445,10 +535,17 @@ def login_portal():
 
 @app.post("/api/v1/auth/login")
 def process_login(email: str = Form(...), password: str = Form(...)):
+    email = email.strip().lower()
     safe_password = password[:72]
-    
+
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if is_login_rate_limited(cur, email):
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Too many failed login attempts for this account. Please wait {LOGIN_RATE_LIMIT_WINDOW_MINUTES} minutes and try again."
+                )
+
             # Querying using the correct column 'email'
             cur.execute("SELECT * FROM users WHERE email = %s;", (email,))
             user = cur.fetchone()
@@ -472,16 +569,39 @@ def process_login(email: str = Form(...), password: str = Form(...)):
                     is_valid = True
                 
                 if is_valid:
-                    if user['role'] == 'admin':
-                        response = RedirectResponse(url=f"/admin/dashboard/{user['school_id']}", status_code=303)
+                    clear_failed_logins(cur, email)
+                    conn.commit()
+
+                    if user['role'] == 'superadmin':
+                        response = RedirectResponse(url="/superadmin/dashboard", status_code=303)
                     else:
-                        if not user['is_verified']:
-                            raise HTTPException(status_code=403, detail="Access Denied: Staff verification pending admin approval.")
-                        response = RedirectResponse(url=f"/staff/dashboard/{user['school_id']}?user_id={user['id']}", status_code=303)
+                        # Admin and staff both belong to a school — check that
+                        # school hasn't been paused or is still awaiting approval.
+                        cur.execute("SELECT status FROM schools WHERE id = %s;", (user['school_id'],))
+                        school_row = cur.fetchone()
+                        school_status = school_row['status'] if school_row else 'active'
+
+                        if school_status == 'pending':
+                            raise HTTPException(
+                                status_code=403,
+                                detail="Your school's registration is still awaiting approval from the platform administrator. You'll be able to log in once it's approved."
+                            )
+                        if school_status == 'deactivated':
+                            raise HTTPException(
+                                status_code=403,
+                                detail="This school's account has been deactivated. Please contact the platform administrator."
+                            )
+
+                        if user['role'] == 'admin':
+                            response = RedirectResponse(url=f"/admin/dashboard/{user['school_id']}", status_code=303)
+                        else:
+                            if not user['is_verified']:
+                                raise HTTPException(status_code=403, detail="Access Denied: Staff verification pending admin approval.")
+                            response = RedirectResponse(url=f"/staff/dashboard/{user['school_id']}?user_id={user['id']}", status_code=303)
                     
                     response.set_cookie(
                         key="session_school_id",
-                        value=str(user['school_id']),
+                        value=str(user['school_id']) if user['school_id'] is not None else "0",
                         httponly=True,
                         samesite="lax",
                         secure=os.getenv("COOKIE_SECURE", "false").lower() == "true",
@@ -504,6 +624,12 @@ def process_login(email: str = Form(...), password: str = Form(...)):
                         max_age=60 * 60 * 24 * 7,
                     )
                     return response
+
+            # Either the user wasn't found, or the password was wrong — record
+            # a failed attempt against this email either way (this also
+            # naturally rate-limits repeated guesses against unknown emails).
+            record_failed_login(cur, email)
+            conn.commit()
     
     # If no user found or password invalid
     raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -659,6 +785,67 @@ def reset_password_submit(email: str = Form(...), reset_code: str = Form(...), n
     </script>
     """)
 
+@app.get("/terms", response_class=HTMLResponse)
+def terms_and_conditions_page():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Terms and Conditions</title>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    </head>
+    <body class="bg-slate-100 min-h-screen py-10 px-6">
+        <div class="max-w-3xl mx-auto bg-white rounded-2xl border shadow-xs p-8 space-y-5 text-sm text-slate-700 leading-relaxed">
+            <h1 class="text-2xl font-black text-slate-900">Terms and Conditions</h1>
+            <p class="text-xs text-slate-400">Last updated: 2026</p>
+
+            <p class="text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg p-3">
+                <b>Note to the school operator:</b> this is a starting template, not a substitute for legal advice.
+                Please have it reviewed by a lawyer familiar with Kenyan data protection law (the Data Protection Act, 2019)
+                before relying on it, especially given that this system stores learners' personal and academic records.
+            </p>
+
+            <div>
+                <h2 class="font-bold text-slate-900 mb-1">1. Acceptance of Terms</h2>
+                <p>By registering a school on this platform, you confirm that you are authorized to act on behalf of your institution and agree to be bound by these Terms and Conditions.</p>
+            </div>
+            <div>
+                <h2 class="font-bold text-slate-900 mb-1">2. Account Registration and Approval</h2>
+                <p>New school accounts are reviewed before activation. Access to the dashboard, student records, and reporting tools is granted only once your school's registration has been approved by the platform administrator.</p>
+            </div>
+            <div>
+                <h2 class="font-bold text-slate-900 mb-1">3. Data You Provide</h2>
+                <p>Your school is responsible for the accuracy of student, staff, and academic data entered into the system. You confirm that you have the necessary consent from parents/guardians and staff to store and process this data for the purpose of academic reporting.</p>
+            </div>
+            <div>
+                <h2 class="font-bold text-slate-900 mb-1">4. Use of Student Images and Data</h2>
+                <p>Where your school uploads a logo, photos, or other identifying content, you confirm that you hold appropriate rights and consent to use that content within the system.</p>
+            </div>
+            <div>
+                <h2 class="font-bold text-slate-900 mb-1">5. Account Security</h2>
+                <p>You are responsible for keeping your administrator and staff login credentials confidential. Notify the platform administrator immediately if you suspect unauthorized access to your account.</p>
+            </div>
+            <div>
+                <h2 class="font-bold text-slate-900 mb-1">6. Service Availability</h2>
+                <p>The platform is provided on an "as available" basis. While reasonable efforts are made to keep the service running and data backed up, no guarantee of uninterrupted availability is made.</p>
+            </div>
+            <div>
+                <h2 class="font-bold text-slate-900 mb-1">7. Suspension and Termination</h2>
+                <p>The platform administrator may suspend or deactivate a school's account for violations of these terms, non-payment, misuse of the platform, or at their discretion with reasonable notice where practical.</p>
+            </div>
+            <div>
+                <h2 class="font-bold text-slate-900 mb-1">8. Changes to These Terms</h2>
+                <p>These terms may be updated from time to time. Continued use of the platform after changes are posted constitutes acceptance of the revised terms.</p>
+            </div>
+
+            <div class="pt-4 border-t">
+                <a href="/register" class="text-emerald-700 font-bold hover:underline text-xs">← Back to registration</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
 @app.get("/register", response_class=HTMLResponse)
 def public_registration_portal():
     return f"""
@@ -696,6 +883,10 @@ def public_registration_portal():
                 <div class="bg-slate-50 p-4 rounded-xl border space-y-3">
                     <h3 class="font-black text-slate-700 uppercase tracking-wide">🔒 Super-Admin Account Security Credentials</h3>
                     <div>
+                        <label class="block font-bold text-slate-600">Administrator Full Name</label>
+                        <input type="text" name="admin_full_name" placeholder="e.g. Francis Mwangi" class="w-full p-2.5 border rounded-lg mt-1 bg-white" required>
+                    </div>
+                    <div>
                         <label class="block font-bold text-slate-600">Primary Administrator Username (Email Address)</label>
                         <input type="email" name="admin_email" placeholder="admin@school.ac.ke" class="w-full p-2.5 border rounded-lg mt-1 bg-white" required>
                     </div>
@@ -708,6 +899,17 @@ def public_registration_portal():
                         <input type="tel" name="admin_phone_number" placeholder="07XXXXXXXX" class="w-full p-2.5 border rounded-lg mt-1 bg-white" required>
                         <p class="text-[10px] text-slate-400 mt-1">Used only for password-reset codes via SMS.</p>
                     </div>
+                </div>
+
+                <div class="bg-white p-4 rounded-xl border">
+                    <label class="flex items-start gap-2.5 cursor-pointer">
+                        <input type="checkbox" name="accept_terms" value="1" class="mt-0.5 w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500 cursor-pointer" required>
+                        <span class="text-xs text-slate-600">
+                            I have read and agree to the
+                            <a href="/terms" target="_blank" class="text-emerald-700 font-bold hover:underline">Terms and Conditions</a>
+                            on behalf of this institution.
+                        </span>
+                    </label>
                 </div>
 
                 <div class="flex items-center justify-between pt-2">
@@ -725,21 +927,28 @@ async def register_new_tenant_pipeline(
     school_name: str = Form(...),
     sub_county: str = Form(...),
     physical_address: str = Form(...),
+    admin_full_name: str = Form(...),
     admin_email: str = Form(...),
     admin_password: str = Form(...),
     admin_phone_number: str = Form(...),
+    accept_terms: str = Form(None),
     logo_file: UploadFile = File(None)
 ):
     school_name = school_name.strip()
     sub_county = sub_county.strip()
     physical_address = physical_address.strip()
+    admin_full_name = admin_full_name.strip()
     admin_phone_number = admin_phone_number.strip()
     admin_email = admin_email.strip().lower()
 
     if not school_name or not sub_county or not physical_address:
         raise HTTPException(status_code=400, detail="School name, sub-county, and address are all required.")
+    if not admin_full_name:
+        raise HTTPException(status_code=400, detail="Administrator full name is required.")
     if len(admin_password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
+    if not accept_terms:
+        raise HTTPException(status_code=400, detail="You must agree to the Terms and Conditions to register.")
 
     logo_resolved_url = None
     if logo_file and logo_file.filename:
@@ -789,8 +998,8 @@ async def register_new_tenant_pipeline(
                 raise HTTPException(status_code=400, detail="Registration Refused: Email already allocated.")
             
             cur.execute("""
-                INSERT INTO schools (name, sub_county, physical_address, logo_url, wallet_balance, theme_color)
-                VALUES (%s, %s, %s, %s, 0.00, 'emerald') RETURNING id;
+                INSERT INTO schools (name, sub_county, physical_address, logo_url, wallet_balance, theme_color, status, terms_accepted_at)
+                VALUES (%s, %s, %s, %s, 0.00, 'emerald', 'pending', NOW()) RETURNING id;
             """, (school_name, sub_county, physical_address, logo_resolved_url))
             new_school_id = cur.fetchone()['id']
 
@@ -800,9 +1009,9 @@ async def register_new_tenant_pipeline(
             """, (new_school_id,))
 
             cur.execute("""
-                INSERT INTO users (email, password_hash, role, school_id, is_verified, phone_number)
-                VALUES (%s, %s, 'admin', %s, TRUE, %s);
-            """, (admin_email, hashed_password, new_school_id, admin_phone_number))
+                INSERT INTO users (email, password_hash, role, school_id, is_verified, phone_number, full_name)
+                VALUES (%s, %s, 'admin', %s, TRUE, %s, %s);
+            """, (admin_email, hashed_password, new_school_id, admin_phone_number, admin_full_name))
 
             conn.commit()
 
@@ -932,6 +1141,14 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
+
+            admin_user_id = request.cookies.get("session_user_id")
+            admin_name = None
+            if admin_user_id:
+                cur.execute("SELECT full_name FROM users WHERE id = %s AND school_id = %s AND role = 'admin';", (admin_user_id, school_id))
+                admin_row = cur.fetchone()
+                if admin_row:
+                    admin_name = admin_row['full_name']
         
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
@@ -1149,6 +1366,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <div>
                     <h1 class="text-base font-bold text-slate-900 tracking-tight">{esc(school['name'])}</h1>
                     <p class="text-xs text-slate-500">{esc(school['physical_address'])} • {esc(school['sub_county'])} Sub-County</p>
+                    {f'<p class="text-[11px] text-indigo-700 font-bold mt-0.5">Welcome, {esc(admin_name.split(" ")[0])}</p>' if admin_name else ''}
                 </div>
             </div>
             <div class="flex items-center space-x-3 text-xs font-semibold mr-14">
@@ -1339,6 +1557,194 @@ def logout():
     return response
 
 
+@app.get("/superadmin/dashboard", response_class=HTMLResponse)
+def superadmin_dashboard(request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT sc.*,
+                    (SELECT COUNT(*) FROM students st WHERE st.school_id = sc.id AND (st.status IS NULL OR st.status != 'GRADUATED')) AS student_count,
+                    (SELECT COUNT(*) FROM users u WHERE u.school_id = sc.id AND u.role = 'staff') AS staff_count
+                FROM schools sc
+                ORDER BY
+                    CASE sc.status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,
+                    sc.created_at DESC;
+            """)
+            schools = cur.fetchall()
+
+    total_schools = len(schools)
+    pending_count = len([s for s in schools if s['status'] == 'pending'])
+    active_count = len([s for s in schools if s['status'] == 'active'])
+    deactivated_count = len([s for s in schools if s['status'] == 'deactivated'])
+
+    status_styles = {
+        'pending': ("bg-amber-50 text-amber-700 border-amber-200", "Pending Approval"),
+        'active': ("bg-emerald-50 text-emerald-700 border-emerald-200", "Active"),
+        'deactivated': ("bg-rose-50 text-rose-700 border-rose-200", "Deactivated"),
+    }
+
+    rows_html = ""
+    for s in schools:
+        style_class, status_label = status_styles.get(s['status'], ("bg-slate-50 text-slate-700 border-slate-200", s['status']))
+        action_buttons = ""
+        if s['status'] == 'pending':
+            action_buttons += f"""
+                <form action="/api/v1/superadmin/school/approve/{s['id']}" method="post" class="inline">
+                    <button type="submit" class="text-emerald-700 hover:text-emerald-900 font-bold">Approve</button>
+                </form>
+            """
+        elif s['status'] == 'active':
+            action_buttons += f"""
+                <form action="/api/v1/superadmin/school/deactivate/{s['id']}" method="post" class="inline" onsubmit="return confirm('Deactivate {esc(s['name'])}? Its admin and staff will be unable to log in until reactivated.');">
+                    <button type="submit" class="text-amber-700 hover:text-amber-900 font-bold">Deactivate</button>
+                </form>
+            """
+        elif s['status'] == 'deactivated':
+            action_buttons += f"""
+                <form action="/api/v1/superadmin/school/reactivate/{s['id']}" method="post" class="inline">
+                    <button type="submit" class="text-emerald-700 hover:text-emerald-900 font-bold">Reactivate</button>
+                </form>
+            """
+        action_buttons += f"""
+            <form action="/api/v1/superadmin/school/delete/{s['id']}" method="post" class="inline" onsubmit="return confirm('Permanently delete {esc(s['name'])}? This deletes ALL of its students, scores, staff, and settings. This cannot be undone.');">
+                <button type="submit" class="text-rose-600 hover:text-rose-800 font-bold ml-3">Delete</button>
+            </form>
+        """
+
+        rows_html += f"""
+        <tr class="border-b border-slate-100 text-sm">
+            <td class="p-4">
+                <p class="font-bold text-slate-900">{esc(s['name'])}</p>
+                <p class="text-xs text-slate-400">{esc(s['sub_county'])}</p>
+            </td>
+            <td class="p-4 text-center"><span class="text-xs font-bold px-2.5 py-1 rounded-full border {style_class}">{status_label}</span></td>
+            <td class="p-4 text-center font-semibold">{s['student_count']}</td>
+            <td class="p-4 text-center font-semibold">{s['staff_count']}</td>
+            <td class="p-4 text-center">KSh {float(s['wallet_balance']):,.2f}</td>
+            <td class="p-4 text-xs text-slate-400">{s['created_at'].strftime('%d %b %Y') if s['created_at'] else '—'}</td>
+            <td class="p-4 text-right text-xs">{action_buttons}</td>
+        </tr>
+        """
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html class="h-full">
+    <head>
+        <title>Super Admin Portal</title>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
+    </head>
+    <body class="bg-[#F8FAFC] text-slate-800 antialiased min-h-full">
+        <header class="bg-slate-900 text-white px-8 py-4 flex justify-between items-center">
+            <h1 class="text-base font-bold tracking-tight">🛡️ Super Admin Portal</h1>
+            <a href="/logout" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs transition">Log Out</a>
+        </header>
+
+        <div class="p-8 max-w-6xl mx-auto w-full">
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
+                <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 border-l-4" style="border-left-color:#4f46e5;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Total Schools</p>
+                    <p class="text-2xl font-black text-slate-900 mt-1">{total_schools}</p>
+                </div>
+                <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 border-l-4" style="border-left-color:#d97706;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Pending Approval</p>
+                    <p class="text-2xl font-black text-slate-900 mt-1">{pending_count}</p>
+                </div>
+                <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 border-l-4" style="border-left-color:#059669;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Active</p>
+                    <p class="text-2xl font-black text-slate-900 mt-1">{active_count}</p>
+                </div>
+                <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 border-l-4" style="border-left-color:#e11d48;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Deactivated</p>
+                    <p class="text-2xl font-black text-slate-900 mt-1">{deactivated_count}</p>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs overflow-hidden">
+                <div class="p-5 border-b border-slate-100 bg-slate-50/40">
+                    <h2 class="text-base font-bold text-slate-900">All Schools</h2>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-100">
+                                <th class="p-4">School</th>
+                                <th class="p-4 text-center">Status</th>
+                                <th class="p-4 text-center">Students</th>
+                                <th class="p-4 text-center">Staff</th>
+                                <th class="p-4 text-center">Wallet</th>
+                                <th class="p-4">Registered</th>
+                                <th class="p-4 text-right">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rows_html or "<tr><td colspan='7' class='text-center p-8 text-slate-400 text-sm italic'>No schools registered yet.</td></tr>"}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/api/v1/superadmin/school/approve/{school_id}")
+def superadmin_approve_school(school_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE schools SET status = 'active' WHERE id = %s;", (school_id,))
+            conn.commit()
+    return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
+@app.post("/api/v1/superadmin/school/deactivate/{school_id}")
+def superadmin_deactivate_school(school_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE schools SET status = 'deactivated' WHERE id = %s;", (school_id,))
+            conn.commit()
+    return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
+@app.post("/api/v1/superadmin/school/reactivate/{school_id}")
+def superadmin_reactivate_school(school_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE schools SET status = 'active' WHERE id = %s;", (school_id,))
+            conn.commit()
+    return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
+@app.post("/api/v1/superadmin/school/delete/{school_id}")
+def superadmin_delete_school(school_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # Cascades to school_settings, users (admin+staff), students, and
+            # (via students) student_scores. Classes and learning_areas are
+            # shared lookup tables, not school-specific, so they're untouched.
+            cur.execute("DELETE FROM schools WHERE id = %s;", (school_id,))
+            conn.commit()
+    return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
 @app.get("/admin/system/diagnostics/{school_id}", response_class=HTMLResponse)
 def storage_diagnostics(school_id: int, request: Request):
     auth_error = require_admin_session(request, school_id)
@@ -1404,11 +1810,14 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None):
             settings = cur.fetchone()
 
             staff_email = None
-            if user_id:
-                cur.execute("SELECT email FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (user_id, school_id))
+            staff_name = None
+            effective_user_id = user_id or request.cookies.get("session_user_id")
+            if effective_user_id:
+                cur.execute("SELECT email, full_name FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (effective_user_id, school_id))
                 staff_user = cur.fetchone()
                 if staff_user:
                     staff_email = staff_user['email']
+                    staff_name = staff_user['full_name']
 
             cur.execute("""
                 SELECT DISTINCT c.id, c.grade_name, s.stream, c.education_level
@@ -1463,6 +1872,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None):
         """)
     class_blocks_html = "".join(class_blocks)
 
+    welcome_html = f"<p class='text-[11px] text-indigo-700 font-bold'>Welcome, {esc(staff_name.split(' ')[0])}</p>" if staff_name else ""
     identity_html = f"<p class='text-xs text-slate-500'>{esc(staff_email)}</p>" if staff_email else ""
 
     return HTMLResponse(f"""
@@ -1483,6 +1893,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None):
                 {logo_html}
                 <div>
                     <h1 class="text-base font-bold text-slate-900 tracking-tight">{esc(school['name'])}</h1>
+                    {welcome_html}
                     {identity_html}
                 </div>
             </div>
@@ -1598,6 +2009,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
 
+            # Whole grade, every stream combined — matches how this report is
+            # actually used at the school (one merit list per grade, not per stream).
             cur.execute("""
                 SELECT s.id, s.admission_number, s.first_name, s.last_name, s.stream
                 FROM students s
@@ -1623,6 +2036,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                     score_map.setdefault(row['student_id'], {})[row['learning_area_id']] = float(row['raw_score'])
 
     total_subjects = len(subjects)
+
+    # Per-student computed metrics for this single exam sitting
     computed = []
     for s in students:
         s_scores = score_map.get(s['id'], {})
@@ -1655,6 +2070,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             'overall_level': overall_level,
         })
 
+    # Rank by total marks: overall (whole grade) and within-stream
     def _rank_by_total_marks(rows):
         ranked = sorted(rows, key=lambda r: r['total_marks'], reverse=True)
         positions = {}
@@ -1675,9 +2091,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
     for stream_name, rows in stream_groups.items():
         stream_positions.update(_rank_by_total_marks(rows))
 
-    # --- KEY CHANGE: Sort by Total Marks for Merit Ranking ---
-    computed.sort(key=lambda x: x['total_marks'], reverse=True)
-
+    # Class-wide averages per subject, for the footer summary table
     subject_footer = []
     for sub in subjects:
         vals = [c['subject_cells'][sub['id']][0] for c in computed if c['subject_cells'][sub['id']] is not None]
@@ -1691,15 +2105,29 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         subject_footer.append({'name': sub['name'], 'avg_mark': avg_mark, 'avg_pts': avg_pts, 'level': level})
 
     class_average_marks = (sum(c['total_marks'] for c in computed) / len(computed)) if computed else 0.0
+
     logo_src = school.get('logo_url')
-    logo_html = f"<img src='{logo_src if logo_src and logo_src.startswith('http') else '/' + (logo_src.lstrip('/') if logo_src else '')}' style='width:64px;height:64px;object-fit:contain;' />" if logo_src else ""
+    logo_html = ""
+    if logo_src:
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
+
     exam_code = f"{grade_name.replace(' ', '').upper()}{st.get('active_year', 2026)}{str(st['active_cycle']).upper().replace(' ', '')}"
+
     subject_header_cells = "".join(f"<th style='text-align:center;'>{esc(abbreviate_subject(sub['name']))}</th>" for sub in subjects)
 
     body_rows = []
     for i, row in enumerate(computed, start=1):
         s = row['student']
-        subject_cells_html = "".join([f"<td style='text-align:center;white-space:nowrap;'>{cell[0]:.0f} {cell[1]}</td>" if cell else "<td style='text-align:center;color:#cbd5e1;'>-</td>" for cell in [row['subject_cells'][sub['id']] for sub in subjects]])
+        subject_cells_html = ""
+        for sub in subjects:
+            cell = row['subject_cells'][sub['id']]
+            if cell is None:
+                subject_cells_html += "<td style='text-align:center;color:#cbd5e1;'>-</td>"
+            else:
+                score, pld = cell
+                subject_cells_html += f"<td style='text-align:center;white-space:nowrap;'>{score:.0f} {pld}</td>"
+
         body_rows.append(f"""
             <tr>
                 <td style='text-align:center;'>{i}</td>
@@ -1720,6 +2148,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             </tr>
         """)
     rows_html = "".join(body_rows)
+
     footer_subject_cells = "".join(
         f"<th style='text-align:center;'>{esc(abbreviate_subject(f['name']))}</th>" for f in subject_footer
     )
@@ -1925,7 +2354,7 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
 
 # --- GET View Routes for Administration Subsystems ---
 @app.get("/admin/student/new/{school_id}", response_class=HTMLResponse)
-def add_student_view(school_id: int):
+def add_student_view(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
@@ -1959,7 +2388,7 @@ def add_student_view(school_id: int):
                 </div>
                 <div class="flex gap-3 pt-2">
                     <button type="submit" class="bg-emerald-700 text-white font-bold py-2 px-4 rounded hover:bg-emerald-800 transition">Save Student</button>
-                    <a href="/admin/dashboard/{school_id}" class="bg-slate-200 text-slate-700 py-2 px-4 rounded hover:bg-slate-300 font-bold transition">Cancel</a>
+                    <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 text-slate-700 py-2 px-4 rounded hover:bg-slate-300 font-bold transition">Cancel</a>
                 </div>
             </form>
         </div>
@@ -2056,7 +2485,7 @@ def delete_staff_permanently(staff_id: int, school_id: int, request: Request):
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
 @app.get("/admin/scores/manage/{school_id}", response_class=HTMLResponse)
-def manage_individual_scores_view(school_id: int, student_id: int):
+def manage_individual_scores_view(school_id: int, student_id: int, request: Request):
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
@@ -2101,7 +2530,7 @@ def manage_individual_scores_view(school_id: int, student_id: int):
                 <h1 class="text-xl font-black">Score Management Engine Matrix</h1>
                 <p class="text-xs text-slate-500 mt-1">Student context: <strong>{esc(student['first_name'])} {esc(student['last_name'])} ({esc(student['admission_number'])})</strong></p>
             </div>
-            <a href="/admin/dashboard/{school_id}" class="bg-slate-200 px-4 py-1.5 rounded-lg text-xs font-bold hover:bg-slate-300">Return Deck</a>
+            <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 px-4 py-1.5 rounded-lg text-xs font-bold hover:bg-slate-300">Return Deck</a>
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -2146,6 +2575,7 @@ def manage_individual_scores_view(school_id: int, student_id: int):
 @app.get("/staff/bulk-entry/{school_id}", response_class=HTMLResponse)
 def educators_bulk_entry_grid(
     school_id: int, 
+    request: Request,
     grade_name: str, 
     stream: str, 
     education_level: str, 
@@ -2210,7 +2640,7 @@ def educators_bulk_entry_grid(
                 <h1 class="text-xl font-black text-slate-900">⚡ Bulk Marks Management Interface</h1>
                 <p class="text-xs text-slate-500 mt-1">Cohort Segment target: <strong>{esc(grade_name)} — {esc(education_level)} (Stream {esc(stream)})</strong></p>
             </div>
-            <a href="/admin/dashboard/{school_id}" class="bg-slate-200 px-4 py-2 rounded-lg text-xs font-black hover:bg-slate-300">Exit Workspace</a>
+            <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 px-4 py-2 rounded-lg text-xs font-black hover:bg-slate-300">Exit Workspace</a>
         </div>
 
         <div class="bg-white p-6 rounded-2xl border shadow-xs">
@@ -2612,6 +3042,7 @@ def update_settings_endpoint(
 @app.post("/api/v1/students/add/{school_id}")
 def backend_add_student(
     school_id: int, 
+    request: Request,
     first_name: str = Form(...), 
     last_name: str = Form(...), 
     admission_number: str = Form(...), 
@@ -2653,7 +3084,7 @@ def backend_add_student(
             """, (school_id, admission_number, first_name, last_name, class_id, processed_stream, education_level))
             conn.commit()
 
-    return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
+    return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
 
 
 @app.post("/api/v1/staff/add/{school_id}")
@@ -2788,7 +3219,7 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     if skipped_entries:
         logger.warning(f"Bulk score save for school {school_id} skipped {skipped_entries} invalid/mismatched entries.")
 
-    return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
+    return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
 
 @app.post("/api/v1/wallet/stkpush/{school_id}")
 def process_simulated_mpesa_stk_push(school_id: int, request: Request, phone_number: str = Form(...), amount: float = Form(...)):
