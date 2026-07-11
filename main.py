@@ -3,6 +3,7 @@ import re
 import uuid
 import html
 import random
+import secrets
 import urllib.parse
 import logging
 import bcrypt
@@ -1697,6 +1698,9 @@ def superadmin_dashboard(request: Request):
                 </form>
             """
         action_buttons += f"""
+            <a href="/superadmin/school/reset-admin-password/{s['id']}" class="text-indigo-700 hover:text-indigo-900 font-bold ml-3">Reset Admin Password</a>
+        """
+        action_buttons += f"""
             <form action="/api/v1/superadmin/school/delete/{s['id']}" method="post" class="inline" onsubmit="return confirm('Permanently delete {esc(s['name'])}? This deletes ALL of its students, scores, staff, and settings. This cannot be undone.');">
                 <button type="submit" class="text-rose-600 hover:text-rose-800 font-bold ml-3">Delete</button>
             </form>
@@ -1830,6 +1834,91 @@ def superadmin_delete_school(school_id: int, request: Request):
             cur.execute("DELETE FROM schools WHERE id = %s;", (school_id,))
             conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
+@app.get("/superadmin/school/reset-admin-password/{school_id}", response_class=HTMLResponse)
+def superadmin_reset_admin_password_form(school_id: int, request: Request, done: str = None):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'admin' ORDER BY id ASC LIMIT 1;", (school_id,))
+            admin = cur.fetchone()
+
+    result_html = ""
+    if done == "1" and admin:
+        # The generated password is passed through a one-time query param
+        # from the POST handler's redirect and shown exactly once.
+        new_password = request.query_params.get("pwd", "")
+        result_html = f"""
+        <div class="bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-lg mb-4">
+            <p class="font-bold mb-1">New password generated:</p>
+            <p class="font-mono text-base bg-white border border-emerald-300 rounded px-3 py-2 inline-block">{esc(new_password)}</p>
+            <p class="text-xs mt-2">Copy this now and relay it to the admin securely — it will not be shown again. They can change it after logging in.</p>
+        </div>
+        """
+
+    if not admin:
+        admin_block = "<p class='text-sm text-rose-600'>No admin account found for this school.</p>"
+    else:
+        admin_block = f"""
+        <p class="text-xs text-slate-500 mb-4">Admin account: <b>{esc(admin['full_name'] or admin['email'])}</b> ({esc(admin['email'])})</p>
+        <form action="/api/v1/superadmin/school/reset-admin-password/{school_id}" method="post" onsubmit="return confirm('Generate a new password for this admin? Their current password will stop working immediately.');">
+            <button type="submit" class="w-full bg-indigo-700 text-white p-3 rounded-lg font-black tracking-wide hover:bg-indigo-800 transition shadow-md">Generate New Password</button>
+        </form>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Reset Admin Password</title>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    </head>
+    <body class="bg-slate-900 flex items-center justify-center min-h-screen font-sans p-6">
+        <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-indigo-700">
+            <h2 class="text-xl font-black text-slate-800 mb-1">Reset Admin Password</h2>
+            <p class="text-xs text-slate-400 mb-4">{esc(school['name'])}</p>
+            {result_html}
+            {admin_block}
+            <div class="mt-4 text-center">
+                <a href="/superadmin/dashboard" class="text-xs text-slate-400 hover:text-slate-600 hover:underline">← Back to Super Admin Portal</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/api/v1/superadmin/school/reset-admin-password/{school_id}")
+def superadmin_reset_admin_password_submit(school_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    new_password = secrets.token_urlsafe(9)  # ~12 readable chars, strong enough for a temp password
+    hashed_password = get_password_hash(new_password)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM users WHERE school_id = %s AND role = 'admin' ORDER BY id ASC LIMIT 1;", (school_id,))
+            admin = cur.fetchone()
+            if not admin:
+                raise HTTPException(status_code=404, detail="No admin account found for this school.")
+            cur.execute("UPDATE users SET password_hash = %s WHERE id = %s;", (hashed_password, admin['id']))
+            conn.commit()
+
+    return RedirectResponse(
+        url=f"/superadmin/school/reset-admin-password/{school_id}?done=1&pwd={urllib.parse.quote(new_password)}",
+        status_code=303
+    )
 
 
 @app.get("/admin/system/diagnostics/{school_id}", response_class=HTMLResponse)
