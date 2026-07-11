@@ -160,15 +160,39 @@ def _get_pool():
 @contextmanager
 def get_db_connection():
     pool = _get_pool()
-    conn = pool.getconn()
+    conn = None
+    last_err = None
 
-    # Neon (especially on autosuspend/free tiers) can silently close idle
-    # connections. A connection sitting in our pool can go stale between
-    # requests without psycopg2 immediately knowing — catch that here rather
-    # than handing a dead connection to a route.
-    if conn.closed:
-        pool.putconn(conn, close=True)
-        conn = pool.getconn()
+    # Actively verify the connection is alive before handing it to a route.
+    # A dead-but-not-marked-closed connection is the actual cause of the
+    # "SSL SYSCALL error: EOF detected" / "bad record mac" crashes — Neon can
+    # silently kill an idle connection at the network layer without psycopg2
+    # noticing until the next real query runs. A cheap SELECT 1 here catches
+    # that upfront and swaps in a fresh connection instead of crashing the
+    # actual request.
+    for _ in range(3):
+        candidate = pool.getconn()
+        if candidate.closed:
+            try:
+                pool.putconn(candidate, close=True)
+            except psycopg2_pool.PoolError:
+                pass
+            continue
+        try:
+            with candidate.cursor() as ping_cur:
+                ping_cur.execute("SELECT 1;")
+        except psycopg2.OperationalError as ping_err:
+            last_err = ping_err
+            try:
+                pool.putconn(candidate, close=True)
+            except psycopg2_pool.PoolError:
+                pass
+            continue
+        conn = candidate
+        break
+
+    if conn is None:
+        raise last_err or psycopg2.OperationalError("Could not obtain a healthy database connection.")
 
     try:
         yield conn
@@ -180,7 +204,7 @@ def get_db_connection():
         try:
             if not conn.closed:
                 conn.rollback()
-        except psycopg2.InterfaceError:
+        except (psycopg2.InterfaceError, psycopg2.OperationalError):
             pass
         raise
     finally:
