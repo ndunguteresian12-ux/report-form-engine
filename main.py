@@ -610,6 +610,7 @@ def login_portal():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Multi-Tenant Hub Gateway</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -763,6 +764,7 @@ def forgot_password_form(sent: str = None):
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Forgot Password</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -830,6 +832,7 @@ def reset_password_form(email: str = "", sent: str = None):
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Reset Password</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -903,6 +906,7 @@ def terms_and_conditions_page():
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Terms and Conditions</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -963,7 +967,7 @@ def public_registration_portal():
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><title>Create School Tenant Account</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Create School Tenant Account</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="flex items-center justify-center min-h-screen font-sans p-6 bg-slate-900 bg-cover bg-center" style="background-image: linear-gradient(rgba(15,23,42,0.80), rgba(15,23,42,0.88)), url('data:image/jpeg;base64,{REGISTRATION_BG_IMAGE_B64}');">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-xl border-t-8 border-emerald-700">
             <h2 class="text-2xl font-black text-slate-800">Register Institutional Tenant</h2>
@@ -1162,7 +1166,7 @@ def update_school_logo_form(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><title>Update School Logo</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Update School Logo</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-900 flex items-center justify-center min-h-screen font-sans p-6">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Update School Logo</h2>
@@ -1431,7 +1435,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                     <span class='text-[10px] bg-slate-100 text-slate-600 px-2.5 py-1 rounded-md font-bold uppercase tracking-wider'>{c['education_level']}</span>
                     <h3 class='text-base font-black text-slate-800 mt-2.5 group-hover:text-slate-900'>{display_title}</h3>
                 </div>
-                <div class='grid grid-cols-3 gap-2 mt-5'>
+                <div class='grid grid-cols-2 sm:grid-cols-3 gap-2 mt-5'>
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
@@ -1463,6 +1467,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     <!DOCTYPE html>
     <html class="h-full">
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Control Deck - {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1749,6 +1754,7 @@ def superadmin_dashboard(request: Request):
     <!DOCTYPE html>
     <html class="h-full">
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Super Admin Portal</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -1903,6 +1909,7 @@ def superadmin_reset_admin_password_form(school_id: int, request: Request, done:
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Reset Admin Password</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -1967,7 +1974,7 @@ def storage_diagnostics(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><title>Storage Diagnostics</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Storage Diagnostics</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-8 font-sans">
         <div class="max-w-lg mx-auto bg-white rounded-2xl border shadow p-6 space-y-4">
             <h2 class="text-lg font-black text-slate-800">🔧 Logo Storage Diagnostics</h2>
@@ -2061,7 +2068,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None):
                     <span class='text-[10px] bg-slate-100 text-slate-600 px-2.5 py-1 rounded-md font-bold uppercase tracking-wider'>{c['education_level']}</span>
                     <h3 class='text-base font-black text-slate-800 mt-2.5 group-hover:text-slate-900'>{display_title}</h3>
                 </div>
-                <div class='grid grid-cols-3 gap-2 mt-5'>
+                <div class='grid grid-cols-2 sm:grid-cols-3 gap-2 mt-5'>
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
@@ -2079,6 +2086,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None):
     <!DOCTYPE html>
     <html class="h-full">
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Staff Portal - {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -2164,6 +2172,7 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Class Roster — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
@@ -2363,6 +2372,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Merit List — {esc(grade_name)}</title>
         <style>
             @page {{ size: landscape; margin: 10mm; }}
@@ -2520,6 +2530,7 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Subject Analysis — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
@@ -2558,20 +2569,20 @@ def add_student_view(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><title>Add New Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
-    <body class="bg-slate-100 flex items-center justify-center min-h-screen">
-        <div class="bg-white p-8 rounded-2xl border shadow-md w-full max-w-lg">
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Add New Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 flex items-center justify-center min-h-screen p-4">
+        <div class="bg-white p-6 sm:p-8 rounded-2xl border shadow-md w-full max-w-lg">
             <h2 class="text-xl font-bold mb-4 text-slate-800">Add New Learner Profile</h2>
             <form action="/api/v1/students/add/{school_id}" method="post" class="space-y-4">
-                <div class="grid grid-cols-2 gap-4">
-                    <div><label class="text-xs font-bold text-slate-600">First Name</label><input type="text" name="first_name" class="w-full border p-2 rounded mt-1" required></div>
-                    <div><label class="text-xs font-bold text-slate-600">Last Name</label><input type="text" name="last_name" class="w-full border p-2 rounded mt-1" required></div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div><label class="text-xs font-bold text-slate-600">First Name</label><input type="text" name="first_name" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
+                    <div><label class="text-xs font-bold text-slate-600">Last Name</label><input type="text" name="last_name" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
                 </div>
-                <div><label class="text-xs font-bold text-slate-600">Admission Number</label><input type="text" name="admission_number" class="w-full border p-2 rounded mt-1" required></div>
-                <div class="grid grid-cols-2 gap-4">
+                <div><label class="text-xs font-bold text-slate-600">Admission Number</label><input type="text" inputmode="numeric" name="admission_number" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
                         <label class="text-xs font-bold text-slate-600">Education Track Segment</label>
-                        <select name="class_id" class="w-full border p-2 rounded mt-1 bg-white text-sm font-medium text-slate-800" required>
+                        <select name="class_id" class="w-full border p-2.5 rounded mt-1 bg-white text-sm font-medium text-slate-800" required>
                             <option value="" disabled selected>Select Grade...</option>
                             <option value="1">Grade 1</option>
                             <option value="2">Grade 2</option>
@@ -2584,11 +2595,11 @@ def add_student_view(school_id: int, request: Request):
                             <option value="9">Grade 9</option>
                         </select>
                     </div>
-                    <div><label class="text-xs font-bold text-slate-600">Class Stream Assignment</label><input type="text" name="stream" placeholder="e.g. N" class="w-full border p-2 rounded mt-1" required></div>
+                    <div><label class="text-xs font-bold text-slate-600">Class Stream Assignment</label><input type="text" name="stream" placeholder="e.g. N" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
                 </div>
-                <div class="flex gap-3 pt-2">
-                    <button type="submit" class="bg-emerald-700 text-white font-bold py-2 px-4 rounded hover:bg-emerald-800 transition">Save Student</button>
-                    <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 text-slate-700 py-2 px-4 rounded hover:bg-slate-300 font-bold transition">Cancel</a>
+                <div class="flex flex-col sm:flex-row gap-3 pt-2">
+                    <button type="submit" class="bg-emerald-700 text-white font-bold py-3 px-4 rounded hover:bg-emerald-800 transition text-center">Save Student</button>
+                    <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 text-slate-700 py-3 px-4 rounded hover:bg-slate-300 font-bold transition text-center">Cancel</a>
                 </div>
             </form>
         </div>
@@ -2612,7 +2623,7 @@ def staff_registration_panel(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><title>Add Staff — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Add Staff — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-indigo-950 flex items-center justify-center min-h-screen font-sans p-6">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-sm border-t-8 border-indigo-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Add Staff Member</h2>
@@ -2723,7 +2734,7 @@ def manage_individual_scores_view(school_id: int, student_id: int, request: Requ
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><title>Edit Matrix for {esc(student['first_name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Edit Matrix for {esc(student['first_name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-50 p-8 min-h-screen max-w-3xl mx-auto space-y-6">
         <div class="bg-white p-6 rounded-2xl border shadow-xs flex justify-between items-center">
             <div>
@@ -2816,51 +2827,51 @@ def educators_bulk_entry_grid(
                     score_map[scr['student_id']] = float(scr['raw_score'])
 
     subject_options = "".join([f"<option value='{sub['id']}' {'selected' if sub['id'] == selected_area_id else ''}>{sub['name']}</option>" for sub in subjects])
-    
+
     student_rows = ""
     for s in students:
         existing_val = score_map.get(s['id'], "")
         student_rows += f"""
-        <tr class="border-b text-sm">
-            <td class="p-3 font-semibold text-slate-600">{esc(s['admission_number'])}</td>
-            <td class="p-3 font-bold text-slate-800">{esc(s['first_name'])} {esc(s['last_name'])}</td>
-            <td class="p-3">
-                <input type="number" step="0.01" min="0" max="100" name="score_{s['id']}" value="{existing_val}" class="border p-1.5 rounded w-32 focus:border-emerald-600 font-bold text-center" placeholder="-%">
-            </td>
-        </tr>
+        <div class="flex items-center justify-between gap-3 p-3.5 border-b last:border-0">
+            <div class="min-w-0">
+                <p class="font-bold text-slate-800 text-sm truncate">{esc(s['first_name'])} {esc(s['last_name'])}</p>
+                <p class="text-xs text-slate-400 font-mono">#{esc(s['admission_number'])}</p>
+            </div>
+            <input type="number" inputmode="decimal" step="0.01" min="0" max="100" name="score_{s['id']}" value="{existing_val}" class="border-2 p-2.5 rounded-xl w-24 shrink-0 focus:border-emerald-600 font-bold text-center text-base" placeholder="-%">
+        </div>
         """
 
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><title>Bulk Sheet Entry Deck</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
-    <body class="bg-slate-100 p-8 min-h-screen max-w-4xl mx-auto space-y-6">
-        <div class="bg-white p-6 rounded-2xl border shadow-xs flex justify-between items-center">
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Bulk Sheet Entry Deck</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 p-3 sm:p-8 min-h-screen max-w-4xl mx-auto space-y-4 sm:space-y-6">
+        <div class="bg-white p-4 sm:p-6 rounded-2xl border shadow-xs flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
             <div>
-                <h1 class="text-xl font-black text-slate-900">⚡ Bulk Marks Management Interface</h1>
+                <h1 class="text-lg sm:text-xl font-black text-slate-900">⚡ Bulk Marks Management Interface</h1>
                 <p class="text-xs text-slate-500 mt-1">Cohort Segment target: <strong>{esc(grade_name)} — {esc(education_level)} (Stream {esc(stream)})</strong></p>
             </div>
-            <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 px-4 py-2 rounded-lg text-xs font-black hover:bg-slate-300">Exit Workspace</a>
+            <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 px-4 py-2.5 rounded-lg text-xs font-black hover:bg-slate-300 text-center">Exit Workspace</a>
         </div>
 
-        <div class="bg-white p-6 rounded-2xl border shadow-xs">
+        <div class="bg-white p-4 sm:p-6 rounded-2xl border shadow-xs">
             <form method="get" action="/staff/bulk-entry/{school_id}" class="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
                 <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                 <input type="hidden" name="education_level" value="{esc(education_level)}">
                 <input type="hidden" name="stream" value="{esc(stream)}">
                 <div>
                     <label class="font-bold text-slate-500">Target Learning Subject</label>
-                    <select name="learning_area_id" onchange="this.form.submit()" class="w-full border p-2 rounded mt-1 font-semibold">{subject_options}</select>
+                    <select name="learning_area_id" onchange="this.form.submit()" class="w-full border p-3 rounded-xl mt-1 font-semibold text-sm">{subject_options}</select>
                 </div>
                 <div>
                     <label class="font-bold text-slate-500">Evaluation Phase</label>
-                    <select name="cycle_name" onchange="this.form.submit()" class="w-full border p-2 rounded mt-1 font-semibold">
+                    <select name="cycle_name" onchange="this.form.submit()" class="w-full border p-3 rounded-xl mt-1 font-semibold text-sm">
                         <option value="Opener" {"selected" if cycle_name == 'Opener' else ""}>Opener Phase</option>
                         <option value="Midterm" {"selected" if cycle_name == 'Midterm' else ""}>Midterm Cycle</option>
                         <option value="End Term" {"selected" if cycle_name == 'End Term' else ""}>End Term Synthesis</option>
                     </select>
                 </div>
-                <div class="flex items-end text-slate-400 text-[11px] italic pb-2">Changing dropdown values auto-updates student listing map.</div>
+                <div class="hidden sm:flex items-end text-slate-400 text-[11px] italic pb-2">Changing dropdown values auto-updates student listing map.</div>
             </form>
         </div>
 
@@ -2870,15 +2881,13 @@ def educators_bulk_entry_grid(
             <input type="hidden" name="stream" value="{esc(stream)}">
             <input type="hidden" name="learning_area_id" value="{selected_area_id}">
             <input type="hidden" name="cycle_name" value="{cycle_name}">
-            
-            <table class="w-full text-left">
-                <thead>
-                    <tr class="bg-slate-50 text-slate-500 text-xs font-bold uppercase tracking-wider border-b"><th class="p-3">Admission ID</th><th class="p-3">Learner Name</th><th class="p-3">Awarded Score Percentage</th></tr>
-                </thead>
-                <tbody>{student_rows or "<tr><td colspan='3' class='text-center p-6 text-slate-400 italic text-xs'>No registered class matching criterion.</td></tr>"}</tbody>
-            </table>
-            
-            {f'<div class="p-4 bg-slate-50 border-t text-right"><button type="submit" class="bg-[#046A38] hover:bg-emerald-900 text-white font-bold py-2 px-6 rounded-xl text-xs shadow-md">Batch Commit Class Sheet</button></div>' if students else ""}
+
+            <div class="px-3.5 py-2.5 bg-slate-50 text-slate-500 text-[10px] font-bold uppercase tracking-wider border-b flex justify-between">
+                <span>Learner</span><span>Score %</span>
+            </div>
+            <div>{student_rows or "<p class='text-center p-6 text-slate-400 italic text-xs'>No registered class matching criterion.</p>"}</div>
+
+            {f'<div class="p-4 bg-slate-50 border-t"><button type="submit" class="w-full bg-[#046A38] hover:bg-emerald-900 text-white font-bold py-3.5 px-6 rounded-xl text-sm shadow-md">Batch Commit Class Sheet</button></div>' if students else ""}
         </form>
     </body>
     </html>
@@ -3153,6 +3162,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             <!DOCTYPE html>
             <html>
             <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Print Out Queue Pipeline</title>
                 <style>
                     * {{ box-sizing: border-box; }}
