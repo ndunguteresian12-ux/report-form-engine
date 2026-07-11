@@ -1359,7 +1359,10 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <span class='text-slate-700 truncate'>{esc(st['first_name'])} {esc(st['last_name'])}
                     <span class='text-slate-400 font-mono text-[10px] block'>#{esc(st['admission_number'])}</span>
                 </span>
-                <a href='/admin/scores/manage/{school_id}?student_id={st['id']}' class='text-blue-600 hover:text-blue-800 text-[10px] font-bold shrink-0'>Scores →</a>
+                <span class='flex items-center gap-2 shrink-0'>
+                    <a href='/admin/student/edit/{school_id}/{st['id']}' class='text-slate-500 hover:text-slate-800 text-[10px] font-bold'>Edit</a>
+                    <a href='/admin/scores/manage/{school_id}?student_id={st['id']}' class='text-blue-600 hover:text-blue-800 text-[10px] font-bold'>Scores →</a>
+                </span>
             </li>
         """ for st in group_students)
 
@@ -3292,6 +3295,133 @@ def backend_add_student(
                 INSERT INTO students (school_id, admission_number, first_name, last_name, class_id, stream, education_level, status)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'ACTIVE');
             """, (school_id, admission_number, first_name, last_name, class_id, processed_stream, education_level))
+            conn.commit()
+
+    return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
+
+
+@app.get("/admin/student/edit/{school_id}/{student_id}", response_class=HTMLResponse)
+def edit_student_view(school_id: int, student_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
+            student = cur.fetchone()
+            if not student:
+                raise HTTPException(status_code=404, detail="Student not found.")
+
+            cur.execute("SELECT id, grade_name FROM classes ORDER BY id ASC;")
+            classes = cur.fetchall()
+
+    grade_options = "".join(
+        f"<option value='{c['id']}' {'selected' if c['id'] == student['class_id'] else ''}>{esc(c['grade_name'])}</option>"
+        for c in classes
+    )
+    display_stream = "" if student['stream'] == "SINGLE STREAM" else student['stream']
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Edit Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 flex items-center justify-center min-h-screen p-4">
+        <div class="bg-white p-6 sm:p-8 rounded-2xl border shadow-md w-full max-w-lg">
+            <h2 class="text-xl font-bold mb-4 text-slate-800">Edit Learner Profile</h2>
+            <form action="/api/v1/students/edit/{school_id}/{student_id}" method="post" class="space-y-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div><label class="text-xs font-bold text-slate-600">First Name</label><input type="text" name="first_name" value="{esc(student['first_name'])}" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
+                    <div><label class="text-xs font-bold text-slate-600">Last Name</label><input type="text" name="last_name" value="{esc(student['last_name'])}" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
+                </div>
+                <div><label class="text-xs font-bold text-slate-600">Admission Number</label><input type="text" inputmode="numeric" name="admission_number" value="{esc(student['admission_number'])}" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="text-xs font-bold text-slate-600">Education Track Segment</label>
+                        <select name="class_id" class="w-full border p-2.5 rounded mt-1 bg-white text-sm font-medium text-slate-800" required>{grade_options}</select>
+                    </div>
+                    <div><label class="text-xs font-bold text-slate-600">Class Stream Assignment</label><input type="text" name="stream" value="{esc(display_stream)}" placeholder="e.g. N" class="w-full border p-2.5 rounded mt-1 text-base"></div>
+                </div>
+                <div class="flex flex-col sm:flex-row gap-3 pt-2">
+                    <button type="submit" class="bg-emerald-700 text-white font-bold py-3 px-4 rounded hover:bg-emerald-800 transition text-center">Save Changes</button>
+                    <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 text-slate-700 py-3 px-4 rounded hover:bg-slate-300 font-bold transition text-center">Cancel</a>
+                </div>
+            </form>
+            <form action="/api/v1/students/delete/{school_id}/{student_id}" method="post" class="mt-4 pt-4 border-t" onsubmit="return confirm('Permanently delete {esc(student['first_name'])} {esc(student['last_name'])}? This also deletes all of their recorded scores. This cannot be undone.');">
+                <button type="submit" class="w-full bg-rose-50 border border-rose-200 text-rose-700 font-bold py-2.5 px-4 rounded-lg hover:bg-rose-100 transition text-sm">🗑 Delete Student Permanently</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/api/v1/students/edit/{school_id}/{student_id}")
+def backend_edit_student(
+    school_id: int,
+    student_id: int,
+    request: Request,
+    first_name: str = Form(...),
+    last_name: str = Form(...),
+    admission_number: str = Form(...),
+    class_id: int = Form(...),
+    stream: str = Form(None)
+):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    raw_stream = stream.strip().upper() if stream else ""
+    if not raw_stream:
+        processed_stream = "SINGLE STREAM"
+    else:
+        processed_stream = raw_stream.replace("GRADE", "").replace(str(class_id), "").strip()
+        if not processed_stream:
+            processed_stream = "SINGLE STREAM"
+
+    admission_number = admission_number.strip().upper()
+    first_name = first_name.strip()
+    last_name = last_name.strip()
+    if not admission_number or not first_name or not last_name:
+        raise HTTPException(status_code=400, detail="First name, last name, and admission number are required.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Student not found.")
+
+            cur.execute("SELECT education_level FROM classes WHERE id = %s;", (class_id,))
+            class_row = cur.fetchone()
+            if not class_row:
+                raise HTTPException(status_code=400, detail="The selected grade/class does not exist.")
+            education_level = class_row[0]
+
+            try:
+                cur.execute("""
+                    UPDATE students
+                    SET first_name = %s, last_name = %s, admission_number = %s,
+                        class_id = %s, stream = %s, education_level = %s
+                    WHERE id = %s AND school_id = %s;
+                """, (first_name, last_name, admission_number, class_id, processed_stream, education_level, student_id, school_id))
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                raise HTTPException(status_code=400, detail="Another student in this school already has that admission number.")
+
+    return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
+
+
+@app.post("/api/v1/students/delete/{school_id}/{student_id}")
+def backend_delete_student(school_id: int, student_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # Cascades to student_scores via the existing foreign key.
+            cur.execute("DELETE FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
             conn.commit()
 
     return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
