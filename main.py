@@ -2110,26 +2110,27 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             'overall_level': overall_level,
         })
 
-    # Rank by total marks: overall (whole grade) and within-stream
-    def _rank_by_total_marks(rows):
-        ranked = sorted(rows, key=lambda r: r['total_marks'], reverse=True)
+    # Rank by total POINTS (not marks) — points reflect performance level
+    # (EE1..BE2) per subject, which is the correct CBC ranking basis.
+    def _rank_by_total_points(rows):
+        ranked = sorted(rows, key=lambda r: r['total_points'], reverse=True)
         positions = {}
-        last_marks = None
+        last_points = None
         last_pos = 0
         for i, r in enumerate(ranked, start=1):
-            if r['total_marks'] != last_marks:
+            if r['total_points'] != last_points:
                 last_pos = i
-                last_marks = r['total_marks']
+                last_points = r['total_points']
             positions[r['student']['id']] = last_pos
         return positions
 
-    overall_positions = _rank_by_total_marks(computed)
+    overall_positions = _rank_by_total_points(computed)
     stream_groups = {}
     for row in computed:
         stream_groups.setdefault(row['student']['stream'], []).append(row)
     stream_positions = {}
     for stream_name, rows in stream_groups.items():
-        stream_positions.update(_rank_by_total_marks(rows))
+        stream_positions.update(_rank_by_total_points(rows))
 
     # Class-wide averages per subject, for the footer summary table
     subject_footer = []
@@ -2156,8 +2157,12 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
 
     subject_header_cells = "".join(f"<th style='text-align:center;'>{esc(abbreviate_subject(sub['name']))}</th>" for sub in subjects)
 
+    # Display order: by overall position (rank 1 first) — this is a merit
+    # list, so it should read top-to-bottom by performance, not roster order.
+    display_order = sorted(computed, key=lambda r: overall_positions[r['student']['id']])
+
     body_rows = []
-    for i, row in enumerate(computed, start=1):
+    for i, row in enumerate(display_order, start=1):
         s = row['student']
         subject_cells_html = ""
         for sub in subjects:
@@ -2662,8 +2667,9 @@ def educators_bulk_entry_grid(
     student_rows = ""
     for s in students:
         existing_val = score_map.get(s['id'], "")
+        search_key = f"{s['first_name']} {s['last_name']} {s['admission_number']}".lower()
         student_rows += f"""
-        <div class="flex items-center justify-between gap-3 p-3.5 border-b last:border-0">
+        <div class="student-row flex items-center justify-between gap-3 p-3.5 border-b last:border-0" data-search="{esc(search_key)}">
             <div class="min-w-0">
                 <p class="font-bold text-slate-800 text-sm truncate">{esc(s['first_name'])} {esc(s['last_name'])}</p>
                 <p class="text-xs text-slate-400 font-mono">#{esc(s['admission_number'])}</p>
@@ -2713,13 +2719,31 @@ def educators_bulk_entry_grid(
             <input type="hidden" name="learning_area_id" value="{selected_area_id}">
             <input type="hidden" name="cycle_name" value="{cycle_name}">
 
+            <div class="p-3 border-b bg-white">
+                <input type="text" id="studentSearchBox" oninput="filterStudentRows(this.value)" placeholder="🔎 Search by name or admission number..." class="w-full border-2 p-2.5 rounded-xl text-sm focus:border-emerald-600" autocomplete="off">
+            </div>
             <div class="px-3.5 py-2.5 bg-slate-50 text-slate-500 text-[10px] font-bold uppercase tracking-wider border-b flex justify-between">
                 <span>Learner</span><span>Score %</span>
             </div>
-            <div>{student_rows or "<p class='text-center p-6 text-slate-400 italic text-xs'>No registered class matching criterion.</p>"}</div>
+            <div id="studentRowsContainer">{student_rows or "<p class='text-center p-6 text-slate-400 italic text-xs'>No registered class matching criterion.</p>"}</div>
+            <p id="noSearchResults" class="hidden text-center p-6 text-slate-400 italic text-xs">No learners match that search.</p>
 
             {f'<div class="p-4 bg-slate-50 border-t"><button type="submit" class="w-full bg-[#046A38] hover:bg-emerald-900 text-white font-bold py-3.5 px-6 rounded-xl text-sm shadow-md">Batch Commit Class Sheet</button></div>' if students else ""}
         </form>
+
+        <script>
+            function filterStudentRows(query) {{
+                const q = query.trim().toLowerCase();
+                const rows = document.querySelectorAll('#studentRowsContainer .student-row');
+                let visibleCount = 0;
+                rows.forEach(function(row) {{
+                    const match = row.getAttribute('data-search').includes(q);
+                    row.style.display = match ? '' : 'none';
+                    if (match) visibleCount++;
+                }});
+                document.getElementById('noSearchResults').classList.toggle('hidden', visibleCount !== 0 || rows.length === 0);
+            }}
+        </script>
     </body>
     </html>
     """
@@ -2763,7 +2787,20 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         s.knec_lan,
                         s.stream,
                         c.grade_name,
-                        COALESCE(AVG(sa.subject_avg), 0) AS final_calculated_mean
+                        COALESCE(AVG(sa.subject_avg), 0) AS final_calculated_mean,
+                        COALESCE(SUM(
+                            CASE
+                                WHEN sa.subject_avg >= 90 THEN 8
+                                WHEN sa.subject_avg >= 76 THEN 7
+                                WHEN sa.subject_avg >= 60 THEN 6
+                                WHEN sa.subject_avg >= 50 THEN 5
+                                WHEN sa.subject_avg >= 40 THEN 4
+                                WHEN sa.subject_avg >= 30 THEN 3
+                                WHEN sa.subject_avg >= 20 THEN 2
+                                WHEN sa.subject_avg >= 0 THEN 1
+                                ELSE 0
+                            END
+                        ), 0) AS total_points
                     FROM students s
                     JOIN classes c ON s.class_id = c.id
                     LEFT JOIN subject_averages sa ON s.id = sa.student_id
@@ -2777,7 +2814,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         *,
                         RANK() OVER (
                             PARTITION BY grade_name, stream 
-                            ORDER BY final_calculated_mean DESC
+                            ORDER BY total_points DESC
                         ) AS stream_position,
                         COUNT(*) OVER (
                             PARTITION BY grade_name, stream
@@ -2785,7 +2822,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         
                         RANK() OVER (
                             PARTITION BY grade_name 
-                            ORDER BY final_calculated_mean DESC
+                            ORDER BY total_points DESC
                         ) AS grade_position,
                         COUNT(*) OVER (
                             PARTITION BY grade_name
@@ -2856,14 +2893,14 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
 
                     rows_markup += f"""
                     <tr>
-                        <td style="padding: 4px 6px; border: 1px solid #222; font-weight:bold;">{sub['name']}</td>
-                        <td style="padding: 4px 6px; border: 1px solid #222; text-align:center;">{op_str}</td>
-                        <td style="padding: 4px 6px; border: 1px solid #222; text-align:center;">{mid_str}</td>
-                        <td style="padding: 4px 6px; border: 1px solid #222; text-align:center;">{end_str}</td>
-                        <td style="padding: 4px 6px; border: 1px solid #222; text-align:center; background:#f9f9f9; font-weight:bold;">{weighted_str}</td>
-                        <td style="padding: 4px 6px; border: 1px solid #222; text-align:center; font-weight:bold;">{pld}</td>
-                        <td style="padding: 4px 6px; border: 1px solid #222; text-align:center; font-weight:bold;">{pts}</td>
-                        <td style="padding: 4px 6px; border: 1px solid #222; font-size:10px; line-height: 1.1;">{descriptor}</td>
+                        <td style="padding: 9px 6px; border: 1px solid #222; font-weight:bold;">{sub['name']}</td>
+                        <td style="padding: 9px 6px; border: 1px solid #222; text-align:center;">{op_str}</td>
+                        <td style="padding: 9px 6px; border: 1px solid #222; text-align:center;">{mid_str}</td>
+                        <td style="padding: 9px 6px; border: 1px solid #222; text-align:center;">{end_str}</td>
+                        <td style="padding: 9px 6px; border: 1px solid #222; text-align:center; background:#f9f9f9; font-weight:bold;">{weighted_str}</td>
+                        <td style="padding: 9px 6px; border: 1px solid #222; text-align:center; font-weight:bold;">{pld}</td>
+                        <td style="padding: 9px 6px; border: 1px solid #222; text-align:center; font-weight:bold;">{pts}</td>
+                        <td style="padding: 9px 6px; border: 1px solid #222; font-size:10.5px; line-height: 1.3;">{descriptor}</td>
                     </tr>
                     """
 
