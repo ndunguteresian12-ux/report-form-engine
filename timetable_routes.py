@@ -46,10 +46,19 @@ def bootstrap_timetable_schema():
                     school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
                     period_order INTEGER NOT NULL,
                     label VARCHAR(50) NOT NULL,
+                    short_label VARCHAR(20),
                     start_time VARCHAR(20),
                     end_time VARCHAR(20),
                     is_teaching_period BOOLEAN DEFAULT TRUE,
                     UNIQUE(school_id, period_order)
+                );
+            """)
+            cur.execute("ALTER TABLE timetable_periods ADD COLUMN IF NOT EXISTS short_label VARCHAR(20);")
+
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS timetable_settings (
+                    school_id INTEGER PRIMARY KEY REFERENCES schools(id) ON DELETE CASCADE,
+                    days_per_week INTEGER NOT NULL DEFAULT 5
                 );
             """)
             cur.execute("""
@@ -121,33 +130,20 @@ def bootstrap_timetable_schema():
 # =====================================================================
 # TIMETABLING MODULE
 # =====================================================================
-TIMETABLE_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+# No hardcoded periods, times, or breaks — every school configures its own
+# day structure and bell times via /timetable/periods/{school_id}, since
+# schools don't share a start time (boarding vs day schools especially).
+ALL_POSSIBLE_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
 
-def ensure_default_periods(cur, school_id: int):
-    """Creates a standard Kenyan-school-day period structure the first time
-    a school opens the timetable module. Safe to call repeatedly — does
-    nothing if periods already exist for this school."""
-    cur.execute("SELECT COUNT(*) AS cnt FROM timetable_periods WHERE school_id = %s;", (school_id,))
-    if cur.fetchone()['cnt'] > 0:
-        return
-    default_periods = [
-        (1, "Period 1", "8:00 AM", "8:40 AM", True),
-        (2, "Period 2", "8:40 AM", "9:20 AM", True),
-        (3, "Short Break", "9:20 AM", "9:40 AM", False),
-        (4, "Period 3", "9:40 AM", "10:20 AM", True),
-        (5, "Period 4", "10:20 AM", "11:00 AM", True),
-        (6, "Period 5", "11:00 AM", "11:40 AM", True),
-        (7, "Lunch Break", "11:40 AM", "12:40 PM", False),
-        (8, "Period 6", "12:40 PM", "1:20 PM", True),
-        (9, "Period 7", "1:20 PM", "2:00 PM", True),
-        (10, "Period 8", "2:00 PM", "2:40 PM", True),
-    ]
-    for order, label, start, end, is_teaching in default_periods:
-        cur.execute("""
-            INSERT INTO timetable_periods (school_id, period_order, label, start_time, end_time, is_teaching_period)
-            VALUES (%s, %s, %s, %s, %s, %s);
-        """, (school_id, order, label, start, end, is_teaching))
+def get_school_days(cur, school_id: int):
+    """Returns this school's configured list of teaching days (e.g. Mon-Fri
+    or Mon-Sat), defaulting to a 5-day week only until the school sets its
+    own value on the Periods & Days page."""
+    cur.execute("SELECT days_per_week FROM timetable_settings WHERE school_id = %s;", (school_id,))
+    row = cur.fetchone()
+    days_per_week = row['days_per_week'] if row else 5
+    return ALL_POSSIBLE_DAYS[:days_per_week]
 
 
 def _section_label(grade_name: str, stream: str) -> str:
@@ -170,8 +166,6 @@ def timetable_dashboard(school_id: int, request: Request):
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
-            ensure_default_periods(cur, school_id)
-            conn.commit()
 
             cur.execute("""
                 SELECT DISTINCT c.grade_name, c.education_level, s.stream, c.id AS class_order
@@ -188,6 +182,9 @@ def timetable_dashboard(school_id: int, request: Request):
                 GROUP BY grade_name, education_level, stream;
             """, (school_id,))
             slot_counts = {(r['grade_name'], r['education_level'], r['stream']): r['slot_count'] for r in cur.fetchall()}
+
+            cur.execute("SELECT COUNT(*) AS cnt FROM timetable_periods WHERE school_id = %s;", (school_id,))
+            has_periods = cur.fetchone()['cnt'] > 0
 
     section_cards = ""
     for sec in sections:
@@ -230,12 +227,14 @@ def timetable_dashboard(school_id: int, request: Request):
                 <p class="text-xs text-slate-400">Each stream has its own independent timetable.</p>
             </div>
             <div class="flex items-center gap-2">
+                <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods & Days</a>
                 <a href="/timetable/availability/{school_id}" class="bg-indigo-700 hover:bg-indigo-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">👩‍🏫 Teacher Availability</a>
                 <a href="/timetable/master/{school_id}" class="bg-emerald-700 hover:bg-emerald-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">🗓 Whole School View</a>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Dashboard</a>
             </div>
         </header>
         <div class="p-6 sm:p-8 max-w-6xl mx-auto">
+            {"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-6'>⏱ <b>Set up your periods and bell times first</b> — go to <a href='/timetable/periods/" + str(school_id) + "' class='underline font-bold'>Periods &amp; Days</a> before generating any timetable.</div>" if not has_periods else ""}
             <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                 {section_cards or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No classes with students yet — add students first.</p>"}
             </div>
@@ -243,6 +242,191 @@ def timetable_dashboard(school_id: int, request: Request):
     </body>
     </html>
     """)
+
+
+@router.get("/timetable/periods/{school_id}", response_class=HTMLResponse)
+def timetable_periods_view(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT days_per_week FROM timetable_settings WHERE school_id = %s;", (school_id,))
+            settings_row = cur.fetchone()
+            days_per_week = settings_row['days_per_week'] if settings_row else 5
+
+            cur.execute("SELECT * FROM timetable_periods WHERE school_id = %s ORDER BY period_order ASC;", (school_id,))
+            periods = cur.fetchall()
+
+    days_options = "".join(
+        f"<option value='{n}' {'selected' if n == days_per_week else ''}>{n} days ({', '.join(ALL_POSSIBLE_DAYS[:n])})</option>"
+        for n in range(1, 7)
+    )
+
+    period_rows = ""
+    for p in periods:
+        row_type = "Break" if not p['is_teaching_period'] else "Teaching"
+        row_style = "background:#f0fdf4;" if not p['is_teaching_period'] else ""
+        period_rows += f"""
+        <tr style="{row_style}" class="border-b text-sm">
+            <td class="p-2.5 text-center text-slate-400 font-mono text-xs">{p['period_order']}</td>
+            <td class="p-2.5 font-bold text-slate-800">{esc(p['label'])}</td>
+            <td class="p-2.5 text-slate-500">{esc(p['short_label'] or '')}</td>
+            <td class="p-2.5 text-slate-500">{esc(p['start_time'] or '')}</td>
+            <td class="p-2.5 text-slate-500">{esc(p['end_time'] or '')}</td>
+            <td class="p-2.5 text-center">
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded-full {'bg-emerald-50 text-emerald-700 border border-emerald-200' if p['is_teaching_period'] else 'bg-slate-100 text-slate-500 border border-slate-200'}">{row_type}</span>
+            </td>
+            <td class="p-2.5 text-right">
+                <form action="/api/v1/timetable/periods/delete/{school_id}/{p['id']}" method="post" onsubmit="return confirm('Delete period \\'{esc(p['label'])}\\'? Any timetable slots using it will be cleared too.');">
+                    <button type="submit" class="text-rose-600 hover:text-rose-800 text-xs font-bold">Delete</button>
+                </form>
+            </td>
+        </tr>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Periods & Days — {esc(school['name'])}</title>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    </head>
+    <body class="bg-[#F8FAFC] min-h-screen">
+        <header class="bg-white border-b border-slate-200/80 px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">⏱ Periods & Days — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">Every school sets its own bell times — there's no shared default, since boarding and day schools (and different regions) start at different times.</p>
+            </div>
+            <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back</a>
+        </header>
+
+        <div class="p-4 sm:p-8 max-w-4xl mx-auto space-y-6">
+            <div class="bg-white p-5 sm:p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-sm font-bold text-slate-800 mb-3">Number of Teaching Days</h2>
+                <form action="/api/v1/timetable/periods/days/{school_id}" method="post" class="flex flex-col sm:flex-row gap-3">
+                    <select name="days_per_week" class="flex-1 border p-2.5 rounded-xl text-sm font-medium">{days_options}</select>
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">Save</button>
+                </form>
+            </div>
+
+            <div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+                <div class="p-5 sm:p-6 border-b bg-slate-50/50">
+                    <h2 class="text-sm font-bold text-slate-800">Periods & Bell Times</h2>
+                    <p class="text-xs text-slate-400 mt-0.5">Add every period and break in order, with its actual start/end time.</p>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead>
+                            <tr class="bg-slate-50 text-slate-500 text-xs font-semibold border-b">
+                                <th class="p-2.5">#</th><th class="p-2.5">Name</th><th class="p-2.5">Short</th>
+                                <th class="p-2.5">Start</th><th class="p-2.5">End</th><th class="p-2.5 text-center">Type</th><th class="p-2.5"></th>
+                            </tr>
+                        </thead>
+                        <tbody>{period_rows or "<tr><td colspan='7' class='text-center p-6 text-slate-400 italic text-xs'>No periods configured yet — add your first one below.</td></tr>"}</tbody>
+                    </table>
+                </div>
+                <form action="/api/v1/timetable/periods/add/{school_id}" method="post" class="p-5 sm:p-6 bg-slate-50/50 border-t grid grid-cols-1 sm:grid-cols-6 gap-3">
+                    <div class="sm:col-span-2">
+                        <label class="text-[11px] font-bold text-slate-500">Name</label>
+                        <input type="text" name="label" placeholder="e.g. Period 1, Short Break" class="w-full border p-2 rounded-lg mt-1 text-sm" required>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500">Short Label</label>
+                        <input type="text" name="short_label" placeholder="1" class="w-full border p-2 rounded-lg mt-1 text-sm">
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500">Start Time</label>
+                        <input type="time" name="start_time" class="w-full border p-2 rounded-lg mt-1 text-sm" required>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500">End Time</label>
+                        <input type="time" name="end_time" class="w-full border p-2 rounded-lg mt-1 text-sm" required>
+                    </div>
+                    <div class="flex flex-col justify-end">
+                        <label class="text-[11px] font-bold text-slate-500 flex items-center gap-1.5 mb-2">
+                            <input type="checkbox" name="is_break" value="1" class="w-4 h-4"> This is a break
+                        </label>
+                        <button type="submit" class="bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-2 rounded-lg text-sm transition">+ Add</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/periods/days/{school_id}")
+def save_timetable_days(school_id: int, request: Request, days_per_week: int = Form(...)):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    days_per_week = max(1, min(6, days_per_week))
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO timetable_settings (school_id, days_per_week) VALUES (%s, %s)
+                ON CONFLICT (school_id) DO UPDATE SET days_per_week = EXCLUDED.days_per_week;
+            """, (school_id, days_per_week))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/periods/{school_id}", status_code=303)
+
+
+@router.post("/api/v1/timetable/periods/add/{school_id}")
+def add_timetable_period(
+    school_id: int,
+    request: Request,
+    label: str = Form(...),
+    short_label: str = Form(""),
+    start_time: str = Form(...),
+    end_time: str = Form(...),
+    is_break: str = Form(None),
+):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    label = label.strip()
+    short_label = short_label.strip() or label[:3].upper()
+    if not label:
+        raise HTTPException(status_code=400, detail="A name for this period is required.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(MAX(period_order), 0) + 1 AS next_order FROM timetable_periods WHERE school_id = %s;", (school_id,))
+            next_order = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO timetable_periods (school_id, period_order, label, short_label, start_time, end_time, is_teaching_period)
+                VALUES (%s, %s, %s, %s, %s, %s, %s);
+            """, (school_id, next_order, label, short_label, start_time, end_time, not bool(is_break)))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/periods/{school_id}", status_code=303)
+
+
+@router.post("/api/v1/timetable/periods/delete/{school_id}/{period_id}")
+def delete_timetable_period(school_id: int, period_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # Cascades to timetable_slots and teacher_availability rows using this period.
+            cur.execute("DELETE FROM timetable_periods WHERE id = %s AND school_id = %s;", (period_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/periods/{school_id}", status_code=303)
 
 
 @router.get("/timetable/assignments/{school_id}", response_class=HTMLResponse)
@@ -399,7 +583,7 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request)
             if not teacher:
                 raise HTTPException(status_code=404, detail="Teacher not found.")
 
-            ensure_default_periods(cur, school_id)
+            days = get_school_days(cur, school_id)
             conn.commit()
 
             cur.execute("SELECT id, period_order, label FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
@@ -413,11 +597,11 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request)
 
     status_options = [("available", "✅ Available"), ("conditional", "❔ Conditional"), ("not_available", "❌ Not Available")]
 
-    header_cells = "".join(f"<th class='p-2 text-center text-xs'>{d}</th>" for d in TIMETABLE_DAYS)
+    header_cells = "".join(f"<th class='p-2 text-center text-xs'>{d}</th>" for d in days)
     body_rows = ""
     for period in periods:
         body_rows += f"<tr><td class='p-2 text-xs font-bold bg-slate-50 sticky left-0'>{esc(period['label'])}</td>"
-        for day in TIMETABLE_DAYS:
+        for day in days:
             cur_status = current.get((day, period['id']), "available")
             options = "".join(f"<option value='{val}' {'selected' if val == cur_status else ''}>{lbl}</option>" for val, lbl in status_options)
             body_rows += f"<td class='p-1 text-center'><select name='status_{day}_{period['id']}' class='text-xs border rounded-lg p-1.5 w-full'>{options}</select></td>"
@@ -465,8 +649,9 @@ async def save_teacher_availability(school_id: int, teacher_id: int, request: Re
 
             cur.execute("SELECT id FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE;", (school_id,))
             period_ids = [r[0] for r in cur.fetchall()]
+            days = get_school_days(cur, school_id)
 
-            for day in TIMETABLE_DAYS:
+            for day in days:
                 for period_id in period_ids:
                     field_name = f"status_{day}_{period_id}"
                     status = form.get(field_name, "available")
@@ -648,7 +833,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
             cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
 
-            ensure_default_periods(cur, school_id)
+            days = get_school_days(cur, school_id)
             conn.commit()
 
             cur.execute("SELECT * FROM timetable_periods WHERE school_id = %s ORDER BY period_order ASC;", (school_id,))
@@ -670,7 +855,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
     encoded_level = urllib.parse.quote(education_level)
     encoded_stream = urllib.parse.quote(stream)
     section_label = _section_label(grade_name, stream)
-    header_cells = "".join(f"<th class='p-2 text-center'>{d}</th>" for d in TIMETABLE_DAYS)
+    header_cells = "".join(f"<th class='p-2 text-center'>{d}</th>" for d in days)
 
     body_rows = ""
     for p in periods:
@@ -678,13 +863,13 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
             body_rows += f"""
             <tr class="bg-slate-50">
                 <td class="p-2 text-xs font-bold text-slate-500 whitespace-nowrap">{esc(p['label'])}<br><span class="font-normal text-slate-400">{esc(p['start_time'] or '')}–{esc(p['end_time'] or '')}</span></td>
-                <td colspan="{len(TIMETABLE_DAYS)}" class="p-2 text-center text-xs italic text-slate-400">{esc(p['label'])}</td>
+                <td colspan="{len(days)}" class="p-2 text-center text-xs italic text-slate-400">{esc(p['label'])}</td>
             </tr>
             """
             continue
 
         row_cells = ""
-        for day in TIMETABLE_DAYS:
+        for day in days:
             slot = slot_map.get((day, p['id']))
             current_subject_id = slot['learning_area_id'] if slot else None
             teacher_label = (slot['full_name'] or slot['email']) if slot and slot['full_name'] or (slot and slot['email']) else None
@@ -757,7 +942,7 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            ensure_default_periods(cur, school_id)
+            days = get_school_days(cur, school_id)
             conn.commit()
 
             cur.execute("SELECT id, period_order FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
@@ -777,7 +962,7 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
 
             # Build a round-robin queue of subjects sized to fill every slot,
             # distributing periods as evenly as possible across the week.
-            total_slots = len(TIMETABLE_DAYS) * len(teaching_periods)
+            total_slots = len(days) * len(teaching_periods)
             queue = []
             i = 0
             while len(queue) < total_slots:
@@ -795,12 +980,16 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             booked = {(r['day_of_week'], r['period_id']): r['staff_user_id'] for r in cur.fetchall()}
 
             # Teachers' explicit unavailability — a slot they're marked
-            # "not_available" for should be avoided when possible.
+            # "not_available" for is a hard block; "conditional" is a soft
+            # preference to avoid, used only if no cleaner slot works out.
             cur.execute("""
-                SELECT staff_user_id, day_of_week, period_id FROM teacher_availability
-                WHERE school_id = %s AND status = 'not_available';
+                SELECT staff_user_id, day_of_week, period_id, status FROM teacher_availability
+                WHERE school_id = %s AND status IN ('not_available', 'conditional');
             """, (school_id,))
-            unavailable = {(r['staff_user_id'], r['day_of_week'], r['period_id']) for r in cur.fetchall()}
+            unavailable, conditional = set(), set()
+            for r in cur.fetchall():
+                key = (r['staff_user_id'], r['day_of_week'], r['period_id'])
+                (unavailable if r['status'] == 'not_available' else conditional).add(key)
 
             # Subject placement rules ("card relationships") for this section.
             cur.execute("""
@@ -818,7 +1007,7 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             cur.execute("DELETE FROM timetable_slots WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;", (school_id, grade_name, education_level, stream))
 
             qi = 0
-            for day in TIMETABLE_DAYS:
+            for day in days:
                 used_today = set()
                 last_subject_id = None
                 for period in teaching_periods:
@@ -828,26 +1017,35 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                     # placed, and whose teacher (if any) isn't marked
                     # unavailable at this exact slot. Falls back to the plain
                     # round-robin pick if nothing satisfies every rule.
+                    # Two passes: first try to avoid "conditional" slots for
+                    # the candidate's teacher too (not just hard-unavailable
+                    # ones); if nothing fits without using a conditional slot,
+                    # retry allowing it — it's a soft preference, not a block.
                     chosen_idx, chosen_subject, chosen_teacher = None, None, None
-                    for attempt in range(len(queue)):
-                        idx = (qi + attempt) % len(queue)
-                        candidate = queue[idx]
-                        cid = candidate['id']
-                        if cid in used_today:
-                            continue
-                        if any((cid, other) in same_day_forbidden for other in used_today):
-                            continue
-                        if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
-                            continue
+                    for avoid_conditional in (True, False):
+                        if chosen_subject is not None:
+                            break
+                        for attempt in range(len(queue)):
+                            idx = (qi + attempt) % len(queue)
+                            candidate = queue[idx]
+                            cid = candidate['id']
+                            if cid in used_today:
+                                continue
+                            if any((cid, other) in same_day_forbidden for other in used_today):
+                                continue
+                            if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
+                                continue
 
-                        cand_teacher = teacher_for_subject.get(cid)
-                        if cand_teacher and (cand_teacher, day, period['id']) in unavailable:
-                            continue  # try a different subject rather than use this slot
-                        if cand_teacher and booked.get((day, period['id'])) == cand_teacher:
-                            cand_teacher = None  # double-booked — place subject without a teacher, flagged for manual fix
+                            cand_teacher = teacher_for_subject.get(cid)
+                            if cand_teacher and (cand_teacher, day, period['id']) in unavailable:
+                                continue  # try a different subject rather than use this slot
+                            if cand_teacher and avoid_conditional and (cand_teacher, day, period['id']) in conditional:
+                                continue  # soft preference: try to avoid this slot first
+                            if cand_teacher and booked.get((day, period['id'])) == cand_teacher:
+                                cand_teacher = None  # double-booked — place subject without a teacher, flagged for manual fix
 
-                        chosen_idx, chosen_subject, chosen_teacher = idx, candidate, cand_teacher
-                        break
+                            chosen_idx, chosen_subject, chosen_teacher = idx, candidate, cand_teacher
+                            break
 
                     if chosen_subject is None:
                         # Nothing satisfied every rule — fall back to the
@@ -995,6 +1193,49 @@ def update_timetable_slot(
     return RedirectResponse(url=redirect_url, status_code=303)
 
 
+def _build_timetable_grid_html(days, periods, cell_lookup_fn):
+    """Builds the <table> for a printable timetable laid out exactly like a
+    physical school timetable: rows = days, columns = periods in order.
+    Break periods (short break, lunch, etc.) render as one column spanning
+    every day row, with the label rotated vertically. cell_lookup_fn(day,
+    period) returns the inner HTML for a teaching-period cell, or None/''
+    for a free slot."""
+    header_cells = "".join(
+        f"<th style='padding:4px 6px;{'background:#eef2f7;' if not p['is_teaching_period'] else ''}'>{esc(p['short_label'] or p['label'])}</th>"
+        for p in periods
+    )
+    time_cells = "".join(
+        f"<th style='font-weight:normal;font-size:9px;color:#64748b;'>{esc(p['start_time'] or '')}-{esc(p['end_time'] or '')}</th>"
+        for p in periods
+    )
+
+    body_rows = ""
+    for day_i, day in enumerate(days):
+        row = f"<td style='padding:6px 8px;font-weight:bold;white-space:nowrap;border:1px solid #cbd5e1;'>{esc(day[:2].upper())}</td>"
+        for p in periods:
+            if not p['is_teaching_period']:
+                if day_i == 0:
+                    row += (
+                        f"<td rowspan='{len(days)}' style='border:1px solid #cbd5e1;text-align:center;background:#f1f5f9;'>"
+                        f"<div style='writing-mode:vertical-rl;transform:rotate(180deg);font-size:10px;font-weight:bold;"
+                        f"color:#475569;white-space:nowrap;margin:0 auto;'>{esc(p['label'])}</div></td>"
+                    )
+                continue  # subsequent days: cell already covered by row 1's rowspan
+            content = cell_lookup_fn(day, p) or "<span style='color:#cbd5e1;'>-</span>"
+            row += f"<td style='padding:4px 6px;text-align:center;border:1px solid #e2e8f0;'>{content}</td>"
+        body_rows += f"<tr>{row}</tr>"
+
+    return f"""
+    <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:14px;">
+        <thead>
+            <tr style="background:#f8fafc;"><th style="padding:4px 8px;"></th>{header_cells}</tr>
+            <tr style="background:#f8fafc;"><th></th>{time_cells}</tr>
+        </thead>
+        <tbody>{body_rows}</tbody>
+    </table>
+    """
+
+
 @router.get("/timetable/print/{school_id}", response_class=HTMLResponse)
 def print_timetable(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
     auth_error = require_school_session(request, school_id)
@@ -1005,6 +1246,8 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT name, logo_url FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
+
+            days = get_school_days(cur, school_id)
 
             cur.execute("SELECT * FROM timetable_periods WHERE school_id = %s ORDER BY period_order ASC;", (school_id,))
             periods = cur.fetchall()
@@ -1025,21 +1268,18 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
         final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
         logo_html = f"<img src='{final_src}' style='width:56px;height:56px;object-fit:contain;' />"
 
-    header_cells = "".join(f"<th style='padding:6px 8px;text-align:center;'>{d}</th>" for d in TIMETABLE_DAYS)
-    body_rows = ""
-    for p in periods:
-        if not p['is_teaching_period']:
-            body_rows += f"<tr style='background:#f8fafc;'><td style='padding:6px 8px;font-weight:bold;'>{esc(p['label'])}</td><td colspan='{len(TIMETABLE_DAYS)}' style='text-align:center;font-style:italic;color:#94a3b8;'>{esc(p['label'])}</td></tr>"
-            continue
-        cells = ""
-        for day in TIMETABLE_DAYS:
-            slot = slot_map.get((day, p['id']))
-            if slot and slot['subject_name']:
-                teacher = slot['full_name'] or slot['email'] or ""
-                cells += f"<td style='padding:6px 8px;text-align:center;border:1px solid #e2e8f0;'><b>{esc(slot['subject_name'])}</b><br><span style='font-size:9px;color:#64748b;'>{esc(teacher)}</span></td>"
-            else:
-                cells += "<td style='padding:6px 8px;text-align:center;border:1px solid #e2e8f0;color:#cbd5e1;'>-</td>"
-        body_rows += f"<tr><td style='padding:6px 8px;font-weight:bold;border:1px solid #e2e8f0;white-space:nowrap;'>{esc(p['label'])}<br><span style='font-weight:normal;color:#64748b;font-size:9px;'>{esc(p['start_time'] or '')}–{esc(p['end_time'] or '')}</span></td>{cells}</tr>"
+    def _class_cell(day, p):
+        slot = slot_map.get((day, p['id']))
+        if not slot or not slot['subject_name']:
+            return None
+        teacher_short = (slot['full_name'] or slot['email'] or "").split(" ")[-1] if (slot['full_name'] or slot['email']) else ""
+        teacher_line = f"<br><span style='font-size:9px;color:#64748b;'>{esc(teacher_short)}</span>" if teacher_short else ""
+        return f"<b>{esc(abbreviate_subject(slot['subject_name']))}</b>{teacher_line}"
+
+    grid_html = _build_timetable_grid_html(days, periods, _class_cell)
+
+    if not periods:
+        grid_html = "<p style='padding:24px;text-align:center;color:#94a3b8;font-style:italic;'>No periods configured yet for this school. Set them up on the Periods &amp; Days page first.</p>"
 
     return f"""
     <!DOCTYPE html>
@@ -1051,7 +1291,6 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
             @page {{ size: landscape; margin: 10mm; }}
             body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; }}
             @media print {{ .no-print {{ display: none !important; }} }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 11px; }}
             th {{ background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
         </style>
     </head>
@@ -1063,13 +1302,96 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
             {logo_html}
             <div>
                 <h1 style="margin:0;font-size:18px;">{esc(school['name'] if school else '')}</h1>
-                <p style="margin:2px 0 0;font-size:13px;font-weight:bold;">CLASS TIMETABLE — {esc(section_label)} ({esc(education_level)})</p>
+                <p style="margin:2px 0 0;font-size:15px;font-weight:bold;">CLASS TIMETABLE — {esc(section_label)} ({esc(education_level)})</p>
             </div>
         </div>
-        <table>
-            <thead><tr><th style="text-align:left;padding:6px 8px;">Period</th>{header_cells}</tr></thead>
-            <tbody>{body_rows}</tbody>
-        </table>
+        {grid_html}
+        <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#94a3b8;">
+            <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
+            <span>{esc(school['name'] if school else '')} — Timetable System</span>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/timetable/print/teacher/{school_id}/{teacher_id}", response_class=HTMLResponse)
+def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name, logo_url FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+
+            cur.execute("SELECT full_name, email FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (teacher_id, school_id))
+            teacher = cur.fetchone()
+            if not teacher:
+                raise HTTPException(status_code=404, detail="Teacher not found.")
+
+            days = get_school_days(cur, school_id)
+
+            cur.execute("SELECT * FROM timetable_periods WHERE school_id = %s ORDER BY period_order ASC;", (school_id,))
+            periods = cur.fetchall()
+
+            cur.execute("""
+                SELECT ts.day_of_week, ts.period_id, ts.grade_name, ts.stream, la.name AS subject_name
+                FROM timetable_slots ts
+                LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                WHERE ts.school_id = %s AND ts.staff_user_id = %s;
+            """, (school_id, teacher_id))
+            slot_map = {(r['day_of_week'], r['period_id']): r for r in cur.fetchall()}
+
+    teacher_name = teacher['full_name'] or teacher['email']
+    logo_html = ""
+    if school and school.get('logo_url'):
+        logo_src = school['logo_url']
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        logo_html = f"<img src='{final_src}' style='width:56px;height:56px;object-fit:contain;' />"
+
+    def _teacher_cell(day, p):
+        slot = slot_map.get((day, p['id']))
+        if not slot or not slot['subject_name']:
+            return None
+        class_label = _section_label(slot['grade_name'], slot['stream'])
+        return f"<b>{esc(abbreviate_subject(slot['subject_name']))}</b><br><span style='font-size:9px;color:#64748b;'>{esc(class_label)}</span>"
+
+    grid_html = _build_timetable_grid_html(days, periods, _teacher_cell)
+
+    if not periods:
+        grid_html = "<p style='padding:24px;text-align:center;color:#94a3b8;font-style:italic;'>No periods configured yet for this school. Set them up on the Periods &amp; Days page first.</p>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Timetable — {esc(teacher_name)}</title>
+        <style>
+            @page {{ size: landscape; margin: 10mm; }}
+            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; }}
+            @media print {{ .no-print {{ display: none !important; }} }}
+            th {{ background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
+            {logo_html}
+            <div>
+                <h1 style="margin:0;font-size:18px;">{esc(school['name'] if school else '')}</h1>
+                <p style="margin:2px 0 0;font-size:15px;font-weight:bold;">TEACHER TIMETABLE — {esc(teacher_name)}</p>
+            </div>
+        </div>
+        {grid_html}
+        <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#94a3b8;">
+            <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
+            <span>{esc(school['name'] if school else '')} — Timetable System</span>
+        </div>
     </body>
     </html>
     """
@@ -1088,7 +1410,7 @@ def timetable_master_view(school_id: int, request: Request):
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
-            ensure_default_periods(cur, school_id)
+            days = get_school_days(cur, school_id)
             conn.commit()
 
             cur.execute("""
@@ -1121,18 +1443,18 @@ def timetable_master_view(school_id: int, request: Request):
     else:
         day_header_cells = "".join(
             f"<th colspan='{len(periods)}' style='text-align:center;border-left:2px solid #cbd5e1;'>{day}</th>"
-            for day in TIMETABLE_DAYS
+            for day in days
         )
         period_header_cells = "".join(
             "".join(f"<th style='font-size:9px;font-weight:normal;color:#94a3b8;{'border-left:2px solid #cbd5e1;' if p_i == 0 else ''}'>{p['period_order']}</th>"
                     for p_i, p in enumerate(periods))
-            for _ in TIMETABLE_DAYS
+            for _ in days
         )
 
         body_rows = ""
         for sec in sections:
             row_cells = ""
-            for day in TIMETABLE_DAYS:
+            for day in days:
                 for p_i, p in enumerate(periods):
                     entry = slot_map.get((sec['grade_name'], sec['education_level'], sec['stream'], day, p['id']))
                     border = "border-left:2px solid #cbd5e1;" if p_i == 0 else ""
@@ -1201,7 +1523,7 @@ def timetable_master_print(school_id: int, request: Request):
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
-            ensure_default_periods(cur, school_id)
+            days = get_school_days(cur, school_id)
             conn.commit()
 
             cur.execute("""
@@ -1227,13 +1549,13 @@ def timetable_master_print(school_id: int, request: Request):
                 key = (row['grade_name'], row['education_level'], row['stream'], row['day_of_week'], row['period_id'])
                 slot_map[key] = row
 
-    day_header_cells = "".join(f"<th colspan='{len(periods)}' style='text-align:center;'>{day}</th>" for day in TIMETABLE_DAYS)
-    period_header_cells = "".join("".join(f"<th style='font-weight:normal;'>{p['period_order']}</th>" for p in periods) for _ in TIMETABLE_DAYS)
+    day_header_cells = "".join(f"<th colspan='{len(periods)}' style='text-align:center;'>{day}</th>" for day in days)
+    period_header_cells = "".join("".join(f"<th style='font-weight:normal;'>{p['period_order']}</th>" for p in periods) for _ in days)
 
     body_rows = ""
     for sec in sections:
         row_cells = ""
-        for day in TIMETABLE_DAYS:
+        for day in days:
             for p in periods:
                 entry = slot_map.get((sec['grade_name'], sec['education_level'], sec['stream'], day, p['id']))
                 label = abbreviate_subject(entry['subject_name']) if (entry and entry['subject_name']) else ""
