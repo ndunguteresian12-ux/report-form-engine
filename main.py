@@ -33,14 +33,23 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("cbe_engine")
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip() or None
-SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip() or None
+# Supabase renamed its API keys for newer projects: the old "service_role"
+# key (needed here for server-side writes past bucket RLS) is now called
+# the "secret" key. Accept whichever name is actually present, so schools
+# don't have to duplicate the same value under a second env var name.
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_KEY")
+    or os.getenv("SUPABASE_SECRET_KEY")
+    or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or ""
+).strip() or None
 supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 if supabase_client:
     logger.info("Supabase Storage configured — logo uploads will be persisted to the cloud.")
 else:
     logger.warning(
-        "Supabase Storage NOT configured (SUPABASE_URL / SUPABASE_KEY missing or empty). "
+        "Supabase Storage NOT configured (need SUPABASE_URL, and one of SUPABASE_KEY / SUPABASE_SECRET_KEY / SUPABASE_SERVICE_ROLE_KEY). "
         "Logo uploads will fall back to local disk, which is NOT persistent on Render."
     )
 
@@ -1323,7 +1332,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             </div>
         </header>
 
-        {"<div class='bg-amber-50 border-b border-amber-200 text-amber-800 text-xs px-8 py-2.5 text-center font-semibold'>⚠️ That logo was saved to temporary server storage, not cloud storage — it will likely disappear the next time the server restarts. Check that SUPABASE_URL and SUPABASE_KEY are set correctly on Render, and that a public 'logos' bucket exists in Supabase, then re-upload.</div>" if logo_storage == "local" else ""}
+        {"<div class='bg-amber-50 border-b border-amber-200 text-amber-800 text-xs px-8 py-2.5 text-center font-semibold'>⚠️ That logo was saved to temporary server storage, not cloud storage — it will likely disappear the next time the server restarts. Check that SUPABASE_URL and a Supabase secret/service key (SUPABASE_KEY, SUPABASE_SECRET_KEY, or SUPABASE_SERVICE_ROLE_KEY) are set correctly on Render, and that a public 'logos' bucket exists in Supabase, then re-upload.</div>" if logo_storage == "local" else ""}
 
         <div class="fixed top-4 right-4 z-50">
             <button onclick="document.getElementById('settingsModal').classList.remove('hidden')" class="bg-white hover:bg-slate-100 text-slate-700 p-2.5 rounded-full border border-slate-200 shadow-md transition duration-200 cursor-pointer flex items-center justify-center">
@@ -1811,15 +1820,17 @@ def storage_diagnostics(school_id: int, request: Request):
             <div class="text-sm space-y-1">
                 <p><b>Supabase Storage:</b> {status_html}</p>
                 <p><b>SUPABASE_URL env var:</b> {url_present}</p>
-                <p><b>SUPABASE_KEY env var:</b> {key_present}</p>
+                <p><b>Supabase key env var:</b> {key_present} <span class="text-slate-400">(accepts SUPABASE_KEY, SUPABASE_SECRET_KEY, or SUPABASE_SERVICE_ROLE_KEY)</span></p>
             </div>
             <div>
                 <p class="text-xs font-bold uppercase text-slate-500 mb-1">Last upload error (this server process)</p>
                 {last_error_html}
             </div>
             <p class="text-[11px] text-slate-400">
-                If Supabase shows "Not configured", add SUPABASE_URL and SUPABASE_KEY in Render → Environment,
-                using your Supabase project URL and <b>service_role</b> key, then redeploy. If it shows
+                If Supabase shows "Not configured", set SUPABASE_URL and a secret-level key in Render → Environment.
+                Newer Supabase projects call this key <b>SUPABASE_SECRET_KEY</b> (shown as "secret key" in
+                Project Settings → API Keys) instead of the older "service_role" naming — either name works here.
+                Do not use the "publishable"/"anon" key; it doesn't have permission to write to storage. If it shows
                 Configured but there's a recorded error, that error message is exactly what Supabase's API
                 returned when the upload was attempted (e.g. bucket not found, or an access-policy rejection).
             </p>
