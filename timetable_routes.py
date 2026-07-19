@@ -381,6 +381,7 @@ def timetable_dashboard(school_id: int, request: Request):
                 <a href="/timetable/availability/{school_id}" class="bg-indigo-700 hover:bg-indigo-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">👩‍🏫 Teacher Availability</a>
                 <a href="/timetable/subject-availability/{school_id}" class="bg-purple-700 hover:bg-purple-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
                 <a href="/timetable/sync-rules/{school_id}" class="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Same-Time Rules</a>
+                <a href="/timetable/teachers/{school_id}" class="bg-slate-700 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">🖨 Teacher Timetables</a>
                 <a href="/timetable/master/{school_id}" class="bg-emerald-700 hover:bg-emerald-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">🗓 Whole School View</a>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Dashboard</a>
             </div>
@@ -712,6 +713,46 @@ def teacher_availability_picker(school_id: int, request: Request):
         <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">👩‍🏫 Teacher Availability</h2>
             <p class="text-xs text-slate-400 mb-4">Pick a teacher to set which days/periods they're available, unavailable, or conditional for.</p>
+            <div>{rows_html or "<p class='text-slate-400 text-xs italic p-4'>No verified staff accounts yet.</p>"}</div>
+            <div class="pt-4">
+                <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/timetable/teachers/{school_id}", response_class=HTMLResponse)
+def teacher_timetable_picker(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, email, full_name FROM users
+                WHERE school_id = %s AND role = 'staff' AND is_verified = TRUE
+                ORDER BY full_name NULLS LAST, email ASC;
+            """, (school_id,))
+            staff_members = cur.fetchall()
+
+    rows_html = "".join(f"""
+        <div class="flex items-center justify-between p-4 border-b last:border-0 hover:bg-slate-50 transition">
+            <span class="text-sm font-bold text-slate-800">{esc(m['full_name'] or m['email'])}</span>
+            <a href="/timetable/print/teacher/{school_id}/{m['id']}" target="_blank" class="text-xs bg-indigo-700 hover:bg-indigo-800 text-white font-bold px-3 py-1.5 rounded-lg transition">🖨 View / Print</a>
+        </div>
+    """ for m in staff_members)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Teacher Timetables</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
+            <h2 class="text-lg font-black text-slate-800">🖨 Teacher Timetables</h2>
+            <p class="text-xs text-slate-400 mb-4">Each teacher's timetable is built automatically from every class they're assigned to teach — pick a teacher to view or print theirs.</p>
             <div>{rows_html or "<p class='text-slate-400 text-xs italic p-4'>No verified staff accounts yet.</p>"}</div>
             <div class="pt-4">
                 <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back</a>
