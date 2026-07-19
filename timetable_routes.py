@@ -76,6 +76,31 @@ def bootstrap_timetable_schema():
             # Safe migration for this table if it already existed (pre-stream) in production.
             cur.execute("ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM';")
 
+            # Same schema-drift issue as timetable_slots below: the original
+            # UNIQUE constraint on a pre-existing live table won't include the
+            # later-added `stream` column, breaking this table's ON CONFLICT
+            # clause too. Fix it the same way.
+            cur.execute("""
+                DELETE FROM teacher_subject_assignments a USING teacher_subject_assignments b
+                WHERE a.id > b.id
+                  AND a.school_id = b.school_id AND a.learning_area_id = b.learning_area_id
+                  AND a.grade_name = b.grade_name AND a.education_level = b.education_level
+                  AND a.stream = b.stream;
+            """)
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_teacher_subject_assignments_slot ON teacher_subject_assignments (school_id, learning_area_id, grade_name, education_level, stream);")
+
+            # Drop any OLDER unique constraint on this table that predates the
+            # per-stream conversion — it won't include `stream`, so it would
+            # otherwise still incorrectly reject two different streams having
+            # the same subject assigned (they're not actually duplicates).
+            cur.execute("""
+                SELECT conname FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                WHERE t.relname = 'teacher_subject_assignments' AND c.contype = 'u';
+            """)
+            for (conname,) in cur.fetchall():
+                cur.execute(f'ALTER TABLE teacher_subject_assignments DROP CONSTRAINT IF EXISTS "{conname}";')
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS timetable_slots (
                     id SERIAL PRIMARY KEY,
@@ -93,6 +118,54 @@ def bootstrap_timetable_schema():
             cur.execute("ALTER TABLE timetable_slots ADD COLUMN IF NOT EXISTS stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM';")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_timetable_slots_conflict ON timetable_slots (school_id, day_of_week, period_id, staff_user_id);")
 
+            # Same schema-drift issue as teacher_subject_assignments above:
+            # the original UNIQUE constraint on a pre-existing live table
+            # won't include the later-added `stream` column, breaking this
+            # table's ON CONFLICT clause. Fix it the same way.
+            cur.execute("""
+                DELETE FROM timetable_slots a USING timetable_slots b
+                WHERE a.id > b.id
+                  AND a.school_id = b.school_id AND a.grade_name = b.grade_name
+                  AND a.education_level = b.education_level AND a.stream = b.stream
+                  AND a.day_of_week = b.day_of_week AND a.period_id = b.period_id;
+            """)
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_timetable_slots_slot ON timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id);")
+
+            cur.execute("""
+                SELECT conname FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                WHERE t.relname = 'timetable_slots' AND c.contype = 'u';
+            """)
+            for (conname,) in cur.fetchall():
+                cur.execute(f'ALTER TABLE timetable_slots DROP CONSTRAINT IF EXISTS "{conname}";')
+
+            # The table's original UNIQUE constraint (from before the per-stream
+            # conversion) is stuck on live databases without the `stream` column,
+            # since CREATE TABLE IF NOT EXISTS never re-runs on an existing table
+            # and ALTER TABLE ADD COLUMN doesn't touch existing constraints. This
+            # breaks the ON CONFLICT (...) clause used when saving a slot. Fix it
+            # by explicitly creating the correctly-scoped unique index — Postgres's
+            # ON CONFLICT matches any unique index with the exact column list,
+            # regardless of the original constraint's name.
+            cur.execute("""
+                DELETE FROM timetable_slots a USING timetable_slots b
+                WHERE a.id > b.id
+                  AND a.school_id = b.school_id AND a.grade_name = b.grade_name
+                  AND a.education_level = b.education_level AND a.stream = b.stream
+                  AND a.day_of_week = b.day_of_week AND a.period_id = b.period_id;
+            """)
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_timetable_slots_slot ON timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id);")
+
+            # Same reasoning as teacher_subject_assignments above — drop any
+            # older unique constraint that predates the per-stream conversion.
+            cur.execute("""
+                SELECT conname FROM pg_constraint c
+                JOIN pg_class t ON c.conrelid = t.oid
+                WHERE t.relname = 'timetable_slots' AND c.contype = 'u';
+            """)
+            for (conname,) in cur.fetchall():
+                cur.execute(f'ALTER TABLE timetable_slots DROP CONSTRAINT IF EXISTS "{conname}";')
+
             # Teacher availability — only exceptions are stored; a teacher with
             # no row for a given day/period is treated as available by default.
             cur.execute("""
@@ -107,6 +180,37 @@ def bootstrap_timetable_schema():
                 );
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_teacher_availability_lookup ON teacher_availability (school_id, staff_user_id, day_of_week, period_id);")
+
+            # Subject "time off" — mirrors teacher_availability, but keyed by
+            # subject instead of teacher (e.g. "no Math after lunch", "PE only
+            # in the afternoon"). Only exceptions are stored; a subject with
+            # no row for a given day/period is available by default.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subject_availability (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    day_of_week VARCHAR(20) NOT NULL,
+                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
+                    status VARCHAR(20) NOT NULL DEFAULT 'available',
+                    UNIQUE(school_id, learning_area_id, day_of_week, period_id)
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_subject_availability_lookup ON subject_availability (school_id, learning_area_id, day_of_week, period_id);")
+
+            # "Same time" subject rule — a subject that must be scheduled at
+            # one fixed day/period across every class/section that takes it
+            # (e.g. a schoolwide Games period, or an assembly slot).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subject_sync_rules (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    day_of_week VARCHAR(20) NOT NULL,
+                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
+                    UNIQUE(school_id, learning_area_id)
+                );
+            """)
 
             # Subject placement constraints ("card relationships") — per
             # class section, a rule between two subjects for the generator
@@ -124,7 +228,53 @@ def bootstrap_timetable_schema():
                     UNIQUE(school_id, grade_name, education_level, stream, subject_a_id, subject_b_id, constraint_type)
                 );
             """)
+
+            # Self-healing migration: on any school whose timetable_slots or
+            # teacher_subject_assignments table was created *before* the
+            # per-stream conversion, the stream column got added via ALTER
+            # TABLE but the original UNIQUE constraint (defined without
+            # stream) was never updated to match — causing "ON CONFLICT"
+            # in the app to fail with InvalidColumnReference. This detects
+            # that mismatch and fixes it, without needing to guess whatever
+            # Postgres auto-generated the old constraint's name as.
+            _ensure_unique_constraint(
+                cur, "timetable_slots",
+                ["school_id", "grade_name", "education_level", "stream", "day_of_week", "period_id"],
+                "uq_timetable_slots_section_slot",
+            )
+            _ensure_unique_constraint(
+                cur, "teacher_subject_assignments",
+                ["school_id", "learning_area_id", "grade_name", "education_level", "stream"],
+                "uq_teacher_subject_assignments_section_subject",
+            )
+
             conn.commit()
+
+
+def _ensure_unique_constraint(cur, table_name: str, target_columns: list, new_constraint_name: str):
+    """Ensures `table_name` has a UNIQUE constraint covering exactly
+    `target_columns` — dropping any older UNIQUE constraint on that table
+    that doesn't match (e.g. one predating a later-added column) and
+    creating the correct one, only when actually needed."""
+    cur.execute("""
+        SELECT tc.constraint_name, array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS cols
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+        WHERE tc.table_name = %s AND tc.constraint_type = 'UNIQUE' AND tc.table_schema = 'public'
+        GROUP BY tc.constraint_name;
+    """, (table_name,))
+    existing = cur.fetchall()
+    target_set = set(target_columns)
+    if any(set(cols) == target_set for _, cols in existing):
+        return  # already correct — nothing to do
+
+    for constraint_name, _ in existing:
+        cur.execute(f'ALTER TABLE {table_name} DROP CONSTRAINT "{constraint_name}";')
+    cur.execute(f"""
+        ALTER TABLE {table_name}
+        ADD CONSTRAINT {new_constraint_name} UNIQUE ({", ".join(target_columns)});
+    """)
 
 
 # =====================================================================
@@ -226,9 +376,11 @@ def timetable_dashboard(school_id: int, request: Request):
                 <h1 class="text-base font-bold text-slate-900">📅 Timetabling — {esc(school['name'])}</h1>
                 <p class="text-xs text-slate-400">Each stream has its own independent timetable.</p>
             </div>
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2 flex-wrap">
                 <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods & Days</a>
                 <a href="/timetable/availability/{school_id}" class="bg-indigo-700 hover:bg-indigo-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">👩‍🏫 Teacher Availability</a>
+                <a href="/timetable/subject-availability/{school_id}" class="bg-purple-700 hover:bg-purple-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
+                <a href="/timetable/sync-rules/{school_id}" class="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Same-Time Rules</a>
                 <a href="/timetable/master/{school_id}" class="bg-emerald-700 hover:bg-emerald-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">🗓 Whole School View</a>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Dashboard</a>
             </div>
@@ -673,6 +825,243 @@ async def save_teacher_availability(school_id: int, teacher_id: int, request: Re
     return RedirectResponse(url=f"/timetable/availability/{school_id}/{teacher_id}", status_code=303)
 
 
+@router.get("/timetable/subject-availability/{school_id}", response_class=HTMLResponse)
+def subject_availability_picker(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name, education_level FROM learning_areas ORDER BY education_level ASC, name ASC;")
+            subjects = cur.fetchall()
+
+    rows_html = "".join(f"""
+        <a href="/timetable/subject-availability/{school_id}/{s['id']}" class="flex items-center justify-between p-4 border-b last:border-0 hover:bg-slate-50 transition">
+            <span class="text-sm font-bold text-slate-800">{esc(s['name'])} <span class="text-[10px] text-slate-400 font-normal">({esc(s['education_level'])})</span></span>
+            <span class="text-xs text-indigo-700 font-bold">Set Time Off →</span>
+        </a>
+    """ for s in subjects)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Subject Time Off</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
+            <h2 class="text-lg font-black text-slate-800">📚 Subject Time Off</h2>
+            <p class="text-xs text-slate-400 mb-4">Pick a subject to mark days/periods it can't (or preferably shouldn't) be scheduled in — e.g. no Math last period, PE unavailable when the field is in use.</p>
+            <div>{rows_html or "<p class='text-slate-400 text-xs italic p-4'>No subjects configured yet.</p>"}</div>
+            <div class="pt-4">
+                <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/timetable/subject-availability/{school_id}/{learning_area_id}", response_class=HTMLResponse)
+def subject_availability_grid(school_id: int, learning_area_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name FROM learning_areas WHERE id = %s;", (learning_area_id,))
+            subject = cur.fetchone()
+            if not subject:
+                raise HTTPException(status_code=404, detail="Subject not found.")
+
+            days = get_school_days(cur, school_id)
+            conn.commit()
+
+            cur.execute("SELECT id, period_order, label FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
+            periods = cur.fetchall()
+
+            cur.execute("""
+                SELECT day_of_week, period_id, status FROM subject_availability
+                WHERE school_id = %s AND learning_area_id = %s;
+            """, (school_id, learning_area_id))
+            current = {(r['day_of_week'], r['period_id']): r['status'] for r in cur.fetchall()}
+
+    status_options = [("available", "✅ Available"), ("conditional", "❔ Conditional"), ("not_available", "❌ Not Available")]
+
+    header_cells = "".join(f"<th class='p-2 text-center text-xs'>{d}</th>" for d in days)
+    body_rows = ""
+    for period in periods:
+        body_rows += f"<tr><td class='p-2 text-xs font-bold bg-slate-50 sticky left-0'>{esc(period['label'])}</td>"
+        for day in days:
+            cur_status = current.get((day, period['id']), "available")
+            options = "".join(f"<option value='{val}' {'selected' if val == cur_status else ''}>{lbl}</option>" for val, lbl in status_options)
+            body_rows += f"<td class='p-1 text-center'><select name='status_{day}_{period['id']}' class='text-xs border rounded-lg p-1.5 w-full'>{options}</select></td>"
+        body_rows += "</tr>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Time Off — {esc(subject['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-4xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
+            <h2 class="text-lg font-black text-slate-800">📚 {esc(subject['name'])} — Time Off</h2>
+            <p class="text-xs text-slate-400 mb-4">"Not Available" is a hard block the generator and manual editor will never use for this subject. "Conditional" is a soft preference — used only if nothing better fits.</p>
+            <form action="/api/v1/timetable/subject-availability/update/{school_id}/{learning_area_id}" method="post">
+                <div class="overflow-x-auto">
+                    <table class="w-full border-collapse text-xs">
+                        <thead><tr><th class="p-2 sticky left-0 bg-white"></th>{header_cells}</tr></thead>
+                        <tbody>{body_rows}</tbody>
+                    </table>
+                </div>
+                <div class="pt-4 flex gap-3">
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 px-5 rounded-xl text-sm transition">Save Time Off</button>
+                    <a href="/timetable/subject-availability/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition">← Back</a>
+                </div>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/subject-availability/update/{school_id}/{learning_area_id}")
+async def save_subject_availability(school_id: int, learning_area_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form = await request.form()
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM learning_areas WHERE id = %s;", (learning_area_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Subject not found.")
+
+            cur.execute("SELECT id FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE;", (school_id,))
+            period_ids = [r[0] for r in cur.fetchall()]
+            days = get_school_days(cur, school_id)
+
+            for day in days:
+                for period_id in period_ids:
+                    field_name = f"status_{day}_{period_id}"
+                    status = form.get(field_name, "available")
+                    if status == "available":
+                        cur.execute("""
+                            DELETE FROM subject_availability
+                            WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s;
+                        """, (school_id, learning_area_id, day, period_id))
+                    else:
+                        cur.execute("""
+                            INSERT INTO subject_availability (school_id, learning_area_id, day_of_week, period_id, status)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (school_id, learning_area_id, day_of_week, period_id)
+                            DO UPDATE SET status = EXCLUDED.status;
+                        """, (school_id, learning_area_id, day, period_id, status))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/subject-availability/{school_id}/{learning_area_id}", status_code=303)
+
+
+@router.get("/timetable/sync-rules/{school_id}", response_class=HTMLResponse)
+def subject_sync_rules_view(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            days = get_school_days(cur, school_id)
+            conn.commit()
+
+            cur.execute("SELECT id, period_order, label FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
+            periods = cur.fetchall()
+
+            cur.execute("SELECT id, name, education_level FROM learning_areas ORDER BY education_level ASC, name ASC;")
+            subjects = cur.fetchall()
+
+            cur.execute("""
+                SELECT r.learning_area_id, r.day_of_week, r.period_id, p.label AS period_label
+                FROM subject_sync_rules r
+                JOIN timetable_periods p ON r.period_id = p.id
+                WHERE r.school_id = %s;
+            """, (school_id,))
+            rules = {r['learning_area_id']: r for r in cur.fetchall()}
+
+    rows_html = ""
+    for s in subjects:
+        rule = rules.get(s['id'])
+        current_note = (
+            f"<span class='text-[10px] text-emerald-700 font-bold'>Locked: {esc(rule['day_of_week'])}, {esc(rule['period_label'])}</span>"
+            if rule else
+            "<span class='text-[10px] text-slate-400 italic'>No rule — scheduled normally</span>"
+        )
+        day_options = "<option value=''>— No rule —</option>" + "".join(
+            f"<option value='{d}' {'selected' if rule and rule['day_of_week'] == d else ''}>{d}</option>" for d in days
+        )
+        period_options = "".join(
+            f"<option value='{p['id']}' {'selected' if rule and rule['period_id'] == p['id'] else ''}>{esc(p['label'])}</option>" for p in periods
+        )
+        rows_html += f"""
+        <tr class="border-b text-sm">
+            <td class="p-3">
+                <p class="font-bold text-slate-800">{esc(s['name'])}</p>
+                <p class="text-[10px] text-slate-400">{esc(s['education_level'])}</p>
+                {current_note}
+            </td>
+            <td class="p-3">
+                <form action="/api/v1/timetable/sync-rules/save/{school_id}/{s['id']}" method="post" class="flex flex-wrap items-center gap-2">
+                    <select name="day_of_week" class="border rounded-lg p-1.5 text-xs">{day_options}</select>
+                    <select name="period_id" class="border rounded-lg p-1.5 text-xs">{period_options}</select>
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition">Save</button>
+                </form>
+            </td>
+        </tr>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Same-Time Subject Rules</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-3xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
+            <h2 class="text-lg font-black text-slate-800">🔗 Same-Time Subject Rules</h2>
+            <p class="text-xs text-slate-400 mb-4">Lock a subject to one fixed day and period, school-wide — every class/stream that takes it will be scheduled at that exact slot (e.g. a schoolwide Games period or assembly). Choose "— No rule —" to let it schedule normally again.</p>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse">
+                    <tbody>{rows_html or "<tr><td class='p-6 text-center text-slate-400 italic text-xs'>No subjects configured yet.</td></tr>"}</tbody>
+                </table>
+            </div>
+            <div class="pt-4">
+                <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/sync-rules/save/{school_id}/{learning_area_id}")
+def save_subject_sync_rule(school_id: int, learning_area_id: int, request: Request, day_of_week: str = Form(""), period_id: str = Form("")):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            if not day_of_week or not period_id:
+                cur.execute("DELETE FROM subject_sync_rules WHERE school_id = %s AND learning_area_id = %s;", (school_id, learning_area_id))
+            else:
+                cur.execute("""
+                    INSERT INTO subject_sync_rules (school_id, learning_area_id, day_of_week, period_id)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (school_id, learning_area_id) DO UPDATE SET day_of_week = EXCLUDED.day_of_week, period_id = EXCLUDED.period_id;
+                """, (school_id, learning_area_id, day_of_week, int(period_id)))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/sync-rules/{school_id}", status_code=303)
+
+
 @router.get("/timetable/constraints/{school_id}", response_class=HTMLResponse)
 def subject_constraints_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
     auth_error = require_school_session(request, school_id)
@@ -695,6 +1084,7 @@ def subject_constraints_view(school_id: int, request: Request, grade_name: str, 
     type_labels = {
         "same_day_forbidden": "Cannot be on the same day",
         "consecutive_forbidden": "Cannot be back-to-back (consecutive periods)",
+        "same_day_required": "Must be on the same day",
     }
 
     existing_rows = ""
@@ -747,6 +1137,7 @@ def subject_constraints_view(school_id: int, request: Request, grade_name: str, 
                     <select name="constraint_type" class="w-full border p-2 rounded-lg text-xs font-semibold bg-white mt-1" required>
                         <option value="same_day_forbidden">Cannot be on the same day</option>
                         <option value="consecutive_forbidden">Cannot be back-to-back (consecutive periods)</option>
+                        <option value="same_day_required">Must be on the same day</option>
                     </select>
                 </div>
                 <div class="flex gap-3 pt-2">
@@ -754,6 +1145,10 @@ def subject_constraints_view(school_id: int, request: Request, grade_name: str, 
                     <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition">← Back</a>
                 </div>
             </form>
+
+            <div class="mt-6 pt-4 border-t">
+                <a href="/timetable/linked-constraints/{school_id}" class="text-xs text-indigo-700 font-bold hover:underline">🔗 Need two subjects across different classes to run at the exact same time? Set that up here →</a>
+            </div>
         </div>
     </body>
     </html>
@@ -960,13 +1355,43 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             if not subjects or not teaching_periods:
                 raise HTTPException(status_code=400, detail="No subjects or teaching periods configured — nothing to generate.")
 
+            teaching_period_ids = {p['id'] for p in teaching_periods}
+
+            # "Same time" rules — a subject locked to one fixed day/period
+            # school-wide gets force-placed there and excluded from the
+            # normal round-robin for every other slot.
+            cur.execute("SELECT learning_area_id, day_of_week, period_id FROM subject_sync_rules WHERE school_id = %s;", (school_id,))
+            sync_rules = {r['learning_area_id']: (r['day_of_week'], r['period_id']) for r in cur.fetchall()}
+
+            locked_placements = {}
+            free_subjects = []
+            for subj in subjects:
+                rule = sync_rules.get(subj['id'])
+                if rule and rule[0] in days and rule[1] in teaching_period_ids:
+                    locked_placements[(rule[0], rule[1])] = subj
+                else:
+                    free_subjects.append(subj)
+            if not free_subjects:
+                free_subjects = subjects  # safety net: never leave the queue empty
+
+            # Subject "time off" — a subject marked "not_available" at a slot
+            # is a hard block; "conditional" is a soft preference to avoid.
+            cur.execute("""
+                SELECT learning_area_id, day_of_week, period_id, status FROM subject_availability
+                WHERE school_id = %s AND status IN ('not_available', 'conditional');
+            """, (school_id,))
+            subject_unavailable, subject_conditional = set(), set()
+            for r in cur.fetchall():
+                key = (r['learning_area_id'], r['day_of_week'], r['period_id'])
+                (subject_unavailable if r['status'] == 'not_available' else subject_conditional).add(key)
+
             # Build a round-robin queue of subjects sized to fill every slot,
             # distributing periods as evenly as possible across the week.
             total_slots = len(days) * len(teaching_periods)
             queue = []
             i = 0
             while len(queue) < total_slots:
-                queue.append(subjects[i % len(subjects)])
+                queue.append(free_subjects[i % len(free_subjects)])
                 i += 1
 
             # Track which teacher is already booked at each (day, period) across
@@ -1011,6 +1436,26 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 used_today = set()
                 last_subject_id = None
                 for period in teaching_periods:
+                    # A subject locked to this exact day/period by a "same
+                    # time" rule always wins this slot outright — it isn't
+                    # drawn from the round-robin queue at all.
+                    locked_subject = locked_placements.get((day, period['id']))
+                    if locked_subject:
+                        lcid = locked_subject['id']
+                        chosen_subject = locked_subject
+                        chosen_teacher = teacher_for_subject.get(lcid)
+                        if chosen_teacher and booked.get((day, period['id'])) == chosen_teacher:
+                            chosen_teacher = None  # conflict — place subject anyway, flagged for manual fix
+                        cur.execute("""
+                            INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, staff_user_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (school_id, grade_name, education_level, stream, day, period['id'], lcid, chosen_teacher))
+                        if chosen_teacher:
+                            booked[(day, period['id'])] = chosen_teacher
+                        used_today.add(lcid)
+                        last_subject_id = lcid
+                        continue
+
                     # Search the queue for the best candidate subject that
                     # respects: not already used today, not blocked by a
                     # same-day/consecutive constraint against what's already
@@ -1035,6 +1480,10 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                                 continue
                             if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
                                 continue
+                            if (cid, day, period['id']) in subject_unavailable:
+                                continue  # this subject has "time off" at this exact slot
+                            if avoid_conditional and (cid, day, period['id']) in subject_conditional:
+                                continue  # soft preference: try to avoid this slot first
 
                             cand_teacher = teacher_for_subject.get(cid)
                             if cand_teacher and (cand_teacher, day, period['id']) in unavailable:
@@ -1181,6 +1630,31 @@ def update_timetable_slot(
                                 status_code=400,
                                 detail=f"This subject can't be placed back-to-back with {other_slot['subject_name']} for this class — see Constraints."
                             )
+
+            # Subject "time off" — this subject marked unavailable at this
+            # exact slot is a hard block, mirroring the teacher check above.
+            cur.execute("""
+                SELECT status FROM subject_availability
+                WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s;
+            """, (school_id, learning_area_id, day_of_week, period_id))
+            subj_availability = cur.fetchone()
+            if subj_availability and subj_availability['status'] == 'not_available':
+                raise HTTPException(
+                    status_code=400,
+                    detail="This subject has been marked unavailable at this exact day/period. Adjust it on the Subject Time Off page first, or pick a different slot."
+                )
+
+            # "Same time" school-wide lock — if this subject is locked to a
+            # specific day/period, it can't be placed anywhere else.
+            cur.execute("SELECT day_of_week, period_id FROM subject_sync_rules WHERE school_id = %s AND learning_area_id = %s;", (school_id, learning_area_id))
+            sync_rule = cur.fetchone()
+            if sync_rule and (sync_rule['day_of_week'] != day_of_week or sync_rule['period_id'] != period_id):
+                cur.execute("SELECT label FROM timetable_periods WHERE id = %s;", (sync_rule['period_id'],))
+                locked_period = cur.fetchone()
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This subject is locked school-wide to {sync_rule['day_of_week']}, {locked_period['label'] if locked_period else 'a fixed period'} — see Same-Time Subject Rules to change it."
+                )
 
             cur.execute("""
                 INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, staff_user_id)
