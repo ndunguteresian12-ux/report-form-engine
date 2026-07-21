@@ -541,8 +541,9 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
         "teaching": ("Teaching", "bg-emerald-50 text-emerald-700 border-emerald-200"),
         "break": ("Break", "bg-slate-100 text-slate-500 border-slate-200"),
         "prep": ("Prep Time", "bg-violet-50 text-violet-700 border-violet-200"),
+        "co_curricular": ("Co-Curricular", "bg-amber-50 text-amber-700 border-amber-200"),
     }
-    row_bg = {"teaching": "", "break": "background:#f8fafc;", "prep": "background:#f5f3ff;"}
+    row_bg = {"teaching": "", "break": "background:#f8fafc;", "prep": "background:#f5f3ff;", "co_curricular": "background:#fffbeb;"}
     for p in periods:
         p_type = p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')
         row_type, badge_class = type_badges.get(p_type, type_badges['teaching'])
@@ -638,6 +639,7 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
                             <option value="teaching">Teaching</option>
                             <option value="break">Break</option>
                             <option value="prep">Prep Time (protected)</option>
+                            <option value="co_curricular">Co-Curricular (reserved)</option>
                         </select>
                     </div>
                     <div class="flex flex-col justify-end">
@@ -688,7 +690,7 @@ def add_timetable_period(
     short_label = short_label.strip() or label[:3].upper()
     if not label:
         raise HTTPException(status_code=400, detail="A name for this period is required.")
-    if period_type not in ("teaching", "break", "prep"):
+    if period_type not in ("teaching", "break", "prep", "co_curricular"):
         period_type = "teaching"
     is_teaching_period = period_type == "teaching"
 
@@ -1869,7 +1871,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
     body_rows = ""
     for p in periods:
         p_type = p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')
-        if p_type != 'teaching':
+        if p_type in ('break', 'prep'):
             label_note = "Prep Time (protected)" if p_type == 'prep' else p['label']
             body_rows += f"""
             <tr class="bg-slate-50">
@@ -2233,6 +2235,15 @@ def update_timetable_slot(
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT period_type, is_teaching_period, label FROM timetable_periods WHERE id = %s;", (period_id,))
+            period_row = cur.fetchone()
+            period_type = (period_row.get('period_type') if period_row else None) or ('teaching' if (period_row and period_row['is_teaching_period']) else 'break')
+            if period_type in ('break', 'prep'):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"'{period_row['label'] if period_row else 'This period'}' is a {('protected prep-time' if period_type == 'prep' else 'break')} period and can never have a lesson or activity scheduled into it."
+                )
+
             if not subject_choice:
                 cur.execute("""
                     DELETE FROM timetable_slots
@@ -2653,7 +2664,13 @@ def timetable_master_view(school_id: int, request: Request):
             # (e.g. Lower Primary's 35-minute lessons vs Junior School's
             # 40-minute ones) — a single merged period list would misalign
             # columns across levels, so each level gets its own table below.
-            periods_by_level = {level: [p for p in get_periods_for_level(cur, school_id, level) if p['is_teaching_period']] for level in EDUCATION_LEVELS}
+            # Only true breaks are excluded here — prep and co-curricular
+            # periods still show as real columns since they can carry actual
+            # scheduled content worth seeing at a glance.
+            periods_by_level = {
+                level: [p for p in get_periods_for_level(cur, school_id, level) if (p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')) != 'break']
+                for level in EDUCATION_LEVELS
+            }
 
     if not sections:
         body_html = "<p class='text-slate-400 text-sm italic text-center py-16'>Nothing to show yet — add students to at least one class first.</p>"
@@ -2781,7 +2798,10 @@ def timetable_master_print(school_id: int, request: Request):
                 key = (row['grade_name'], row['education_level'], row['stream'], row['day_of_week'], row['period_id'])
                 slot_map[key] = row
 
-            periods_by_level = {level: [p for p in get_periods_for_level(cur, school_id, level) if p['is_teaching_period']] for level in EDUCATION_LEVELS}
+            periods_by_level = {
+                level: [p for p in get_periods_for_level(cur, school_id, level) if (p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')) != 'break']
+                for level in EDUCATION_LEVELS
+            }
 
     level_tables = []
     for level in EDUCATION_LEVELS:
