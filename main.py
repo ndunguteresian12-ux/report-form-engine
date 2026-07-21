@@ -1315,9 +1315,9 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
         <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
     </head>
-    <body class="bg-[#F8FAFC] text-slate-800 antialiased min-h-full flex flex-col relative">
-        
-        <header class="bg-white border-b border-slate-200/80 px-8 py-4 flex justify-between items-center sticky top-0 z-40 backdrop-blur-md bg-white/90 shadow-2xs">
+    <body class="bg-[#F7F8FB] text-slate-800 antialiased min-h-full flex flex-col relative">
+
+        <header class="bg-white border-b border-slate-200/80 px-4 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 sticky top-0 z-40 backdrop-blur-md bg-white/90 shadow-2xs">
             <div class="flex items-center space-x-4">
                 {logo_html}
                 <div>
@@ -1326,9 +1326,9 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                     {f'<p class="text-[11px] text-indigo-700 font-bold mt-0.5">Welcome, {esc(admin_name.split(" ")[0])}</p>' if admin_name else ''}
                 </div>
             </div>
-            <div class="flex items-center space-x-3 text-xs font-semibold mr-14">
-                <span class="bg-slate-50 text-slate-700 px-3 py-2 rounded-xl border border-slate-200/60 shadow-2xs">System Wallet: <span class="text-slate-900 font-bold">KSh {float(school['wallet_balance']):,.2f}</span></span>
-                <span class="bg-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
+            <div class="flex items-center flex-wrap gap-2 text-xs font-semibold">
+                <span class="bg-gradient-to-r from-amber-500 to-amber-600 text-white px-3 py-2 rounded-xl shadow-xs">💰 KSh {float(school['wallet_balance']):,.2f}</span>
+                <span class="bg-gradient-to-r from-indigo-800 to-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 Timetable</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
@@ -1336,51 +1336,73 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
 
         {"<div class='bg-amber-50 border-b border-amber-200 text-amber-800 text-xs px-8 py-2.5 text-center font-semibold'>⚠️ That logo was saved to temporary server storage, not cloud storage — it will likely disappear the next time the server restarts. Check that SUPABASE_URL and a Supabase secret/service key (SUPABASE_KEY, SUPABASE_SECRET_KEY, or SUPABASE_SERVICE_ROLE_KEY) are set correctly on Render, and that a public 'logos' bucket exists in Supabase, then re-upload.</div>" if logo_storage == "local" else ""}
 
-        <div class="fixed top-4 right-4 z-50">
-            <button onclick="document.getElementById('settingsModal').classList.remove('hidden')" class="bg-white hover:bg-slate-100 text-slate-700 p-2.5 rounded-full border border-slate-200 shadow-md transition duration-200 cursor-pointer flex items-center justify-center">
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="w-5 h-5 animate-[spin_12s_linear_infinite]">
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.43l-1.003.767a1.123 1.123 0 0 0-.417 1.03c.004.074.006.148.006.222 0 .074-.002.148-.006.222a1.123 1.123 0 0 0 .417 1.03l1.003.767a1.125 1.125 0 0 1 .26 1.43l-1.296 2.247a1.125 1.125 0 0 1-1.37.49l-1.216-.456a1.125 1.125 0 0 0-1.076.124a6.57 6.57 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281a1.125 1.125 0 0 0-.646-.87a6.512 6.512 0 0 1-.22-.127c-.331-.182-.581-.495-.644-.869l-.213-1.281a1.125 1.125 0 0 1 .26-1.43l1.003-.767a1.12 1.12 0 0 0 .417-1.03a6.445 6.445 0 0 1-.006-.222c0-.074.002-.148.006-.222a1.12 1.12 0 0 0-.417-1.03l-1.003-.767a1.125 1.125 0 0 1-.26-1.43l1.296-2.247a1.125 1.125 0 0 1 1.37-.49l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128c.332-.183.582-.495.644-.869l.214-1.28Z" />
-                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
-                </svg>
-            </button>
-        </div>
+        <div class="flex flex-col lg:flex-row flex-1 w-full max-w-[1600px] mx-auto">
 
-        <div class="p-8 max-w-7xl mx-auto w-full grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">
-            <div class="lg:col-span-2 space-y-8">
-                {stats_html}
+            <!-- ============ LEFT SIDEBAR ============ -->
+            <aside class="w-full lg:w-80 shrink-0 lg:sticky lg:top-[73px] lg:h-[calc(100vh-73px)] lg:overflow-y-auto border-r border-slate-200/70 bg-white px-5 py-6 space-y-6">
+
+                <!-- Classes quick nav -->
                 <div>
-                    <div class="flex items-center justify-between mb-4">
-                        <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Classroom Cohorts Grouping</h2>
-                        <a href="/admin/student/new/{school_id}" class="bg-indigo-900 hover:bg-indigo-800 text-white text-xs px-3.5 py-2 rounded-xl font-semibold transition shadow-xs">+ Register New Student</a>
-                    </div>
-                    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                        {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No registered student profiles logged inside streams.</p>"}
-                    </div>
-                </div>
-            </div>
-
-            <div class="space-y-6">
-                <div class="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-3">
-                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400 border-b border-slate-100 pb-3">📚 Class Rosters</h2>
-                    <div class="space-y-2 max-h-[420px] overflow-y-auto pr-1">
-                        {roster_sidebar_html or "<p class='text-slate-400 text-xs italic text-center py-6'>No classes with students yet.</p>"}
+                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-indigo-700 flex items-center gap-1.5 mb-2.5">
+                        <span class="w-2 h-2 rounded-full bg-indigo-600"></span> Classes
+                    </h2>
+                    <div class="space-y-1 max-h-40 overflow-y-auto pr-1">
+                        {"".join(f"<a href='/staff/bulk-entry/{school_id}?grade_name={urllib.parse.quote(c['grade_name'])}&stream={urllib.parse.quote('SINGLE STREAM' if (is_single_stream or not c['stream'] or c['stream'].strip()=='' or c['stream'].upper()=='SINGLE STREAM') else c['stream'])}&education_level={urllib.parse.quote(c['education_level'])}' class='block text-xs font-semibold text-slate-600 hover:text-indigo-700 hover:bg-indigo-50 rounded-lg px-2.5 py-1.5 transition truncate'>{esc(c['grade_name'] if (is_single_stream or not c['stream'] or c['stream'].strip()=='' or c['stream'].upper()=='SINGLE STREAM') else c['grade_name'] + ' — ' + c['stream'])}</a>" for c in classes) or "<p class='text-slate-400 text-xs italic px-2.5'>No classes yet.</p>"}
                     </div>
                 </div>
 
-                <div class="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-3">
-                    <div class="flex items-center justify-between border-b border-slate-100 pb-3">
-                        <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400">🧑‍🏫 Staff</h2>
-                        <a href="/staff/register-panel/{school_id}" class="bg-indigo-700 hover:bg-indigo-800 text-white text-[10px] px-2.5 py-1.5 rounded-lg font-bold transition">+ Add Staff</a>
+                <!-- Staff -->
+                <div class="pt-5 border-t border-slate-100">
+                    <div class="flex items-center justify-between mb-2.5">
+                        <h2 class="text-[11px] font-bold uppercase tracking-wider text-violet-700 flex items-center gap-1.5">
+                            <span class="w-2 h-2 rounded-full bg-violet-600"></span> Staff
+                        </h2>
+                        <a href="/staff/register-panel/{school_id}" class="bg-violet-700 hover:bg-violet-800 text-white text-[10px] px-2.5 py-1 rounded-lg font-bold transition">+ Add</a>
                     </div>
-                    <div class="max-h-64 overflow-y-auto pr-1">
-                        {staff_panel_html or "<p class='text-slate-400 text-xs italic text-center py-6'>No staff accounts yet.</p>"}
+                    <div class="max-h-56 overflow-y-auto pr-1 space-y-0.5">
+                        {staff_panel_html or "<p class='text-slate-400 text-xs italic px-1 py-3'>No staff accounts yet.</p>"}
                     </div>
                 </div>
 
-                <div class="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-4">
-                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400 border-b border-slate-100 pb-3">⚙️ Core Parameters</h2>
-                    <form action="/api/v1/settings/update/{school_id}" method="post" class="space-y-4">
-                        <div class="grid grid-cols-2 gap-3">
+                <!-- Class Rosters -->
+                <div class="pt-5 border-t border-slate-100">
+                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-teal-700 flex items-center gap-1.5 mb-2.5">
+                        <span class="w-2 h-2 rounded-full bg-teal-600"></span> Class Rosters
+                    </h2>
+                    <div class="space-y-2 max-h-72 overflow-y-auto pr-1">
+                        {roster_sidebar_html or "<p class='text-slate-400 text-xs italic px-1 py-3'>No classes with students yet.</p>"}
+                    </div>
+                </div>
+
+                <!-- System Wallet -->
+                <div class="pt-5 border-t border-slate-100">
+                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-amber-700 flex items-center gap-1.5 mb-2.5">
+                        <span class="w-2 h-2 rounded-full bg-amber-500"></span> System Wallet
+                    </h2>
+                    <div class="bg-gradient-to-br from-amber-50 to-white border border-amber-100 rounded-xl p-3 mb-3">
+                        <p class="text-[10px] text-amber-700 font-bold uppercase tracking-wide">Current Balance</p>
+                        <p class="text-lg font-black text-slate-900">KSh {float(school['wallet_balance']):,.2f}</p>
+                    </div>
+                    <form action="/api/v1/wallet/stkpush/{school_id}" method="post" class="space-y-2.5">
+                        <div>
+                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Lipa na M-PESA Phone Number</label>
+                            <input type="text" name="phone_number" placeholder="07XXXXXXXX" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-amber-400" required>
+                        </div>
+                        <div>
+                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Topup Amount (KSh)</label>
+                            <input type="number" name="amount" value="500" min="10" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-amber-400" required>
+                        </div>
+                        <button type="submit" class="w-full bg-amber-500 hover:bg-amber-600 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">🚀 Request STK Push</button>
+                    </form>
+                </div>
+
+                <!-- Settings -->
+                <div class="pt-5 border-t border-slate-100">
+                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5 mb-2.5">
+                        <span class="w-2 h-2 rounded-full bg-slate-500"></span> Settings
+                    </h2>
+                    <form action="/api/v1/settings/update/{school_id}" method="post" class="space-y-3">
+                        <div class="grid grid-cols-2 gap-2">
                             <div>
                                 <label class="text-[11px] font-semibold text-slate-500 block mb-1">Academic Term</label>
                                 <select name="active_term" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
@@ -1398,7 +1420,16 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                                 </select>
                             </div>
                         </div>
-                        
+
+                        <div>
+                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Theme Branding Color</label>
+                            <select name="theme_color" class="w-full border border-slate-200 p-2 rounded-xl text-xs font-semibold bg-white outline-none focus:border-slate-400">
+                                <option value="emerald" {"selected" if school.get('theme_color') == 'emerald' else ""}>Emerald Dynamic Green</option>
+                                <option value="indigo" {"selected" if school.get('theme_color') == 'indigo' else ""}>Indigo Corporate Blue</option>
+                                <option value="slate" {"selected" if school.get('theme_color') == 'slate' else ""}>Slate Minimalistic Gray</option>
+                            </select>
+                        </div>
+
                         <div class="bg-slate-50 p-3 rounded-xl border border-slate-100 flex items-center justify-between">
                             <div>
                                 <label class="text-xs font-bold text-slate-800 block">Single Stream Mode</label>
@@ -1417,12 +1448,11 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                                 <input type="date" name="closing_date" value="{esc(st['closing_date'])}" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
                             </div>
                         </div>
-                        <input type="hidden" name="theme_color" value="emerald">
-                        <button type="submit" class="w-full bg-indigo-900 hover:bg-indigo-800 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">Commit Engine Settings</button>
+                        <button type="submit" class="w-full bg-slate-800 hover:bg-slate-900 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">Commit Engine Settings</button>
                     </form>
 
-                    <div class="mt-2 pt-4 border-t border-slate-100">
-                        <form action="/api/v1/school/promote-classes/{school_id}" method="post" 
+                    <div class="mt-3 pt-3 border-t border-slate-100">
+                        <form action="/api/v1/school/promote-classes/{school_id}" method="post"
                               onsubmit="return confirm('CRITICAL WARNING: Are you sure you want to promote all active student cohorts up 1 Grade Level? Grade 9 cohorts will safely move into Graduated Status.');">
                             <button type="submit" class="w-full bg-amber-50 border border-amber-200/80 text-amber-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-amber-100/70 transition cursor-pointer">
                                 🔄 Advance All Classes 1 Year
@@ -1430,76 +1460,21 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                         </form>
                     </div>
                 </div>
+            </aside>
 
-                <div class="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-4">
-                    <h2 class="text-sm font-bold uppercase tracking-wider text-slate-400 border-b border-slate-100 pb-3">💳 Wallet Billing</h2>
-                    <form action="/api/v1/wallet/stkpush/{school_id}" method="post" class="space-y-3">
-                        <div>
-                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Lipa na M-PESA Phone Number</label>
-                            <input type="text" name="phone_number" placeholder="07XXXXXXXX" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400" required>
-                        </div>
-                        <div>
-                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Topup Amount (KSh)</label>
-                            <input type="number" name="amount" value="500" min="10" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400" required>
-                        </div>
-                        <button type="submit" class="w-full bg-emerald-600 text-white text-xs py-2.5 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs cursor-pointer">🚀 Request STK Push</button>
-                    </form>
+            <!-- ============ CENTER: PERFORMANCE ANALYSIS & INTERACTIVE CARDS ============ -->
+            <main class="flex-1 p-4 sm:p-8 space-y-8 min-w-0">
+                {stats_html}
+                <div>
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Classroom Cohorts Grouping</h2>
+                        <a href="/admin/student/new/{school_id}" class="bg-indigo-900 hover:bg-indigo-800 text-white text-xs px-3.5 py-2 rounded-xl font-semibold transition shadow-xs">+ Register New Student</a>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No registered student profiles logged inside streams.</p>"}
+                    </div>
                 </div>
-            </div>
-        </div>
-
-        <div id="settingsModal" class="hidden fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-            <div class="bg-white rounded-2xl border shadow-xl max-w-md w-full overflow-hidden">
-                <div class="p-5 border-b flex justify-between items-center bg-slate-50">
-                    <h3 class="font-black text-slate-800 text-base">⚙️ System Node Configurations</h3>
-                    <button onclick="document.getElementById('settingsModal').classList.add('hidden')" class="text-slate-400 hover:text-slate-600 font-bold text-sm cursor-pointer">✕</button>
-                </div>
-                
-                <form action="/api/v1/settings/update/{school_id}" method="post" class="p-6 space-y-4 text-xs">
-                    <div>
-                        <label class="block font-bold text-slate-600 mb-1">Active Operations Term</label>
-                        <select name="active_term" class="w-full border border-slate-200 p-2 rounded-lg font-semibold bg-white">
-                            <option value="Term 1" {"selected" if st['active_term'] == 'Term 1' else ""}>Term 1</option>
-                            <option value="Term 2" {"selected" if st['active_term'] == 'Term 2' else ""}>Term 2</option>
-                            <option value="Term 3" {"selected" if st['active_term'] == 'Term 3' else ""}>Term 3</option>
-                        </select>
-                    </div>
-
-                    <div>
-                        <label class="block font-bold text-slate-600 mb-1">Active Evaluation Cycle</label>
-                        <select name="active_cycle" class="w-full border border-slate-200 p-2 rounded-lg font-semibold bg-white">
-                            <option value="Opener" {"selected" if st['active_cycle'] == 'Opener' else ""}>Opener Phase</option>
-                            <option value="Midterm" {"selected" if st['active_cycle'] == 'Midterm' else ""}>Midterm Cycle</option>
-                            <option value="End Term" {"selected" if st['active_cycle'] == 'End Term' else ""}>End Term Synthesis</option>
-                        </select>
-                    </div>
-
-                    <div class="grid grid-cols-2 gap-3">
-                        <div>
-                            <label class="block font-bold text-slate-600 mb-1">Opening Date</label>
-                            <input type="date" name="opening_date" value="{esc(st['opening_date'])}" required class="w-full border border-slate-200 p-2 rounded-lg font-semibold text-slate-700">
-                        </div>
-                        <div>
-                            <label class="block font-bold text-slate-600 mb-1">Closing Date</label>
-                            <input type="date" name="closing_date" value="{esc(st['closing_date'])}" required class="w-full border border-slate-200 p-2 rounded-lg font-semibold text-slate-700">
-                        </div>
-                    </div>
-
-                    <div>
-                        <label class="block font-bold text-slate-600 mb-1">Theme Branding Color</label>
-                        <select name="theme_color" class="w-full border border-slate-200 p-2 rounded-lg font-semibold bg-white">
-                            <option value="emerald">Emerald Dynamic Green</option>
-                            <option value="indigo">Indigo Corporate Blue</option>
-                            <option value="slate">Slate Minimalistic Gray</option>
-                        </select>
-                    </div>
-
-                    <div class="pt-4 border-t flex justify-end space-x-2">
-                        <button type="button" onclick="document.getElementById('settingsModal').classList.add('hidden')" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold py-2 px-4 rounded-xl cursor-pointer">Cancel</button>
-                        <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2 px-5 rounded-xl shadow-xs cursor-pointer">Save Settings</button>
-                    </div>
-                </form>
-            </div>
+            </main>
         </div>
     </body>
     </html>
