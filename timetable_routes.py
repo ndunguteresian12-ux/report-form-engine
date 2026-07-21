@@ -44,16 +44,21 @@ def bootstrap_timetable_schema():
                 CREATE TABLE IF NOT EXISTS timetable_periods (
                     id SERIAL PRIMARY KEY,
                     school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    education_level VARCHAR(100) NOT NULL DEFAULT 'ALL',
                     period_order INTEGER NOT NULL,
                     label VARCHAR(50) NOT NULL,
                     short_label VARCHAR(20),
                     start_time VARCHAR(20),
                     end_time VARCHAR(20),
                     is_teaching_period BOOLEAN DEFAULT TRUE,
-                    UNIQUE(school_id, period_order)
+                    UNIQUE(school_id, education_level, period_order)
                 );
             """)
             cur.execute("ALTER TABLE timetable_periods ADD COLUMN IF NOT EXISTS short_label VARCHAR(20);")
+            # Schools with periods already configured before per-level bell
+            # schedules existed get 'ALL' — a single shared schedule used as
+            # a fallback for any level that hasn't been given its own yet.
+            cur.execute("ALTER TABLE timetable_periods ADD COLUMN IF NOT EXISTS education_level VARCHAR(100) NOT NULL DEFAULT 'ALL';")
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS timetable_settings (
@@ -70,9 +75,13 @@ def bootstrap_timetable_schema():
                     grade_name VARCHAR(100) NOT NULL,
                     education_level VARCHAR(100) NOT NULL,
                     stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM',
+                    lessons_per_week INTEGER NOT NULL DEFAULT 1,
+                    requires_double BOOLEAN NOT NULL DEFAULT FALSE,
                     UNIQUE(school_id, learning_area_id, grade_name, education_level, stream)
                 );
             """)
+            cur.execute("ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS lessons_per_week INTEGER NOT NULL DEFAULT 1;")
+            cur.execute("ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS requires_double BOOLEAN NOT NULL DEFAULT FALSE;")
             # Safe migration for this table if it already existed (pre-stream) in production.
             cur.execute("ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM';")
 
@@ -247,6 +256,11 @@ def bootstrap_timetable_schema():
                 ["school_id", "learning_area_id", "grade_name", "education_level", "stream"],
                 "uq_teacher_subject_assignments_section_subject",
             )
+            _ensure_unique_constraint(
+                cur, "timetable_periods",
+                ["school_id", "education_level", "period_order"],
+                "uq_timetable_periods_level_order",
+            )
 
             conn.commit()
 
@@ -285,6 +299,11 @@ def _ensure_unique_constraint(cur, table_name: str, target_columns: list, new_co
 # schools don't share a start time (boarding vs day schools especially).
 ALL_POSSIBLE_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
+# The three CBC education levels, matching main.py's classes/learning_areas
+# data exactly. Each can have its own independent bell schedule — e.g.
+# Lower Primary's shorter 35-minute lessons vs Junior School's 40-minute ones.
+EDUCATION_LEVELS = ["Lower Primary", "Upper Primary", "Junior School"]
+
 
 def get_school_days(cur, school_id: int):
     """Returns this school's configured list of teaching days (e.g. Mon-Fri
@@ -296,11 +315,32 @@ def get_school_days(cur, school_id: int):
     return ALL_POSSIBLE_DAYS[:days_per_week]
 
 
+def get_periods_for_level(cur, school_id: int, education_level: str):
+    """Returns this school's periods for a specific education level (e.g.
+    Lower Primary's 35-minute lessons vs Junior School's 40-minute ones).
+    Falls back to the shared 'ALL' schedule if that level hasn't been given
+    its own periods yet, so schools that don't need the distinction — or
+    haven't configured it yet — keep working exactly as before."""
+    cur.execute(
+        "SELECT * FROM timetable_periods WHERE school_id = %s AND education_level = %s ORDER BY period_order ASC;",
+        (school_id, education_level)
+    )
+    rows = cur.fetchall()
+    if rows:
+        return rows
+    cur.execute(
+        "SELECT * FROM timetable_periods WHERE school_id = %s AND education_level = 'ALL' ORDER BY period_order ASC;",
+        (school_id,)
+    )
+    return cur.fetchall()
+
+
 def _section_label(grade_name: str, stream: str) -> str:
     """'Grade 6' for single-stream classes, 'Grade 6 — Stream N' otherwise."""
     if not stream or stream == "SINGLE STREAM":
         return grade_name
     return f"{grade_name} — Stream {stream}"
+
 
 
 @router.get("/timetable/dashboard/{school_id}", response_class=HTMLResponse)
@@ -398,7 +438,7 @@ def timetable_dashboard(school_id: int, request: Request):
 
 
 @router.get("/timetable/periods/{school_id}", response_class=HTMLResponse)
-def timetable_periods_view(school_id: int, request: Request):
+def timetable_periods_view(school_id: int, request: Request, education_level: str = "Lower Primary"):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -414,12 +454,21 @@ def timetable_periods_view(school_id: int, request: Request):
             settings_row = cur.fetchone()
             days_per_week = settings_row['days_per_week'] if settings_row else 5
 
-            cur.execute("SELECT * FROM timetable_periods WHERE school_id = %s ORDER BY period_order ASC;", (school_id,))
+            cur.execute(
+                "SELECT * FROM timetable_periods WHERE school_id = %s AND education_level = %s ORDER BY period_order ASC;",
+                (school_id, education_level)
+            )
             periods = cur.fetchall()
 
     days_options = "".join(
         f"<option value='{n}' {'selected' if n == days_per_week else ''}>{n} days ({', '.join(ALL_POSSIBLE_DAYS[:n])})</option>"
         for n in range(1, 7)
+    )
+
+    level_tabs = "".join(
+        f"""<a href="/timetable/periods/{school_id}?education_level={urllib.parse.quote(lvl)}"
+               class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-indigo-700 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
+        for lvl in EDUCATION_LEVELS
     )
 
     period_rows = ""
@@ -456,7 +505,7 @@ def timetable_periods_view(school_id: int, request: Request):
         <header class="bg-white border-b border-slate-200/80 px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
             <div>
                 <h1 class="text-base font-bold text-slate-900">⏱ Periods & Days — {esc(school['name'])}</h1>
-                <p class="text-xs text-slate-400">Every school sets its own bell times — there's no shared default, since boarding and day schools (and different regions) start at different times.</p>
+                <p class="text-xs text-slate-400">Every school sets its own bell times — there's no shared default, since boarding and day schools (and different levels within the same school) start and run lessons at different times.</p>
             </div>
             <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back</a>
         </header>
@@ -464,16 +513,23 @@ def timetable_periods_view(school_id: int, request: Request):
         <div class="p-4 sm:p-8 max-w-4xl mx-auto space-y-6">
             <div class="bg-white p-5 sm:p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-sm font-bold text-slate-800 mb-3">Number of Teaching Days</h2>
+                <p class="text-xs text-slate-400 mb-3">This applies school-wide, across every level.</p>
                 <form action="/api/v1/timetable/periods/days/{school_id}" method="post" class="flex flex-col sm:flex-row gap-3">
                     <select name="days_per_week" class="flex-1 border p-2.5 rounded-xl text-sm font-medium">{days_options}</select>
                     <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">Save</button>
                 </form>
             </div>
 
+            <div>
+                <h2 class="text-sm font-bold text-slate-800 mb-2">Bell Times for:</h2>
+                <div class="flex gap-2 flex-wrap">{level_tabs}</div>
+                <p class="text-xs text-slate-400 mt-2">Each level below has its own independent set of periods — set Lower Primary's shorter lessons separately from Junior School's longer ones, for example.</p>
+            </div>
+
             <div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
                 <div class="p-5 sm:p-6 border-b bg-slate-50/50">
-                    <h2 class="text-sm font-bold text-slate-800">Periods & Bell Times</h2>
-                    <p class="text-xs text-slate-400 mt-0.5">Add every period and break in order, with its actual start/end time.</p>
+                    <h2 class="text-sm font-bold text-slate-800">{esc(education_level)} — Periods & Bell Times</h2>
+                    <p class="text-xs text-slate-400 mt-0.5">Add every period and break in order, with its actual start/end time for this level.</p>
                 </div>
                 <div class="overflow-x-auto">
                     <table class="w-full text-left">
@@ -483,10 +539,11 @@ def timetable_periods_view(school_id: int, request: Request):
                                 <th class="p-2.5">Start</th><th class="p-2.5">End</th><th class="p-2.5 text-center">Type</th><th class="p-2.5"></th>
                             </tr>
                         </thead>
-                        <tbody>{period_rows or "<tr><td colspan='7' class='text-center p-6 text-slate-400 italic text-xs'>No periods configured yet — add your first one below.</td></tr>"}</tbody>
+                        <tbody>{period_rows or "<tr><td colspan='7' class='text-center p-6 text-slate-400 italic text-xs'>No periods configured yet for this level — add the first one below.</td></tr>"}</tbody>
                     </table>
                 </div>
                 <form action="/api/v1/timetable/periods/add/{school_id}" method="post" class="p-5 sm:p-6 bg-slate-50/50 border-t grid grid-cols-1 sm:grid-cols-6 gap-3">
+                    <input type="hidden" name="education_level" value="{esc(education_level)}">
                     <div class="sm:col-span-2">
                         <label class="text-[11px] font-bold text-slate-500">Name</label>
                         <input type="text" name="label" placeholder="e.g. Period 1, Short Break" class="w-full border p-2 rounded-lg mt-1 text-sm" required>
@@ -539,6 +596,7 @@ def save_timetable_days(school_id: int, request: Request, days_per_week: int = F
 def add_timetable_period(
     school_id: int,
     request: Request,
+    education_level: str = Form(...),
     label: str = Form(...),
     short_label: str = Form(""),
     start_time: str = Form(...),
@@ -556,15 +614,18 @@ def add_timetable_period(
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(MAX(period_order), 0) + 1 AS next_order FROM timetable_periods WHERE school_id = %s;", (school_id,))
+            cur.execute(
+                "SELECT COALESCE(MAX(period_order), 0) + 1 AS next_order FROM timetable_periods WHERE school_id = %s AND education_level = %s;",
+                (school_id, education_level)
+            )
             next_order = cur.fetchone()[0]
             cur.execute("""
-                INSERT INTO timetable_periods (school_id, period_order, label, short_label, start_time, end_time, is_teaching_period)
-                VALUES (%s, %s, %s, %s, %s, %s, %s);
-            """, (school_id, next_order, label, short_label, start_time, end_time, not bool(is_break)))
+                INSERT INTO timetable_periods (school_id, education_level, period_order, label, short_label, start_time, end_time, is_teaching_period)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            """, (school_id, education_level, next_order, label, short_label, start_time, end_time, not bool(is_break)))
             conn.commit()
 
-    return RedirectResponse(url=f"/timetable/periods/{school_id}", status_code=303)
+    return RedirectResponse(url=f"/timetable/periods/{school_id}?education_level={urllib.parse.quote(education_level)}", status_code=303)
 
 
 @router.post("/api/v1/timetable/periods/delete/{school_id}/{period_id}")
@@ -574,12 +635,15 @@ def delete_timetable_period(school_id: int, period_id: int, request: Request):
         return auth_error
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT education_level FROM timetable_periods WHERE id = %s AND school_id = %s;", (period_id, school_id))
+            row = cur.fetchone()
+            level = row['education_level'] if row else "Lower Primary"
             # Cascades to timetable_slots and teacher_availability rows using this period.
             cur.execute("DELETE FROM timetable_periods WHERE id = %s AND school_id = %s;", (period_id, school_id))
             conn.commit()
 
-    return RedirectResponse(url=f"/timetable/periods/{school_id}", status_code=303)
+    return RedirectResponse(url=f"/timetable/periods/{school_id}?education_level={urllib.parse.quote(level)}", status_code=303)
 
 
 @router.get("/timetable/assignments/{school_id}", response_class=HTMLResponse)
@@ -597,22 +661,32 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
             staff_members = cur.fetchall()
 
             cur.execute("""
-                SELECT learning_area_id, staff_user_id FROM teacher_subject_assignments
+                SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
                 WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
             """, (school_id, grade_name, education_level, stream))
-            current_assignments = {r['learning_area_id']: r['staff_user_id'] for r in cur.fetchall()}
+            current_assignments = {r['learning_area_id']: r for r in cur.fetchall()}
 
     rows_html = ""
     for sub in subjects:
-        assigned_id = current_assignments.get(sub['id'])
+        existing = current_assignments.get(sub['id'], {})
+        assigned_id = existing.get('staff_user_id')
+        lessons_per_week = existing.get('lessons_per_week', 1)
+        requires_double = existing.get('requires_double', False)
         options = "<option value=''>— Unassigned —</option>" + "".join(
             f"<option value='{m['id']}' {'selected' if m['id'] == assigned_id else ''}>{esc(m['full_name'] or m['email'])}</option>"
             for m in staff_members
         )
         rows_html += f"""
-        <div class="flex items-center justify-between gap-3 py-2.5 border-b border-slate-50 last:border-0">
-            <span class="text-sm font-semibold text-slate-700">{esc(sub['name'])}</span>
-            <select name="teacher_{sub['id']}" class="border p-2 rounded-lg text-xs font-semibold bg-white w-48">{options}</select>
+        <div class="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 py-2.5 border-b border-slate-50 last:border-0">
+            <span class="text-sm font-semibold text-slate-700 sm:w-40 shrink-0">{esc(sub['name'])}</span>
+            <select name="teacher_{sub['id']}" class="border p-2 rounded-lg text-xs font-semibold bg-white flex-1 min-w-0">{options}</select>
+            <div class="flex items-center gap-2 shrink-0">
+                <label class="text-[10px] font-bold text-slate-500">Lessons/wk</label>
+                <input type="number" name="lessons_{sub['id']}" value="{lessons_per_week}" min="0" max="20" class="border p-1.5 rounded-lg text-xs w-14 text-center">
+                <label class="text-[10px] font-bold text-slate-500 flex items-center gap-1">
+                    <input type="checkbox" name="double_{sub['id']}" value="1" {'checked' if requires_double else ''} class="w-3.5 h-3.5"> Needs double
+                </label>
+            </div>
         </div>
         """
 
@@ -624,7 +698,7 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">Assign Teachers</h2>
-            <p class="text-xs text-slate-400 mb-4">{esc(section_label)} ({esc(education_level)}) — who teaches each subject to this class?</p>
+            <p class="text-xs text-slate-400 mb-4">{esc(section_label)} ({esc(education_level)}) — who teaches each subject, how many lessons per week, and whether it needs a double lesson (e.g. for practicals).</p>
             {"<p class='text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4'>No verified staff accounts yet — add and activate staff first, then come back to assign them here.</p>" if not staff_members else ""}
             <form action="/api/v1/timetable/assignments/{school_id}" method="post" class="space-y-1">
                 <input type="hidden" name="grade_name" value="{esc(grade_name)}">
@@ -663,18 +737,18 @@ async def save_teacher_assignments(school_id: int, request: Request):
                 learning_area_id = int(key.replace("teacher_", ""))
                 staff_user_id = int(value) if value else None
 
-                if staff_user_id is None:
-                    cur.execute("""
-                        DELETE FROM teacher_subject_assignments
-                        WHERE school_id = %s AND learning_area_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
-                    """, (school_id, learning_area_id, grade_name, education_level, stream))
-                else:
-                    cur.execute("""
-                        INSERT INTO teacher_subject_assignments (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (school_id, learning_area_id, grade_name, education_level, stream)
-                        DO UPDATE SET staff_user_id = EXCLUDED.staff_user_id;
-                    """, (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream))
+                try:
+                    lessons_per_week = max(0, min(20, int(form.get(f"lessons_{learning_area_id}", 1) or 1)))
+                except ValueError:
+                    lessons_per_week = 1
+                requires_double = form.get(f"double_{learning_area_id}") is not None
+
+                cur.execute("""
+                    INSERT INTO teacher_subject_assignments (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (school_id, learning_area_id, grade_name, education_level, stream)
+                    DO UPDATE SET staff_user_id = EXCLUDED.staff_user_id, lessons_per_week = EXCLUDED.lessons_per_week, requires_double = EXCLUDED.requires_double;
+                """, (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double))
             conn.commit()
 
     encoded_grade = urllib.parse.quote(grade_name)
@@ -764,7 +838,7 @@ def teacher_timetable_picker(school_id: int, request: Request):
 
 
 @router.get("/timetable/availability/{school_id}/{teacher_id}", response_class=HTMLResponse)
-def teacher_availability_grid(school_id: int, teacher_id: int, request: Request):
+def teacher_availability_grid(school_id: int, teacher_id: int, request: Request, education_level: str = "Lower Primary"):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -779,8 +853,7 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request)
             days = get_school_days(cur, school_id)
             conn.commit()
 
-            cur.execute("SELECT id, period_order, label FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
-            periods = cur.fetchall()
+            periods = [p for p in get_periods_for_level(cur, school_id, education_level) if p['is_teaching_period']]
 
             cur.execute("""
                 SELECT day_of_week, period_id, status FROM teacher_availability
@@ -789,6 +862,12 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request)
             current = {(r['day_of_week'], r['period_id']): r['status'] for r in cur.fetchall()}
 
     status_options = [("available", "✅ Available"), ("conditional", "❔ Conditional"), ("not_available", "❌ Not Available")]
+
+    level_tabs = "".join(
+        f"""<a href="/timetable/availability/{school_id}/{teacher_id}?education_level={urllib.parse.quote(lvl)}"
+               class="px-3 py-1.5 rounded-lg text-xs font-bold transition {'bg-indigo-700 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
+        for lvl in EDUCATION_LEVELS
+    )
 
     header_cells = "".join(f"<th class='p-2 text-center text-xs'>{d}</th>" for d in days)
     body_rows = ""
@@ -807,12 +886,15 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request)
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-4xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">👩‍🏫 {esc(teacher['full_name'] or teacher['email'])} — Availability</h2>
-            <p class="text-xs text-slate-400 mb-4">Mark when this teacher is unavailable (e.g. part-time, other commitments). The timetable generator and manual editor will both respect this.</p>
-            <form action="/api/v1/timetable/availability/update/{school_id}/{teacher_id}" method="post">
+            <p class="text-xs text-slate-400 mb-3">Mark when this teacher is unavailable (e.g. part-time, other commitments). The timetable generator and manual editor will both respect this.</p>
+            <div class="flex gap-2 flex-wrap mb-4">
+                <span class="text-xs font-bold text-slate-500 self-center mr-1">Level:</span>{level_tabs}
+            </div>
+            <form action="/api/v1/timetable/availability/update/{school_id}/{teacher_id}?education_level={urllib.parse.quote(education_level)}" method="post">
                 <div class="overflow-x-auto">
                     <table class="w-full border-collapse text-xs">
                         <thead><tr><th class="p-2 sticky left-0 bg-white"></th>{header_cells}</tr></thead>
-                        <tbody>{body_rows}</tbody>
+                        <tbody>{body_rows or "<tr><td class='p-4 text-slate-400 italic text-xs' colspan='99'>No periods configured for this level yet.</td></tr>"}</tbody>
                     </table>
                 </div>
                 <div class="pt-4 flex gap-3">
@@ -827,7 +909,7 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request)
 
 
 @router.post("/api/v1/timetable/availability/update/{school_id}/{teacher_id}")
-async def save_teacher_availability(school_id: int, teacher_id: int, request: Request):
+async def save_teacher_availability(school_id: int, teacher_id: int, request: Request, education_level: str = "Lower Primary"):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -840,7 +922,13 @@ async def save_teacher_availability(school_id: int, teacher_id: int, request: Re
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Teacher not found.")
 
-            cur.execute("SELECT id FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE;", (school_id,))
+            cur.execute("""
+                SELECT id FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE
+                AND education_level = (
+                    CASE WHEN EXISTS (SELECT 1 FROM timetable_periods WHERE school_id = %s AND education_level = %s)
+                         THEN %s ELSE 'ALL' END
+                );
+            """, (school_id, school_id, education_level, education_level))
             period_ids = [r[0] for r in cur.fetchall()]
             days = get_school_days(cur, school_id)
 
@@ -863,7 +951,7 @@ async def save_teacher_availability(school_id: int, teacher_id: int, request: Re
                         """, (school_id, teacher_id, day, period_id, status))
             conn.commit()
 
-    return RedirectResponse(url=f"/timetable/availability/{school_id}/{teacher_id}", status_code=303)
+    return RedirectResponse(url=f"/timetable/availability/{school_id}/{teacher_id}?education_level={urllib.parse.quote(education_level)}", status_code=303)
 
 
 @router.get("/timetable/subject-availability/{school_id}", response_class=HTMLResponse)
@@ -910,7 +998,7 @@ def subject_availability_grid(school_id: int, learning_area_id: int, request: Re
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, name FROM learning_areas WHERE id = %s;", (learning_area_id,))
+            cur.execute("SELECT id, name, education_level FROM learning_areas WHERE id = %s;", (learning_area_id,))
             subject = cur.fetchone()
             if not subject:
                 raise HTTPException(status_code=404, detail="Subject not found.")
@@ -918,8 +1006,7 @@ def subject_availability_grid(school_id: int, learning_area_id: int, request: Re
             days = get_school_days(cur, school_id)
             conn.commit()
 
-            cur.execute("SELECT id, period_order, label FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
-            periods = cur.fetchall()
+            periods = [p for p in get_periods_for_level(cur, school_id, subject['education_level']) if p['is_teaching_period']]
 
             cur.execute("""
                 SELECT day_of_week, period_id, status FROM subject_availability
@@ -975,11 +1062,19 @@ async def save_subject_availability(school_id: int, learning_area_id: int, reque
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM learning_areas WHERE id = %s;", (learning_area_id,))
-            if not cur.fetchone():
+            cur.execute("SELECT education_level FROM learning_areas WHERE id = %s;", (learning_area_id,))
+            subject_row = cur.fetchone()
+            if not subject_row:
                 raise HTTPException(status_code=404, detail="Subject not found.")
+            subject_level = subject_row[0]
 
-            cur.execute("SELECT id FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE;", (school_id,))
+            cur.execute("""
+                SELECT id FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE
+                AND education_level = (
+                    CASE WHEN EXISTS (SELECT 1 FROM timetable_periods WHERE school_id = %s AND education_level = %s)
+                         THEN %s ELSE 'ALL' END
+                );
+            """, (school_id, school_id, subject_level, subject_level))
             period_ids = [r[0] for r in cur.fetchall()]
             days = get_school_days(cur, school_id)
 
@@ -1015,8 +1110,10 @@ def subject_sync_rules_view(school_id: int, request: Request):
             days = get_school_days(cur, school_id)
             conn.commit()
 
-            cur.execute("SELECT id, period_order, label FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
-            periods = cur.fetchall()
+            periods_by_level = {
+                lvl: [p for p in get_periods_for_level(cur, school_id, lvl) if p['is_teaching_period']]
+                for lvl in EDUCATION_LEVELS
+            }
 
             cur.execute("SELECT id, name, education_level FROM learning_areas ORDER BY education_level ASC, name ASC;")
             subjects = cur.fetchall()
@@ -1032,6 +1129,7 @@ def subject_sync_rules_view(school_id: int, request: Request):
     rows_html = ""
     for s in subjects:
         rule = rules.get(s['id'])
+        periods = periods_by_level.get(s['education_level'], [])
         current_note = (
             f"<span class='text-[10px] text-emerald-700 font-bold'>Locked: {esc(rule['day_of_week'])}, {esc(rule['period_label'])}</span>"
             if rule else
@@ -1272,8 +1370,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
             days = get_school_days(cur, school_id)
             conn.commit()
 
-            cur.execute("SELECT * FROM timetable_periods WHERE school_id = %s ORDER BY period_order ASC;", (school_id,))
-            periods = cur.fetchall()
+            periods = get_periods_for_level(cur, school_id, education_level)
 
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
@@ -1381,22 +1478,36 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             days = get_school_days(cur, school_id)
             conn.commit()
 
-            cur.execute("SELECT id, period_order FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
-            teaching_periods = cur.fetchall()
+            teaching_periods = [p for p in get_periods_for_level(cur, school_id, education_level) if p['is_teaching_period']]
 
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
             cur.execute("""
-                SELECT learning_area_id, staff_user_id FROM teacher_subject_assignments
+                SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
                 WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
             """, (school_id, grade_name, education_level, stream))
-            teacher_for_subject = {r['learning_area_id']: r['staff_user_id'] for r in cur.fetchall()}
+            assignment_rows = cur.fetchall()
+            teacher_for_subject = {r['learning_area_id']: r['staff_user_id'] for r in assignment_rows}
+            lessons_per_week_for_subject = {r['learning_area_id']: r['lessons_per_week'] for r in assignment_rows}
+            requires_double_for_subject = {r['learning_area_id']: r['requires_double'] for r in assignment_rows}
 
             if not subjects or not teaching_periods:
                 raise HTTPException(status_code=400, detail="No subjects or teaching periods configured — nothing to generate.")
 
             teaching_period_ids = {p['id'] for p in teaching_periods}
+
+            # True consecutive pairs for double lessons — two teaching periods
+            # are only "back to back" if their period_order differs by
+            # exactly 1 with nothing between them. Using the position in the
+            # teaching-only list would wrongly treat two periods separated by
+            # a filtered-out break as consecutive.
+            sorted_teaching = sorted(teaching_periods, key=lambda p: p['period_order'])
+            consecutive_period_pairs = [
+                (sorted_teaching[i], sorted_teaching[i + 1])
+                for i in range(len(sorted_teaching) - 1)
+                if sorted_teaching[i + 1]['period_order'] - sorted_teaching[i]['period_order'] == 1
+            ]
 
             # "Same time" rules — a subject locked to one fixed day/period
             # school-wide gets force-placed there and excluded from the
@@ -1425,15 +1536,6 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             for r in cur.fetchall():
                 key = (r['learning_area_id'], r['day_of_week'], r['period_id'])
                 (subject_unavailable if r['status'] == 'not_available' else subject_conditional).add(key)
-
-            # Build a round-robin queue of subjects sized to fill every slot,
-            # distributing periods as evenly as possible across the week.
-            total_slots = len(days) * len(teaching_periods)
-            queue = []
-            i = 0
-            while len(queue) < total_slots:
-                queue.append(free_subjects[i % len(free_subjects)])
-                i += 1
 
             # Track which teacher is already booked at each (day, period) across
             # the WHOLE school (every other grade+stream) to avoid double-booking —
@@ -1472,41 +1574,88 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             # Clear this section's existing plan before laying down the new one.
             cur.execute("DELETE FROM timetable_slots WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;", (school_id, grade_name, education_level, stream))
 
+            # How many lessons each subject still needs this week — defaults
+            # to 1 for any subject without an explicit assignment configured.
+            remaining = {subj['id']: max(1, lessons_per_week_for_subject.get(subj['id'], 1)) for subj in free_subjects}
+            filled = {}       # (day, period_id) -> subject already placed there
+            used_today_by_day = {day: set() for day in days}
+            last_subject_by_day = {day: None for day in days}
+
+            def _place(day, period_id, subject, teacher):
+                cur.execute("""
+                    INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, staff_user_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                """, (school_id, grade_name, education_level, stream, day, period_id, subject['id'], teacher))
+                filled[(day, period_id)] = subject
+                if teacher:
+                    booked[(day, period_id)] = teacher
+                used_today_by_day[day].add(subject['id'])
+                remaining[subject['id']] -= 1
+
+            # --- Phase 1: place locked "same time" subjects first — these
+            # always win their slot outright, not drawn from the queue. ---
+            for (day, period_id), locked_subject in locked_placements.items():
+                if day not in days or period_id not in teaching_period_ids:
+                    continue
+                lcid = locked_subject['id']
+                chosen_teacher = teacher_for_subject.get(lcid)
+                if chosen_teacher and booked.get((day, period_id)) == chosen_teacher:
+                    chosen_teacher = None  # conflict — place subject anyway, flagged for manual fix
+                _place(day, period_id, locked_subject, chosen_teacher)
+                last_subject_by_day[day] = lcid
+                if lcid in remaining:
+                    remaining[lcid] = max(0, remaining[lcid] - 1)
+
+            # --- Phase 2: subjects needing at least one double lesson (e.g.
+            # for practicals) get a genuine back-to-back pair placed first,
+            # before anything else competes for those slots. ---
+            for subj in free_subjects:
+                sid = subj['id']
+                if not requires_double_for_subject.get(sid) or remaining.get(sid, 0) < 2:
+                    continue
+                cand_teacher = teacher_for_subject.get(sid)
+                placed = False
+                for day in days:
+                    if placed:
+                        break
+                    if sid in used_today_by_day[day]:
+                        continue  # already has a lesson today — keep doubles on their own day
+                    for p1, p2 in consecutive_period_pairs:
+                        if (day, p1['id']) in filled or (day, p2['id']) in filled:
+                            continue
+                        if (sid, day, p1['id']) in subject_unavailable or (sid, day, p2['id']) in subject_unavailable:
+                            continue
+                        if cand_teacher and (
+                            (cand_teacher, day, p1['id']) in unavailable or (cand_teacher, day, p2['id']) in unavailable
+                            or booked.get((day, p1['id'])) == cand_teacher or booked.get((day, p2['id'])) == cand_teacher
+                        ):
+                            continue
+                        _place(day, p1['id'], subj, cand_teacher)
+                        _place(day, p2['id'], subj, cand_teacher)
+                        last_subject_by_day[day] = sid
+                        placed = True
+                        break
+                # If no clean double slot exists anywhere, the subject simply
+                # falls through to Phase 3 as ordinary single lessons instead
+                # of forcing a bad placement.
+
+            # --- Phase 3: fill remaining empty slots with each subject's
+            # remaining single lessons, up to its weekly quota — once a
+            # subject's quota is used up it drops out, and once every
+            # subject's quota is used up, any leftover slots simply stay
+            # free rather than being force-filled. ---
+            queue = [subj for subj in free_subjects for _ in range(remaining.get(subj['id'], 0))]
             qi = 0
             for day in days:
-                used_today = set()
-                last_subject_id = None
                 for period in teaching_periods:
-                    # A subject locked to this exact day/period by a "same
-                    # time" rule always wins this slot outright — it isn't
-                    # drawn from the round-robin queue at all.
-                    locked_subject = locked_placements.get((day, period['id']))
-                    if locked_subject:
-                        lcid = locked_subject['id']
-                        chosen_subject = locked_subject
-                        chosen_teacher = teacher_for_subject.get(lcid)
-                        if chosen_teacher and booked.get((day, period['id'])) == chosen_teacher:
-                            chosen_teacher = None  # conflict — place subject anyway, flagged for manual fix
-                        cur.execute("""
-                            INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, staff_user_id)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-                        """, (school_id, grade_name, education_level, stream, day, period['id'], lcid, chosen_teacher))
-                        if chosen_teacher:
-                            booked[(day, period['id'])] = chosen_teacher
-                        used_today.add(lcid)
-                        last_subject_id = lcid
+                    if (day, period['id']) in filled:
                         continue
+                    if not queue:
+                        break  # every subject's quota is met — this slot stays free
 
-                    # Search the queue for the best candidate subject that
-                    # respects: not already used today, not blocked by a
-                    # same-day/consecutive constraint against what's already
-                    # placed, and whose teacher (if any) isn't marked
-                    # unavailable at this exact slot. Falls back to the plain
-                    # round-robin pick if nothing satisfies every rule.
-                    # Two passes: first try to avoid "conditional" slots for
-                    # the candidate's teacher too (not just hard-unavailable
-                    # ones); if nothing fits without using a conditional slot,
-                    # retry allowing it — it's a soft preference, not a block.
+                    used_today = used_today_by_day[day]
+                    last_subject_id = last_subject_by_day[day]
+
                     chosen_idx, chosen_subject, chosen_teacher = None, None, None
                     for avoid_conditional in (True, False):
                         if chosen_subject is not None:
@@ -1522,24 +1671,25 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                             if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
                                 continue
                             if (cid, day, period['id']) in subject_unavailable:
-                                continue  # this subject has "time off" at this exact slot
+                                continue
                             if avoid_conditional and (cid, day, period['id']) in subject_conditional:
-                                continue  # soft preference: try to avoid this slot first
+                                continue
 
                             cand_teacher = teacher_for_subject.get(cid)
                             if cand_teacher and (cand_teacher, day, period['id']) in unavailable:
-                                continue  # try a different subject rather than use this slot
+                                continue
                             if cand_teacher and avoid_conditional and (cand_teacher, day, period['id']) in conditional:
-                                continue  # soft preference: try to avoid this slot first
+                                continue
                             if cand_teacher and booked.get((day, period['id'])) == cand_teacher:
-                                cand_teacher = None  # double-booked — place subject without a teacher, flagged for manual fix
+                                cand_teacher = None
 
                             chosen_idx, chosen_subject, chosen_teacher = idx, candidate, cand_teacher
                             break
 
                     if chosen_subject is None:
                         # Nothing satisfied every rule — fall back to the
-                        # plain round-robin pick rather than leave a gap.
+                        # plain round-robin pick rather than leave a gap,
+                        # as long as some subject still has quota left.
                         chosen_idx = qi % len(queue)
                         chosen_subject = queue[chosen_idx]
                         chosen_teacher = teacher_for_subject.get(chosen_subject['id'])
@@ -1550,15 +1700,14 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                             chosen_teacher = None
 
                     qi = chosen_idx + 1
-                    cur.execute("""
-                        INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, staff_user_id)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-                    """, (school_id, grade_name, education_level, stream, day, period['id'], chosen_subject['id'], chosen_teacher))
+                    _place(day, period['id'], chosen_subject, chosen_teacher)
+                    last_subject_by_day[day] = chosen_subject['id']
+                    # Remove exactly one used-up occurrence from the queue so
+                    # a satisfied subject can't be picked again.
+                    queue = [s for s in queue if s['id'] != chosen_subject['id']] + (
+                        [chosen_subject] * remaining.get(chosen_subject['id'], 0)
+                    )
 
-                    if chosen_teacher:
-                        booked[(day, period['id'])] = chosen_teacher
-                    used_today.add(chosen_subject['id'])
-                    last_subject_id = chosen_subject['id']
             conn.commit()
 
     encoded_grade = urllib.parse.quote(grade_name)
@@ -1764,8 +1913,7 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
 
             days = get_school_days(cur, school_id)
 
-            cur.execute("SELECT * FROM timetable_periods WHERE school_id = %s ORDER BY period_order ASC;", (school_id,))
-            periods = cur.fetchall()
+            periods = get_periods_for_level(cur, school_id, education_level)
 
             cur.execute("""
                 SELECT ts.day_of_week, ts.period_id, la.name AS subject_name, u.full_name, u.email
@@ -1848,16 +1996,39 @@ def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
 
             days = get_school_days(cur, school_id)
 
-            cur.execute("SELECT * FROM timetable_periods WHERE school_id = %s ORDER BY period_order ASC;", (school_id,))
-            periods = cur.fetchall()
-
             cur.execute("""
-                SELECT ts.day_of_week, ts.period_id, ts.grade_name, ts.stream, la.name AS subject_name
+                SELECT ts.day_of_week, ts.period_id, ts.grade_name, ts.stream, ts.education_level, la.name AS subject_name
                 FROM timetable_slots ts
                 LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
                 WHERE ts.school_id = %s AND ts.staff_user_id = %s;
             """, (school_id, teacher_id))
-            slot_map = {(r['day_of_week'], r['period_id']): r for r in cur.fetchall()}
+            teacher_slots = cur.fetchall()
+
+            # A teacher can teach across more than one level (e.g. Upper
+            # Primary and Junior School), and each level can have its own
+            # bell schedule — so render one grid per level they actually
+            # have lessons in, each using that level's own periods.
+            levels_taught = sorted({s['education_level'] for s in teacher_slots if s['education_level']}) or ["Lower Primary"]
+
+            level_sections = []
+            for level in levels_taught:
+                level_periods = get_periods_for_level(cur, school_id, level)
+                slot_map = {(r['day_of_week'], r['period_id']): r for r in teacher_slots if r['education_level'] == level}
+
+                def _teacher_cell(day, p, slot_map=slot_map):
+                    slot = slot_map.get((day, p['id']))
+                    if not slot or not slot['subject_name']:
+                        return None
+                    class_label = _section_label(slot['grade_name'], slot['stream'])
+                    return f"<b>{esc(abbreviate_subject(slot['subject_name']))}</b><br><span style='font-size:9px;color:#64748b;'>{esc(class_label)}</span>"
+
+                grid = _build_timetable_grid_html(days, level_periods, _teacher_cell)
+                if not level_periods:
+                    grid = "<p style='padding:16px;text-align:center;color:#94a3b8;font-style:italic;'>No periods configured yet for this level.</p>"
+                level_sections.append(f"""
+                    <h2 style="margin:20px 0 6px;font-size:13px;font-weight:bold;color:#4f46e5;">{esc(level)}</h2>
+                    {grid}
+                """)
 
     teacher_name = teacher['full_name'] or teacher['email']
     logo_html = ""
@@ -1866,17 +2037,7 @@ def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
         final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
         logo_html = f"<img src='{final_src}' style='width:56px;height:56px;object-fit:contain;' />"
 
-    def _teacher_cell(day, p):
-        slot = slot_map.get((day, p['id']))
-        if not slot or not slot['subject_name']:
-            return None
-        class_label = _section_label(slot['grade_name'], slot['stream'])
-        return f"<b>{esc(abbreviate_subject(slot['subject_name']))}</b><br><span style='font-size:9px;color:#64748b;'>{esc(class_label)}</span>"
-
-    grid_html = _build_timetable_grid_html(days, periods, _teacher_cell)
-
-    if not periods:
-        grid_html = "<p style='padding:24px;text-align:center;color:#94a3b8;font-style:italic;'>No periods configured yet for this school. Set them up on the Periods &amp; Days page first.</p>"
+    grid_html = "".join(level_sections) if level_sections else "<p style='padding:24px;text-align:center;color:#94a3b8;font-style:italic;'>No timetable generated yet for this teacher.</p>"
 
     return f"""
     <!DOCTYPE html>
@@ -1937,9 +2098,6 @@ def timetable_master_view(school_id: int, request: Request):
             """, (school_id,))
             sections = cur.fetchall()
 
-            cur.execute("SELECT id, period_order, label FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
-            periods = cur.fetchall()
-
             cur.execute("""
                 SELECT ts.grade_name, ts.education_level, ts.stream, ts.day_of_week, ts.period_id,
                        la.name AS subject_name, u.full_name AS teacher_name
@@ -1953,50 +2111,71 @@ def timetable_master_view(school_id: int, request: Request):
                 key = (row['grade_name'], row['education_level'], row['stream'], row['day_of_week'], row['period_id'])
                 slot_map[key] = row
 
-    if not sections or not periods:
-        body_html = "<p class='text-slate-400 text-sm italic text-center py-16'>Nothing to show yet — add students to at least one class and configure periods first.</p>"
+            # Different levels can have entirely different bell schedules
+            # (e.g. Lower Primary's 35-minute lessons vs Junior School's
+            # 40-minute ones) — a single merged period list would misalign
+            # columns across levels, so each level gets its own table below.
+            periods_by_level = {level: [p for p in get_periods_for_level(cur, school_id, level) if p['is_teaching_period']] for level in EDUCATION_LEVELS}
+
+    if not sections:
+        body_html = "<p class='text-slate-400 text-sm italic text-center py-16'>Nothing to show yet — add students to at least one class first.</p>"
     else:
-        day_header_cells = "".join(
-            f"<th colspan='{len(periods)}' style='text-align:center;border-left:2px solid #cbd5e1;'>{day}</th>"
-            for day in days
-        )
-        period_header_cells = "".join(
-            "".join(f"<th style='font-size:9px;font-weight:normal;color:#94a3b8;{'border-left:2px solid #cbd5e1;' if p_i == 0 else ''}'>{p['period_order']}</th>"
-                    for p_i, p in enumerate(periods))
-            for _ in days
-        )
+        level_tables = []
+        for level in EDUCATION_LEVELS:
+            level_sections = [s for s in sections if s['education_level'] == level]
+            periods = periods_by_level.get(level, [])
+            if not level_sections:
+                continue
+            if not periods:
+                level_tables.append(f"""
+                    <h2 style="margin:20px 0 8px;font-size:14px;font-weight:bold;color:#4f46e5;">{esc(level)}</h2>
+                    <p class='text-slate-400 text-xs italic'>No periods configured yet for this level.</p>
+                """)
+                continue
 
-        body_rows = ""
-        for sec in sections:
-            row_cells = ""
-            for day in days:
-                for p_i, p in enumerate(periods):
-                    entry = slot_map.get((sec['grade_name'], sec['education_level'], sec['stream'], day, p['id']))
-                    border = "border-left:2px solid #cbd5e1;" if p_i == 0 else ""
-                    if entry and entry['subject_name']:
-                        label = abbreviate_subject(entry['subject_name'])
-                        teacher_title = f" title='{esc(entry['teacher_name'])}'" if entry.get('teacher_name') else ""
-                        row_cells += f"<td{teacher_title} style='{border}text-align:center;font-size:10px;padding:4px 2px;border-bottom:1px solid #f1f5f9;'>{esc(label)}</td>"
-                    else:
-                        row_cells += f"<td style='{border}background:#f8fafc;border-bottom:1px solid #f1f5f9;'></td>"
-            body_rows += f"""
-            <tr>
-                <td style='padding:6px 8px;font-weight:bold;background:white;position:sticky;left:0;border-right:2px solid #cbd5e1;white-space:nowrap;'>{esc(_section_label(sec['grade_name'], sec['stream']))}<br><span style='font-weight:normal;color:#94a3b8;font-size:9px;'>{esc(sec['education_level'])}</span></td>
-                {row_cells}
-            </tr>
-            """
+            day_header_cells = "".join(
+                f"<th colspan='{len(periods)}' style='text-align:center;border-left:2px solid #cbd5e1;'>{day}</th>"
+                for day in days
+            )
+            period_header_cells = "".join(
+                "".join(f"<th style='font-size:9px;font-weight:normal;color:#94a3b8;{'border-left:2px solid #cbd5e1;' if p_i == 0 else ''}'>{p['period_order']}</th>"
+                        for p_i, p in enumerate(periods))
+                for _ in days
+            )
 
-        body_html = f"""
-        <div style="overflow-x:auto; border:1px solid #e2e8f0; border-radius:12px;">
-            <table style="border-collapse:collapse; font-size:11px; min-width:100%;">
-                <thead>
-                    <tr style="background:#f8fafc;"><th style="padding:6px 8px; text-align:left; position:sticky; left:0; background:#f8fafc; border-right:2px solid #cbd5e1;">Class</th>{day_header_cells}</tr>
-                    <tr style="background:#f8fafc;"><th style="position:sticky; left:0; background:#f8fafc; border-right:2px solid #cbd5e1;"></th>{period_header_cells}</tr>
-                </thead>
-                <tbody>{body_rows}</tbody>
-            </table>
-        </div>
-        """
+            body_rows = ""
+            for sec in level_sections:
+                row_cells = ""
+                for day in days:
+                    for p_i, p in enumerate(periods):
+                        entry = slot_map.get((sec['grade_name'], sec['education_level'], sec['stream'], day, p['id']))
+                        border = "border-left:2px solid #cbd5e1;" if p_i == 0 else ""
+                        if entry and entry['subject_name']:
+                            label = abbreviate_subject(entry['subject_name'])
+                            teacher_title = f" title='{esc(entry['teacher_name'])}'" if entry.get('teacher_name') else ""
+                            row_cells += f"<td{teacher_title} style='{border}text-align:center;font-size:10px;padding:4px 2px;border-bottom:1px solid #f1f5f9;'>{esc(label)}</td>"
+                        else:
+                            row_cells += f"<td style='{border}background:#f8fafc;border-bottom:1px solid #f1f5f9;'></td>"
+                body_rows += f"""
+                <tr>
+                    <td style='padding:6px 8px;font-weight:bold;background:white;position:sticky;left:0;border-right:2px solid #cbd5e1;white-space:nowrap;'>{esc(_section_label(sec['grade_name'], sec['stream']))}</td>
+                    {row_cells}
+                </tr>
+                """
+
+            level_tables.append(f"""
+            <h2 style="margin:20px 0 8px;font-size:14px;font-weight:bold;color:#4f46e5;">{esc(level)}</h2>
+            <div style="overflow-x:auto; border:1px solid #e2e8f0; border-radius:12px;">
+                <table style="border-collapse:collapse; font-size:11px; min-width:100%;">
+                    <thead>
+                        <tr style="background:#f8fafc;"><th style="padding:6px 8px; text-align:left; position:sticky; left:0; background:#f8fafc; border-right:2px solid #cbd5e1;">Class</th>{day_header_cells}</tr>
+                        <tr style="background:#f8fafc;"><th style="position:sticky; left:0; background:#f8fafc; border-right:2px solid #cbd5e1;"></th>{period_header_cells}</tr>
+                    </thead>
+                    <tbody>{body_rows}</tbody>
+                </table>
+            </div>
+            """)
+        body_html = "".join(level_tables) or "<p class='text-slate-400 text-sm italic text-center py-16'>Configure periods for at least one level first.</p>"
 
     return HTMLResponse(f"""
     <!DOCTYPE html>
@@ -2050,9 +2229,6 @@ def timetable_master_print(school_id: int, request: Request):
             """, (school_id,))
             sections = cur.fetchall()
 
-            cur.execute("SELECT id, period_order FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE ORDER BY period_order ASC;", (school_id,))
-            periods = cur.fetchall()
-
             cur.execute("""
                 SELECT ts.grade_name, ts.education_level, ts.stream, ts.day_of_week, ts.period_id, la.name AS subject_name
                 FROM timetable_slots ts
@@ -2064,18 +2240,39 @@ def timetable_master_print(school_id: int, request: Request):
                 key = (row['grade_name'], row['education_level'], row['stream'], row['day_of_week'], row['period_id'])
                 slot_map[key] = row
 
-    day_header_cells = "".join(f"<th colspan='{len(periods)}' style='text-align:center;'>{day}</th>" for day in days)
-    period_header_cells = "".join("".join(f"<th style='font-weight:normal;'>{p['period_order']}</th>" for p in periods) for _ in days)
+            periods_by_level = {level: [p for p in get_periods_for_level(cur, school_id, level) if p['is_teaching_period']] for level in EDUCATION_LEVELS}
 
-    body_rows = ""
-    for sec in sections:
-        row_cells = ""
-        for day in days:
-            for p in periods:
-                entry = slot_map.get((sec['grade_name'], sec['education_level'], sec['stream'], day, p['id']))
-                label = abbreviate_subject(entry['subject_name']) if (entry and entry['subject_name']) else ""
-                row_cells += f"<td style='text-align:center;padding:3px;'>{esc(label)}</td>"
-        body_rows += f"<tr><td style='font-weight:bold;padding:4px 6px;white-space:nowrap;'>{esc(_section_label(sec['grade_name'], sec['stream']))}</td>{row_cells}</tr>"
+    level_tables = []
+    for level in EDUCATION_LEVELS:
+        level_sections = [s for s in sections if s['education_level'] == level]
+        periods = periods_by_level.get(level, [])
+        if not level_sections or not periods:
+            continue
+
+        day_header_cells = "".join(f"<th colspan='{len(periods)}' style='text-align:center;'>{day}</th>" for day in days)
+        period_header_cells = "".join("".join(f"<th style='font-weight:normal;'>{p['period_order']}</th>" for p in periods) for _ in days)
+
+        body_rows = ""
+        for sec in level_sections:
+            row_cells = ""
+            for day in days:
+                for p in periods:
+                    entry = slot_map.get((sec['grade_name'], sec['education_level'], sec['stream'], day, p['id']))
+                    label = abbreviate_subject(entry['subject_name']) if (entry and entry['subject_name']) else ""
+                    row_cells += f"<td style='text-align:center;padding:3px;'>{esc(label)}</td>"
+            body_rows += f"<tr><td style='font-weight:bold;padding:4px 6px;white-space:nowrap;'>{esc(_section_label(sec['grade_name'], sec['stream']))}</td>{row_cells}</tr>"
+
+        level_tables.append(f"""
+        <h2 style="margin:16px 0 4px;font-size:13px;">{esc(level)}</h2>
+        <table>
+            <thead>
+                <tr><th>Class</th>{day_header_cells}</tr>
+                <tr><th></th>{period_header_cells}</tr>
+            </thead>
+            <tbody>{body_rows}</tbody>
+        </table>
+        """)
+    body_html = "".join(level_tables) or "<p style='color:#94a3b8;font-style:italic;'>Nothing to show yet.</p>"
 
     return f"""
     <!DOCTYPE html>
@@ -2096,13 +2293,7 @@ def timetable_master_print(school_id: int, request: Request):
             <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
         </div>
         <h1 style="margin:0;font-size:16px;">{esc(school['name'])} — Whole School Timetable</h1>
-        <table>
-            <thead>
-                <tr><th>Class</th>{day_header_cells}</tr>
-                <tr><th></th>{period_header_cells}</tr>
-            </thead>
-            <tbody>{body_rows}</tbody>
-        </table>
+        {body_html}
     </body>
     </html>
     """
