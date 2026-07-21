@@ -137,6 +137,26 @@ def bootstrap_timetable_schema():
             cur.execute("ALTER TABLE timetable_slots ADD COLUMN IF NOT EXISTS stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM';")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_timetable_slots_conflict ON timetable_slots (school_id, day_of_week, period_id, staff_user_id);")
 
+            # Timetable-only subjects — school-defined items (e.g. "Library",
+            # "Study Skills", "Guidance & Counselling") that can be scheduled
+            # into the grid alongside real graded subjects, without ever
+            # touching learning_areas or the report-card/grading system.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS timetable_custom_subjects (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    education_level VARCHAR(100) NOT NULL,
+                    name VARCHAR(150) NOT NULL,
+                    UNIQUE(school_id, education_level, name)
+                );
+            """)
+
+            # A slot can hold exactly one of: a graded subject, a custom
+            # (non-graded) subject, or a co-curricular activity. Additive,
+            # nullable columns — existing behavior around learning_area_id
+            # is completely untouched.
+            cur.execute("ALTER TABLE timetable_slots ADD COLUMN IF NOT EXISTS custom_subject_id INTEGER REFERENCES timetable_custom_subjects(id) ON DELETE SET NULL;")
+
             # Same schema-drift issue as teacher_subject_assignments above:
             # the original UNIQUE constraint on a pre-existing live table
             # won't include the later-added `stream` column, breaking this
@@ -295,6 +315,11 @@ def bootstrap_timetable_schema():
                 );
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_co_curricular_participants_activity ON co_curricular_participants (activity_id);")
+
+            # Now that co_curricular_activities exists, a timetable slot can
+            # also hold a co-curricular activity instead of an academic or
+            # custom subject.
+            cur.execute("ALTER TABLE timetable_slots ADD COLUMN IF NOT EXISTS co_curricular_activity_id INTEGER REFERENCES co_curricular_activities(id) ON DELETE SET NULL;")
 
             conn.commit()
 
@@ -461,6 +486,7 @@ def timetable_dashboard(school_id: int, request: Request):
                 <a href="/timetable/sync-rules/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Same-Time Rules</a>
                 <a href="/timetable/teachers/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🖨 Teacher Timetables</a>
                 <a href="/timetable/co-curricular/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🎭 Co-Curricular</a>
+                <a href="/timetable/custom-subjects/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">➕ Custom Subjects</a>
                 <a href="/timetable/master/{school_id}" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🗓 Whole School View</a>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Dashboard</a>
             </div>
@@ -889,6 +915,111 @@ def teacher_timetable_picker(school_id: int, request: Request):
     </body>
     </html>
     """
+
+
+@router.get("/timetable/custom-subjects/{school_id}", response_class=HTMLResponse)
+def custom_subjects_view(school_id: int, request: Request, education_level: str = "Lower Primary"):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute(
+                "SELECT * FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s ORDER BY name ASC;",
+                (school_id, education_level)
+            )
+            custom_subjects = cur.fetchall()
+
+    level_tabs = "".join(
+        f"""<a href="/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(lvl)}"
+               class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-teal-700 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
+        for lvl in EDUCATION_LEVELS
+    )
+
+    rows_html = "".join(f"""
+        <div class="flex items-center justify-between py-2.5 border-b border-slate-50 last:border-0">
+            <span class="text-sm font-semibold text-slate-700">{esc(s['name'])}</span>
+            <form action="/api/v1/timetable/custom-subjects/delete/{school_id}/{s['id']}" method="post" onsubmit="return confirm('Delete \\'{esc(s['name'])}\\'? Any timetable slots using it will be cleared too.');">
+                <button type="submit" class="text-rose-600 hover:text-rose-800 text-xs font-bold">Delete</button>
+            </form>
+        </div>
+    """ for s in custom_subjects)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Custom Subjects — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">➕ Custom Timetable Subjects</h2>
+                <p class="text-xs text-slate-400 mt-1">Add items that can be scheduled into the timetable but aren't graded subjects — e.g. Library, Study Skills, Guidance &amp; Counselling. These never appear in report cards or the marks-entry system; they're for scheduling only.</p>
+            </div>
+
+            <div>
+                <p class="text-xs font-bold text-slate-500 mb-2">Level:</p>
+                <div class="flex gap-2 flex-wrap">{level_tabs}</div>
+            </div>
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-bold text-slate-800 mb-3">{esc(education_level)}</h3>
+                <div class="mb-4">{rows_html or "<p class='text-slate-400 text-xs italic p-2'>No custom subjects added yet for this level.</p>"}</div>
+                <form action="/api/v1/timetable/custom-subjects/add/{school_id}" method="post" class="flex gap-2">
+                    <input type="hidden" name="education_level" value="{esc(education_level)}">
+                    <input type="text" name="name" placeholder="e.g. Library, Study Skills" class="flex-1 border p-2.5 rounded-lg text-sm" required>
+                    <button type="submit" class="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-4 py-2.5 rounded-lg text-sm transition">+ Add</button>
+                </form>
+            </div>
+
+            <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/custom-subjects/add/{school_id}")
+def add_custom_subject(school_id: int, request: Request, education_level: str = Form(...), name: str = Form(...)):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="A name is required.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO timetable_custom_subjects (school_id, education_level, name) VALUES (%s, %s, %s)
+                ON CONFLICT (school_id, education_level, name) DO NOTHING;
+            """, (school_id, education_level, name))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(education_level)}", status_code=303)
+
+
+@router.post("/api/v1/timetable/custom-subjects/delete/{school_id}/{subject_id}")
+def delete_custom_subject(school_id: int, subject_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT education_level FROM timetable_custom_subjects WHERE id = %s AND school_id = %s;", (subject_id, school_id))
+            row = cur.fetchone()
+            level = row['education_level'] if row else "Lower Primary"
+            cur.execute("DELETE FROM timetable_custom_subjects WHERE id = %s AND school_id = %s;", (subject_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(level)}", status_code=303)
 
 
 @router.get("/timetable/co-curricular/{school_id}", response_class=HTMLResponse)
@@ -1700,10 +1831,26 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
+            cur.execute(
+                "SELECT id, name FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s ORDER BY name ASC;",
+                (school_id, education_level)
+            )
+            custom_subjects = cur.fetchall()
+
+            cur.execute(
+                "SELECT id, name FROM co_curricular_activities WHERE school_id = %s ORDER BY name ASC;",
+                (school_id,)
+            )
+            activities = cur.fetchall()
+
             cur.execute("""
-                SELECT ts.day_of_week, ts.period_id, ts.learning_area_id, la.name AS subject_name, u.full_name, u.email
+                SELECT ts.day_of_week, ts.period_id, ts.learning_area_id, ts.custom_subject_id, ts.co_curricular_activity_id,
+                       la.name AS academic_name, cs.name AS custom_name, ca.name AS activity_name,
+                       u.full_name, u.email
                 FROM timetable_slots ts
                 LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+                LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
                 LEFT JOIN users u ON ts.staff_user_id = u.id
                 WHERE ts.school_id = %s AND ts.grade_name = %s AND ts.education_level = %s AND ts.stream = %s;
             """, (school_id, grade_name, education_level, stream))
@@ -1715,13 +1862,19 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
     section_label = _section_label(grade_name, stream)
     header_cells = "".join(f"<th class='p-2 text-center'>{d}</th>" for d in days)
 
+    subject_optgroup = "".join(f"<option value='subject:{s['id']}'>{esc(s['name'])}</option>" for s in subjects)
+    custom_optgroup = "".join(f"<option value='custom:{s['id']}'>{esc(s['name'])}</option>" for s in custom_subjects)
+    activity_optgroup = "".join(f"<option value='activity:{a['id']}'>{esc(a['name'])}</option>" for a in activities)
+
     body_rows = ""
     for p in periods:
-        if not p['is_teaching_period']:
+        p_type = p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')
+        if p_type != 'teaching':
+            label_note = "Prep Time (protected)" if p_type == 'prep' else p['label']
             body_rows += f"""
             <tr class="bg-slate-50">
                 <td class="p-2 text-xs font-bold text-slate-500 whitespace-nowrap">{esc(p['label'])}<br><span class="font-normal text-slate-400">{esc(p['start_time'] or '')}–{esc(p['end_time'] or '')}</span></td>
-                <td colspan="{len(days)}" class="p-2 text-center text-xs italic text-slate-400">{esc(p['label'])}</td>
+                <td colspan="{len(days)}" class="p-2 text-center text-xs italic text-slate-400">{esc(label_note)}</td>
             </tr>
             """
             continue
@@ -1729,11 +1882,22 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
         row_cells = ""
         for day in days:
             slot = slot_map.get((day, p['id']))
-            current_subject_id = slot['learning_area_id'] if slot else None
-            teacher_label = (slot['full_name'] or slot['email']) if slot and slot['full_name'] or (slot and slot['email']) else None
-            options = "<option value=''>— Free —</option>" + "".join(
-                f"<option value='{s['id']}' {'selected' if s['id'] == current_subject_id else ''}>{esc(s['name'])}</option>" for s in subjects
-            )
+            if slot and slot['learning_area_id']:
+                current_value = f"subject:{slot['learning_area_id']}"
+            elif slot and slot['custom_subject_id']:
+                current_value = f"custom:{slot['custom_subject_id']}"
+            elif slot and slot['co_curricular_activity_id']:
+                current_value = f"activity:{slot['co_curricular_activity_id']}"
+            else:
+                current_value = ""
+            teacher_label = (slot['full_name'] or slot['email']) if slot and (slot['full_name'] or slot['email']) else None
+            options = f"""<option value=''>— Free —</option>
+                <optgroup label="Academic Subjects">{subject_optgroup}</optgroup>
+                {"<optgroup label='Custom Subjects'>" + custom_optgroup + "</optgroup>" if custom_optgroup else ""}
+                {"<optgroup label='Co-Curricular'>" + activity_optgroup + "</optgroup>" if activity_optgroup else ""}
+            """
+            # Mark the currently-selected option, whichever group it's in.
+            options = options.replace(f"value='{current_value}'", f"value='{current_value}' selected", 1) if current_value else options
             row_cells += f"""
             <td class="p-1.5 align-top">
                 <form action="/api/v1/timetable/slot/update/{school_id}" method="post" class="space-y-1">
@@ -1742,7 +1906,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                     <input type="hidden" name="stream" value="{esc(stream)}">
                     <input type="hidden" name="day_of_week" value="{day}">
                     <input type="hidden" name="period_id" value="{p['id']}">
-                    <select name="learning_area_id" onchange="this.form.submit()" class="w-full border p-1.5 rounded-lg text-[11px] font-semibold bg-white">{options}</select>
+                    <select name="subject_choice" onchange="this.form.submit()" class="w-full border p-1.5 rounded-lg text-[11px] font-semibold bg-white">{options}</select>
                     {f"<p class='text-[9px] text-slate-400 text-center truncate'>{esc(teacher_label)}</p>" if teacher_label else ""}
                 </form>
             </td>
@@ -2056,7 +2220,7 @@ def update_timetable_slot(
     stream: str = Form(...),
     day_of_week: str = Form(...),
     period_id: int = Form(...),
-    learning_area_id: str = Form(""),
+    subject_choice: str = Form(""),
 ):
     auth_error = require_school_session(request, school_id)
     if auth_error:
@@ -2069,7 +2233,7 @@ def update_timetable_slot(
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if not learning_area_id:
+            if not subject_choice:
                 cur.execute("""
                     DELETE FROM timetable_slots
                     WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND day_of_week = %s AND period_id = %s;
@@ -2077,13 +2241,26 @@ def update_timetable_slot(
                 conn.commit()
                 return RedirectResponse(url=redirect_url, status_code=303)
 
-            learning_area_id = int(learning_area_id)
-            cur.execute("""
-                SELECT staff_user_id FROM teacher_subject_assignments
-                WHERE school_id = %s AND learning_area_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
-            """, (school_id, learning_area_id, grade_name, education_level, stream))
-            assignment = cur.fetchone()
-            teacher_id = assignment['staff_user_id'] if assignment else None
+            kind, _, raw_id = subject_choice.partition(":")
+            item_id = int(raw_id) if raw_id else None
+            learning_area_id = item_id if kind == "subject" else None
+            custom_subject_id = item_id if kind == "custom" else None
+            co_curricular_activity_id = item_id if kind == "activity" else None
+            teacher_id = None
+
+            if kind == "subject":
+                cur.execute("""
+                    SELECT staff_user_id FROM teacher_subject_assignments
+                    WHERE school_id = %s AND learning_area_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
+                """, (school_id, learning_area_id, grade_name, education_level, stream))
+                assignment = cur.fetchone()
+                teacher_id = assignment['staff_user_id'] if assignment else None
+            elif kind == "activity":
+                # A co-curricular activity's supervisor doubles as the
+                # "teacher" for this slot, for conflict-checking purposes.
+                cur.execute("SELECT staff_user_id FROM co_curricular_activities WHERE id = %s AND school_id = %s;", (co_curricular_activity_id, school_id))
+                activity_row = cur.fetchone()
+                teacher_id = activity_row['staff_user_id'] if activity_row else None
 
             if teacher_id:
                 cur.execute("""
@@ -2111,78 +2288,82 @@ def update_timetable_slot(
                         detail="That teacher has been marked unavailable at this exact day/period. Set them to Available on their Availability page first, or pick a different teacher/subject."
                     )
 
-            # Subject placement constraints ("card relationships") against
-            # whatever else is already scheduled for this section.
-            cur.execute("""
-                SELECT subject_a_id, subject_b_id, constraint_type FROM subject_constraints
-                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s
-                  AND (subject_a_id = %s OR subject_b_id = %s);
-            """, (school_id, grade_name, education_level, stream, learning_area_id, learning_area_id))
-            relevant_constraints = cur.fetchall()
-            if relevant_constraints:
-                other_subject_ids = {c['subject_b_id'] if c['subject_a_id'] == learning_area_id else c['subject_a_id'] for c in relevant_constraints}
-                constraint_type_by_other = {
-                    (c['subject_b_id'] if c['subject_a_id'] == learning_area_id else c['subject_a_id']): c['constraint_type']
-                    for c in relevant_constraints
-                }
-
+            # The rest of these checks (subject placement constraints, time
+            # off, "same time" locks) only make sense for real academic
+            # subjects — custom subjects and co-curricular activities aren't
+            # tracked in those tables, so they're skipped for those cases.
+            if kind == "subject":
                 cur.execute("""
-                    SELECT day_of_week, period_id, learning_area_id, la.name AS subject_name
-                    FROM timetable_slots ts
-                    JOIN learning_areas la ON ts.learning_area_id = la.id
-                    WHERE ts.school_id = %s AND ts.grade_name = %s AND ts.education_level = %s AND ts.stream = %s
-                      AND ts.learning_area_id = ANY(%s)
-                      AND NOT (ts.day_of_week = %s AND ts.period_id = %s);
-                """, (school_id, grade_name, education_level, stream, list(other_subject_ids), day_of_week, period_id))
-                for other_slot in cur.fetchall():
-                    ctype = constraint_type_by_other.get(other_slot['learning_area_id'])
-                    if ctype == 'same_day_forbidden' and other_slot['day_of_week'] == day_of_week:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"This subject can't be placed on the same day as {other_slot['subject_name']} for this class — see Constraints."
-                        )
-                    if ctype == 'consecutive_forbidden' and other_slot['day_of_week'] == day_of_week:
-                        cur.execute("SELECT period_order FROM timetable_periods WHERE id = %s;", (period_id,))
-                        this_order = cur.fetchone()['period_order']
-                        cur.execute("SELECT period_order FROM timetable_periods WHERE id = %s;", (other_slot['period_id'],))
-                        other_order = cur.fetchone()['period_order']
-                        if abs(this_order - other_order) == 1:
+                    SELECT subject_a_id, subject_b_id, constraint_type FROM subject_constraints
+                    WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s
+                      AND (subject_a_id = %s OR subject_b_id = %s);
+                """, (school_id, grade_name, education_level, stream, learning_area_id, learning_area_id))
+                relevant_constraints = cur.fetchall()
+                if relevant_constraints:
+                    other_subject_ids = {c['subject_b_id'] if c['subject_a_id'] == learning_area_id else c['subject_a_id'] for c in relevant_constraints}
+                    constraint_type_by_other = {
+                        (c['subject_b_id'] if c['subject_a_id'] == learning_area_id else c['subject_a_id']): c['constraint_type']
+                        for c in relevant_constraints
+                    }
+
+                    cur.execute("""
+                        SELECT day_of_week, period_id, learning_area_id, la.name AS subject_name
+                        FROM timetable_slots ts
+                        JOIN learning_areas la ON ts.learning_area_id = la.id
+                        WHERE ts.school_id = %s AND ts.grade_name = %s AND ts.education_level = %s AND ts.stream = %s
+                          AND ts.learning_area_id = ANY(%s)
+                          AND NOT (ts.day_of_week = %s AND ts.period_id = %s);
+                    """, (school_id, grade_name, education_level, stream, list(other_subject_ids), day_of_week, period_id))
+                    for other_slot in cur.fetchall():
+                        ctype = constraint_type_by_other.get(other_slot['learning_area_id'])
+                        if ctype == 'same_day_forbidden' and other_slot['day_of_week'] == day_of_week:
                             raise HTTPException(
                                 status_code=400,
-                                detail=f"This subject can't be placed back-to-back with {other_slot['subject_name']} for this class — see Constraints."
+                                detail=f"This subject can't be placed on the same day as {other_slot['subject_name']} for this class — see Constraints."
                             )
+                        if ctype == 'consecutive_forbidden' and other_slot['day_of_week'] == day_of_week:
+                            cur.execute("SELECT period_order FROM timetable_periods WHERE id = %s;", (period_id,))
+                            this_order = cur.fetchone()['period_order']
+                            cur.execute("SELECT period_order FROM timetable_periods WHERE id = %s;", (other_slot['period_id'],))
+                            other_order = cur.fetchone()['period_order']
+                            if abs(this_order - other_order) == 1:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=f"This subject can't be placed back-to-back with {other_slot['subject_name']} for this class — see Constraints."
+                                )
 
-            # Subject "time off" — this subject marked unavailable at this
-            # exact slot is a hard block, mirroring the teacher check above.
+                # Subject "time off" — this subject marked unavailable at this
+                # exact slot is a hard block, mirroring the teacher check above.
+                cur.execute("""
+                    SELECT status FROM subject_availability
+                    WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s;
+                """, (school_id, learning_area_id, day_of_week, period_id))
+                subj_availability = cur.fetchone()
+                if subj_availability and subj_availability['status'] == 'not_available':
+                    raise HTTPException(
+                        status_code=400,
+                        detail="This subject has been marked unavailable at this exact day/period. Adjust it on the Subject Time Off page first, or pick a different slot."
+                    )
+
+                # "Same time" school-wide lock — if this subject is locked to a
+                # specific day/period, it can't be placed anywhere else.
+                cur.execute("SELECT day_of_week, period_id FROM subject_sync_rules WHERE school_id = %s AND learning_area_id = %s;", (school_id, learning_area_id))
+                sync_rule = cur.fetchone()
+                if sync_rule and (sync_rule['day_of_week'] != day_of_week or sync_rule['period_id'] != period_id):
+                    cur.execute("SELECT label FROM timetable_periods WHERE id = %s;", (sync_rule['period_id'],))
+                    locked_period = cur.fetchone()
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"This subject is locked school-wide to {sync_rule['day_of_week']}, {locked_period['label'] if locked_period else 'a fixed period'} — see Same-Time Subject Rules to change it."
+                    )
+
             cur.execute("""
-                SELECT status FROM subject_availability
-                WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s;
-            """, (school_id, learning_area_id, day_of_week, period_id))
-            subj_availability = cur.fetchone()
-            if subj_availability and subj_availability['status'] == 'not_available':
-                raise HTTPException(
-                    status_code=400,
-                    detail="This subject has been marked unavailable at this exact day/period. Adjust it on the Subject Time Off page first, or pick a different slot."
-                )
-
-            # "Same time" school-wide lock — if this subject is locked to a
-            # specific day/period, it can't be placed anywhere else.
-            cur.execute("SELECT day_of_week, period_id FROM subject_sync_rules WHERE school_id = %s AND learning_area_id = %s;", (school_id, learning_area_id))
-            sync_rule = cur.fetchone()
-            if sync_rule and (sync_rule['day_of_week'] != day_of_week or sync_rule['period_id'] != period_id):
-                cur.execute("SELECT label FROM timetable_periods WHERE id = %s;", (sync_rule['period_id'],))
-                locked_period = cur.fetchone()
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"This subject is locked school-wide to {sync_rule['day_of_week']}, {locked_period['label'] if locked_period else 'a fixed period'} — see Same-Time Subject Rules to change it."
-                )
-
-            cur.execute("""
-                INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, staff_user_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, custom_subject_id, co_curricular_activity_id, staff_user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (school_id, grade_name, education_level, stream, day_of_week, period_id)
-                DO UPDATE SET learning_area_id = EXCLUDED.learning_area_id, staff_user_id = EXCLUDED.staff_user_id;
-            """, (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, teacher_id))
+                DO UPDATE SET learning_area_id = EXCLUDED.learning_area_id, custom_subject_id = EXCLUDED.custom_subject_id,
+                              co_curricular_activity_id = EXCLUDED.co_curricular_activity_id, staff_user_id = EXCLUDED.staff_user_id;
+            """, (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, custom_subject_id, co_curricular_activity_id, teacher_id))
             conn.commit()
 
     return RedirectResponse(url=redirect_url, status_code=303)
@@ -2257,9 +2438,12 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
             periods = get_periods_for_level(cur, school_id, education_level)
 
             cur.execute("""
-                SELECT ts.day_of_week, ts.period_id, la.name AS subject_name, u.full_name, u.email
+                SELECT ts.day_of_week, ts.period_id,
+                       COALESCE(la.name, cs.name, ca.name) AS subject_name, u.full_name, u.email
                 FROM timetable_slots ts
                 LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+                LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
                 LEFT JOIN users u ON ts.staff_user_id = u.id
                 WHERE ts.school_id = %s AND ts.grade_name = %s AND ts.education_level = %s AND ts.stream = %s;
             """, (school_id, grade_name, education_level, stream))
@@ -2342,9 +2526,12 @@ def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
             days = get_school_days(cur, school_id)
 
             cur.execute("""
-                SELECT ts.day_of_week, ts.period_id, ts.grade_name, ts.stream, ts.education_level, la.name AS subject_name
+                SELECT ts.day_of_week, ts.period_id, ts.grade_name, ts.stream, ts.education_level,
+                       COALESCE(la.name, cs.name, ca.name) AS subject_name
                 FROM timetable_slots ts
                 LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+                LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
                 WHERE ts.school_id = %s AND ts.staff_user_id = %s;
             """, (school_id, teacher_id))
             teacher_slots = cur.fetchall()
@@ -2449,9 +2636,11 @@ def timetable_master_view(school_id: int, request: Request):
 
             cur.execute("""
                 SELECT ts.grade_name, ts.education_level, ts.stream, ts.day_of_week, ts.period_id,
-                       la.name AS subject_name, u.full_name AS teacher_name
+                       COALESCE(la.name, cs.name, ca.name) AS subject_name, u.full_name AS teacher_name
                 FROM timetable_slots ts
                 LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+                LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
                 LEFT JOIN users u ON ts.staff_user_id = u.id
                 WHERE ts.school_id = %s;
             """, (school_id,))
@@ -2579,9 +2768,12 @@ def timetable_master_print(school_id: int, request: Request):
             sections = cur.fetchall()
 
             cur.execute("""
-                SELECT ts.grade_name, ts.education_level, ts.stream, ts.day_of_week, ts.period_id, la.name AS subject_name
+                SELECT ts.grade_name, ts.education_level, ts.stream, ts.day_of_week, ts.period_id,
+                       COALESCE(la.name, cs.name, ca.name) AS subject_name
                 FROM timetable_slots ts
                 LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+                LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
                 WHERE ts.school_id = %s;
             """, (school_id,))
             slot_map = {}
