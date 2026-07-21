@@ -51,10 +51,20 @@ def bootstrap_timetable_schema():
                     start_time VARCHAR(20),
                     end_time VARCHAR(20),
                     is_teaching_period BOOLEAN DEFAULT TRUE,
+                    period_type VARCHAR(20) NOT NULL DEFAULT 'teaching',
                     UNIQUE(school_id, education_level, period_order)
                 );
             """)
             cur.execute("ALTER TABLE timetable_periods ADD COLUMN IF NOT EXISTS short_label VARCHAR(20);")
+            # Adds a third period type — 'prep' — alongside the existing
+            # teaching/break split. is_teaching_period stays the single
+            # source of truth for "can a lesson ever go here?": prep periods
+            # keep it FALSE, so they're structurally excluded from the
+            # generator's candidate list the same way breaks already are —
+            # not a soft rule that could be overridden, but simply never in
+            # the pool of fillable periods at all.
+            cur.execute("ALTER TABLE timetable_periods ADD COLUMN IF NOT EXISTS period_type VARCHAR(20) NOT NULL DEFAULT 'teaching';")
+            cur.execute("UPDATE timetable_periods SET period_type = 'break' WHERE is_teaching_period = FALSE AND period_type = 'teaching';")
             # Schools with periods already configured before per-level bell
             # schedules existed get 'ALL' — a single shared schedule used as
             # a fallback for any level that hasn't been given its own yet.
@@ -262,6 +272,30 @@ def bootstrap_timetable_schema():
                 "uq_timetable_periods_level_order",
             )
 
+            # Co-curricular activities (clubs, societies, sports, etc.) —
+            # separate from timed lesson slots, since most of these run
+            # outside the regular teaching day.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS co_curricular_activities (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    name VARCHAR(150) NOT NULL,
+                    category VARCHAR(50) NOT NULL DEFAULT 'Club',
+                    schedule_note VARCHAR(200),
+                    staff_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    description TEXT
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS co_curricular_participants (
+                    id SERIAL PRIMARY KEY,
+                    activity_id INTEGER REFERENCES co_curricular_activities(id) ON DELETE CASCADE,
+                    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+                    UNIQUE(activity_id, student_id)
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_co_curricular_participants_activity ON co_curricular_participants (activity_id);")
+
             conn.commit()
 
 
@@ -377,27 +411,29 @@ def timetable_dashboard(school_id: int, request: Request):
             has_periods = cur.fetchone()['cnt'] > 0
 
     section_cards = ""
+    level_accent = {"Lower Primary": "#0d9488", "Upper Primary": "#0891b2", "Junior School": "#7c3aed"}
     for sec in sections:
         encoded_grade = urllib.parse.quote(sec['grade_name'])
         encoded_level = urllib.parse.quote(sec['education_level'])
         encoded_stream = urllib.parse.quote(sec['stream'])
         has_timetable = slot_counts.get((sec['grade_name'], sec['education_level'], sec['stream']), 0) > 0
         status_badge = (
-            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>Timetable set</span>"
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 border border-teal-200'>Timetable set</span>"
             if has_timetable else
             "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Not yet created</span>"
         )
+        accent = level_accent.get(sec['education_level'], "#0d9488")
         section_cards += f"""
-        <div class='bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs flex flex-col justify-between gap-3'>
+        <div class='bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs hover:shadow-md transition-shadow flex flex-col justify-between gap-3 border-l-4' style='border-left-color:{accent};'>
             <div>
-                <span class='text-[10px] bg-slate-100 text-slate-600 px-2.5 py-1 rounded-md font-bold uppercase tracking-wider'>{esc(sec['education_level'])}</span>
+                <span class='text-[10px] px-2.5 py-1 rounded-md font-bold uppercase tracking-wider' style='background:{accent}1a;color:{accent};'>{esc(sec['education_level'])}</span>
                 <h3 class='text-base font-black text-slate-800 mt-2.5'>{esc(_section_label(sec['grade_name'], sec['stream']))}</h3>
                 <div class="mt-2">{status_badge}</div>
             </div>
             <div class='grid grid-cols-3 gap-2'>
-                <a href='/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition'>Assign Teachers</a>
-                <a href='/timetable/constraints/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-amber-600 hover:bg-amber-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition'>Constraints</a>
-                <a href='/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-indigo-700 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition'>Open Timetable</a>
+                <a href='/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-100 hover:bg-slate-200 text-slate-700 text-center text-xs py-2 rounded-xl font-semibold transition'>Assign Teachers</a>
+                <a href='/timetable/constraints/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-100 hover:bg-slate-200 text-slate-700 text-center text-xs py-2 rounded-xl font-semibold transition'>Constraints</a>
+                <a href='/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition'>Open Timetable</a>
             </div>
         </div>
         """
@@ -409,21 +445,24 @@ def timetable_dashboard(school_id: int, request: Request):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Timetabling — {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
     </head>
-    <body class="bg-[#F8FAFC] min-h-screen">
+    <body class="bg-[#F7F9F8] min-h-screen">
         <header class="bg-white border-b border-slate-200/80 px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
             <div>
                 <h1 class="text-base font-bold text-slate-900">📅 Timetabling — {esc(school['name'])}</h1>
                 <p class="text-xs text-slate-400">Each stream has its own independent timetable.</p>
             </div>
             <div class="flex items-center gap-2 flex-wrap">
-                <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods & Days</a>
-                <a href="/timetable/availability/{school_id}" class="bg-indigo-700 hover:bg-indigo-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">👩‍🏫 Teacher Availability</a>
-                <a href="/timetable/subject-availability/{school_id}" class="bg-purple-700 hover:bg-purple-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
-                <a href="/timetable/sync-rules/{school_id}" class="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Same-Time Rules</a>
-                <a href="/timetable/teachers/{school_id}" class="bg-slate-700 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">🖨 Teacher Timetables</a>
-                <a href="/timetable/master/{school_id}" class="bg-emerald-700 hover:bg-emerald-800 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">🗓 Whole School View</a>
-                <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Dashboard</a>
+                <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods & Days</a>
+                <a href="/timetable/availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">👩‍🏫 Teacher Availability</a>
+                <a href="/timetable/subject-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
+                <a href="/timetable/sync-rules/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Same-Time Rules</a>
+                <a href="/timetable/teachers/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🖨 Teacher Timetables</a>
+                <a href="/timetable/co-curricular/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🎭 Co-Curricular</a>
+                <a href="/timetable/master/{school_id}" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🗓 Whole School View</a>
+                <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Dashboard</a>
             </div>
         </header>
         <div class="p-6 sm:p-8 max-w-6xl mx-auto">
@@ -472,9 +511,16 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
     )
 
     period_rows = ""
+    type_badges = {
+        "teaching": ("Teaching", "bg-emerald-50 text-emerald-700 border-emerald-200"),
+        "break": ("Break", "bg-slate-100 text-slate-500 border-slate-200"),
+        "prep": ("Prep Time", "bg-violet-50 text-violet-700 border-violet-200"),
+    }
+    row_bg = {"teaching": "", "break": "background:#f8fafc;", "prep": "background:#f5f3ff;"}
     for p in periods:
-        row_type = "Break" if not p['is_teaching_period'] else "Teaching"
-        row_style = "background:#f0fdf4;" if not p['is_teaching_period'] else ""
+        p_type = p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')
+        row_type, badge_class = type_badges.get(p_type, type_badges['teaching'])
+        row_style = row_bg.get(p_type, "")
         period_rows += f"""
         <tr style="{row_style}" class="border-b text-sm">
             <td class="p-2.5 text-center text-slate-400 font-mono text-xs">{p['period_order']}</td>
@@ -483,7 +529,7 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
             <td class="p-2.5 text-slate-500">{esc(p['start_time'] or '')}</td>
             <td class="p-2.5 text-slate-500">{esc(p['end_time'] or '')}</td>
             <td class="p-2.5 text-center">
-                <span class="text-[10px] font-bold px-2 py-0.5 rounded-full {'bg-emerald-50 text-emerald-700 border border-emerald-200' if p['is_teaching_period'] else 'bg-slate-100 text-slate-500 border border-slate-200'}">{row_type}</span>
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {badge_class}">{row_type}</span>
             </td>
             <td class="p-2.5 text-right">
                 <form action="/api/v1/timetable/periods/delete/{school_id}/{p['id']}" method="post" onsubmit="return confirm('Delete period \\'{esc(p['label'])}\\'? Any timetable slots using it will be cleared too.');">
@@ -560,10 +606,15 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
                         <label class="text-[11px] font-bold text-slate-500">End Time</label>
                         <input type="time" name="end_time" class="w-full border p-2 rounded-lg mt-1 text-sm" required>
                     </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500">Type</label>
+                        <select name="period_type" class="w-full border p-2 rounded-lg mt-1 text-sm bg-white">
+                            <option value="teaching">Teaching</option>
+                            <option value="break">Break</option>
+                            <option value="prep">Prep Time (protected)</option>
+                        </select>
+                    </div>
                     <div class="flex flex-col justify-end">
-                        <label class="text-[11px] font-bold text-slate-500 flex items-center gap-1.5 mb-2">
-                            <input type="checkbox" name="is_break" value="1" class="w-4 h-4"> This is a break
-                        </label>
                         <button type="submit" class="bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-2 rounded-lg text-sm transition">+ Add</button>
                     </div>
                 </form>
@@ -601,7 +652,7 @@ def add_timetable_period(
     short_label: str = Form(""),
     start_time: str = Form(...),
     end_time: str = Form(...),
-    is_break: str = Form(None),
+    period_type: str = Form("teaching"),
 ):
     auth_error = require_school_session(request, school_id)
     if auth_error:
@@ -611,6 +662,9 @@ def add_timetable_period(
     short_label = short_label.strip() or label[:3].upper()
     if not label:
         raise HTTPException(status_code=400, detail="A name for this period is required.")
+    if period_type not in ("teaching", "break", "prep"):
+        period_type = "teaching"
+    is_teaching_period = period_type == "teaching"
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -620,9 +674,9 @@ def add_timetable_period(
             )
             next_order = cur.fetchone()[0]
             cur.execute("""
-                INSERT INTO timetable_periods (school_id, education_level, period_order, label, short_label, start_time, end_time, is_teaching_period)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-            """, (school_id, education_level, next_order, label, short_label, start_time, end_time, not bool(is_break)))
+                INSERT INTO timetable_periods (school_id, education_level, period_order, label, short_label, start_time, end_time, is_teaching_period, period_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """, (school_id, education_level, next_order, label, short_label, start_time, end_time, is_teaching_period, period_type))
             conn.commit()
 
     return RedirectResponse(url=f"/timetable/periods/{school_id}?education_level={urllib.parse.quote(education_level)}", status_code=303)
@@ -835,6 +889,277 @@ def teacher_timetable_picker(school_id: int, request: Request):
     </body>
     </html>
     """
+
+
+@router.get("/timetable/co-curricular/{school_id}", response_class=HTMLResponse)
+def co_curricular_list(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("""
+                SELECT a.*, u.full_name AS supervisor_name, u.email AS supervisor_email,
+                       (SELECT COUNT(*) FROM co_curricular_participants p WHERE p.activity_id = a.id) AS participant_count
+                FROM co_curricular_activities a
+                LEFT JOIN users u ON a.staff_user_id = u.id
+                WHERE a.school_id = %s
+                ORDER BY a.category ASC, a.name ASC;
+            """, (school_id,))
+            activities = cur.fetchall()
+
+            cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'staff' AND is_verified = TRUE ORDER BY full_name NULLS LAST, email ASC;", (school_id,))
+            staff_members = cur.fetchall()
+
+    staff_options = "<option value=''>— No supervisor assigned —</option>" + "".join(
+        f"<option value='{m['id']}'>{esc(m['full_name'] or m['email'])}</option>" for m in staff_members
+    )
+
+    cards_html = ""
+    for a in activities:
+        supervisor_label = esc(a['supervisor_name'] or a['supervisor_email']) if a['supervisor_email'] else "<span class='text-slate-400 italic'>Unassigned</span>"
+        cards_html += f"""
+        <div class="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs hover:shadow-md transition-all">
+            <div class="flex items-start justify-between gap-2">
+                <div>
+                    <span class="text-[10px] bg-violet-50 text-violet-700 border border-violet-200 px-2.5 py-1 rounded-md font-bold uppercase tracking-wider">{esc(a['category'])}</span>
+                    <h3 class="text-base font-black text-slate-800 mt-2">{esc(a['name'])}</h3>
+                </div>
+                <form action="/api/v1/timetable/co-curricular/delete/{school_id}/{a['id']}" method="post" onsubmit="return confirm('Delete {esc(a['name'])}? This removes all enrolled participants too.');">
+                    <button type="submit" class="text-rose-500 hover:text-rose-700 text-xs font-bold">✕</button>
+                </form>
+            </div>
+            <p class="text-xs text-slate-500 mt-1">{esc(a['schedule_note'] or 'No schedule set')}</p>
+            <p class="text-xs text-slate-500 mt-1">Supervisor: {supervisor_label}</p>
+            {f"<p class='text-xs text-slate-400 mt-2 italic'>{esc(a['description'])}</p>" if a['description'] else ""}
+            <div class="flex items-center justify-between mt-4 pt-3 border-t border-slate-100">
+                <span class="text-xs font-bold text-slate-600">{a['participant_count']} student{'s' if a['participant_count'] != 1 else ''} enrolled</span>
+                <a href="/timetable/co-curricular/{school_id}/{a['id']}/roster" class="bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition">Manage Roster →</a>
+            </div>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Co-Curricular Activities — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F8FAFC] min-h-screen">
+        <header class="bg-white border-b border-slate-200/80 px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">🎭 Co-Curricular Activities — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">Clubs, societies, sports, and other extracurricular programs — separate from the academic timetable.</p>
+            </div>
+            <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back</a>
+        </header>
+
+        <div class="p-4 sm:p-8 max-w-5xl mx-auto space-y-6">
+            <div class="bg-white p-5 sm:p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-sm font-bold text-slate-800 mb-3">+ Add New Activity</h2>
+                <form action="/api/v1/timetable/co-curricular/add/{school_id}" method="post" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500">Activity Name</label>
+                        <input type="text" name="name" placeholder="e.g. Drama Club, Football, Debate Society" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500">Category</label>
+                        <select name="category" class="w-full border p-2.5 rounded-lg mt-1 text-sm bg-white">
+                            <option value="Club">Club</option>
+                            <option value="Society">Society</option>
+                            <option value="Sport">Sport</option>
+                            <option value="Other">Other</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500">Schedule</label>
+                        <input type="text" name="schedule_note" placeholder="e.g. Tue & Thu, 4:00–5:00pm" class="w-full border p-2.5 rounded-lg mt-1 text-sm">
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500">Supervisor</label>
+                        <select name="staff_user_id" class="w-full border p-2.5 rounded-lg mt-1 text-sm bg-white">{staff_options}</select>
+                    </div>
+                    <div class="sm:col-span-2">
+                        <label class="text-[11px] font-bold text-slate-500">Description (optional)</label>
+                        <input type="text" name="description" placeholder="Brief note about this activity" class="w-full border p-2.5 rounded-lg mt-1 text-sm">
+                    </div>
+                    <div class="sm:col-span-2">
+                        <button type="submit" class="bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-2.5 px-5 rounded-xl text-sm transition">+ Add Activity</button>
+                    </div>
+                </form>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+                {cards_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No co-curricular activities added yet.</p>"}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/co-curricular/add/{school_id}")
+def add_co_curricular_activity(
+    school_id: int,
+    request: Request,
+    name: str = Form(...),
+    category: str = Form("Club"),
+    schedule_note: str = Form(""),
+    staff_user_id: str = Form(""),
+    description: str = Form(""),
+):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="An activity name is required.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO co_curricular_activities (school_id, name, category, schedule_note, staff_user_id, description)
+                VALUES (%s, %s, %s, %s, %s, %s);
+            """, (school_id, name, category, schedule_note.strip() or None, int(staff_user_id) if staff_user_id else None, description.strip() or None))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/co-curricular/{school_id}", status_code=303)
+
+
+@router.post("/api/v1/timetable/co-curricular/delete/{school_id}/{activity_id}")
+def delete_co_curricular_activity(school_id: int, activity_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM co_curricular_activities WHERE id = %s AND school_id = %s;", (activity_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/co-curricular/{school_id}", status_code=303)
+
+
+@router.get("/timetable/co-curricular/{school_id}/{activity_id}/roster", response_class=HTMLResponse)
+def co_curricular_roster(school_id: int, activity_id: int, request: Request, search: str = ""):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM co_curricular_activities WHERE id = %s AND school_id = %s;", (activity_id, school_id))
+            activity = cur.fetchone()
+            if not activity:
+                raise HTTPException(status_code=404, detail="Activity not found.")
+
+            cur.execute("""
+                SELECT s.id, s.first_name, s.last_name, s.admission_number
+                FROM co_curricular_participants p
+                JOIN students s ON p.student_id = s.id
+                WHERE p.activity_id = %s
+                ORDER BY s.first_name ASC;
+            """, (activity_id,))
+            enrolled = cur.fetchall()
+            enrolled_ids = {s['id'] for s in enrolled}
+
+            search = search.strip()
+            candidates = []
+            if search:
+                cur.execute("""
+                    SELECT id, first_name, last_name, admission_number FROM students
+                    WHERE school_id = %s AND (status IS NULL OR status != 'GRADUATED')
+                      AND (LOWER(first_name || ' ' || last_name) LIKE LOWER(%s) OR admission_number LIKE %s)
+                    ORDER BY first_name ASC LIMIT 20;
+                """, (school_id, f"%{search}%", f"%{search}%"))
+                candidates = [s for s in cur.fetchall() if s['id'] not in enrolled_ids]
+
+    enrolled_html = "".join(f"""
+        <div class="flex items-center justify-between py-2 border-b last:border-0">
+            <span class="text-sm text-slate-700">{esc(s['first_name'])} {esc(s['last_name'])} <span class="text-slate-400 font-mono text-xs">#{esc(s['admission_number'])}</span></span>
+            <form action="/api/v1/timetable/co-curricular/roster/remove/{school_id}/{activity_id}/{s['id']}" method="post">
+                <button type="submit" class="text-rose-600 hover:text-rose-800 text-xs font-bold">Remove</button>
+            </form>
+        </div>
+    """ for s in enrolled)
+
+    candidates_html = "".join(f"""
+        <div class="flex items-center justify-between py-2 border-b last:border-0">
+            <span class="text-sm text-slate-700">{esc(s['first_name'])} {esc(s['last_name'])} <span class="text-slate-400 font-mono text-xs">#{esc(s['admission_number'])}</span></span>
+            <form action="/api/v1/timetable/co-curricular/roster/add/{school_id}/{activity_id}" method="post">
+                <input type="hidden" name="student_id" value="{s['id']}">
+                <input type="hidden" name="search" value="{esc(search)}">
+                <button type="submit" class="bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold px-3 py-1 rounded-lg transition">+ Add</button>
+            </form>
+        </div>
+    """ for s in candidates)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Roster — {esc(activity['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">{esc(activity['name'])} — Roster</h2>
+                <p class="text-xs text-slate-400">{esc(activity['category'])} · {len(enrolled)} enrolled</p>
+            </div>
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-bold text-slate-800 mb-3">Find a Student to Add</h3>
+                <form method="get" class="flex gap-2 mb-3">
+                    <input type="text" name="search" value="{esc(search)}" placeholder="Search by name or admission number..." class="flex-1 border p-2.5 rounded-lg text-sm" autocomplete="off">
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold px-4 py-2.5 rounded-lg text-sm transition">Search</button>
+                </form>
+                <div>{candidates_html or ("<p class='text-slate-400 text-xs italic p-2'>No matches found.</p>" if search else "<p class='text-slate-400 text-xs italic p-2'>Search above to find students to add.</p>")}</div>
+            </div>
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-bold text-slate-800 mb-3">Enrolled Students</h3>
+                <div>{enrolled_html or "<p class='text-slate-400 text-xs italic p-2'>No students enrolled yet.</p>"}</div>
+            </div>
+
+            <a href="/timetable/co-curricular/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back to Activities</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/co-curricular/roster/add/{school_id}/{activity_id}")
+def add_co_curricular_participant(school_id: int, activity_id: int, request: Request, student_id: int = Form(...), search: str = Form("")):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO co_curricular_participants (activity_id, student_id) VALUES (%s, %s)
+                ON CONFLICT (activity_id, student_id) DO NOTHING;
+            """, (activity_id, student_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/co-curricular/{school_id}/{activity_id}/roster?search={urllib.parse.quote(search)}", status_code=303)
+
+
+@router.post("/api/v1/timetable/co-curricular/roster/remove/{school_id}/{activity_id}/{student_id}")
+def remove_co_curricular_participant(school_id: int, activity_id: int, student_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM co_curricular_participants WHERE activity_id = %s AND student_id = %s;", (activity_id, student_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/co-curricular/{school_id}/{activity_id}/roster", status_code=303)
 
 
 @router.get("/timetable/availability/{school_id}/{teacher_id}", response_class=HTMLResponse)
@@ -1432,8 +1757,14 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Timetable — {esc(section_label)}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
-    <body class="bg-[#F8FAFC] min-h-screen">
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Timetable — {esc(section_label)}</title>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
+    </head>
+    <body class="bg-[#F7F9F8] min-h-screen">
         <header class="bg-white border-b px-6 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
             <div>
                 <h1 class="text-base font-bold text-slate-900">📅 {esc(section_label)} Timetable</h1>
@@ -1444,11 +1775,11 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                     <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                     <input type="hidden" name="education_level" value="{esc(education_level)}">
                     <input type="hidden" name="stream" value="{esc(stream)}">
-                    <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-bold transition">🎲 Generate Draft</button>
+                    <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🎲 Generate Draft</button>
                 </form>
-                <a href="/timetable/print/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" target="_blank" class="bg-slate-700 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-xs font-bold transition">🖨 Print</a>
-                <a href="/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" class="bg-white border hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold transition">Teachers</a>
-                <a href="/timetable/dashboard/{school_id}" class="bg-white border hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold transition">← Back</a>
+                <a href="/timetable/print/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" target="_blank" class="bg-teal-700 hover:bg-teal-800 text-white px-4 py-2 rounded-xl text-xs font-bold transition">🖨 Print</a>
+                <a href="/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">Teachers</a>
+                <a href="/timetable/dashboard/{school_id}" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">← Back</a>
             </div>
         </header>
         <div class="p-4 sm:p-8 max-w-6xl mx-auto overflow-x-auto">
@@ -1861,9 +2192,12 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
     """Builds the <table> for a printable timetable laid out exactly like a
     physical school timetable: rows = days, columns = periods in order.
     Break periods (short break, lunch, etc.) render as one column spanning
-    every day row, with the label rotated vertically. cell_lookup_fn(day,
-    period) returns the inner HTML for a teaching-period cell, or None/''
-    for a free slot."""
+    every day row, with the label rotated vertically. Prep-time periods
+    render as an ordinary per-day cell showing a fixed "PREP" label — they
+    still take up a column per day (unlike breaks), but are never eligible
+    to be assigned a subject; cell_lookup_fn is never even consulted for
+    them. cell_lookup_fn(day, period) returns the inner HTML for a teaching-
+    period cell, or None/'' for a free slot."""
     header_cells = "".join(
         f"<th style='padding:4px 6px;{'background:#eef2f7;' if not p['is_teaching_period'] else ''}'>{esc(p['short_label'] or p['label'])}</th>"
         for p in periods
@@ -1877,7 +2211,8 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
     for day_i, day in enumerate(days):
         row = f"<td style='padding:6px 8px;font-weight:bold;white-space:nowrap;border:1px solid #cbd5e1;'>{esc(day[:2].upper())}</td>"
         for p in periods:
-            if not p['is_teaching_period']:
+            p_type = p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')
+            if p_type == 'break':
                 if day_i == 0:
                     row += (
                         f"<td rowspan='{len(days)}' style='border:1px solid #cbd5e1;text-align:center;background:#f1f5f9;'>"
@@ -1885,6 +2220,12 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
                         f"color:#475569;white-space:nowrap;margin:0 auto;'>{esc(p['label'])}</div></td>"
                     )
                 continue  # subsequent days: cell already covered by row 1's rowspan
+            if p_type == 'prep':
+                row += (
+                    "<td style='padding:4px 6px;text-align:center;border:1px solid #e2e8f0;background:#f5f3ff;'>"
+                    "<span style='font-size:9px;font-weight:bold;color:#6d28d9;'>PREP</span></td>"
+                )
+                continue
             content = cell_lookup_fn(day, p) or "<span style='color:#cbd5e1;'>-</span>"
             row += f"<td style='padding:4px 6px;text-align:center;border:1px solid #e2e8f0;'>{content}</td>"
         body_rows += f"<tr>{row}</tr>"
@@ -1951,27 +2292,31 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Timetable — {esc(section_label)}</title>
         <style>
-            @page {{ size: landscape; margin: 10mm; }}
-            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; }}
-            @media print {{ .no-print {{ display: none !important; }} }}
+            @page {{ size: A4 landscape; margin: 12mm; }}
+            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; background:#f1f5f9; }}
+            @media print {{ .no-print {{ display: none !important; }} body {{ background: white; padding: 0; }} }}
             th {{ background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
+            .print-page {{ max-width: 223mm; margin: 0 auto; background: white; padding: 14mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
+            @media print {{ .print-page {{ box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }} }}
         </style>
     </head>
     <body>
-        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+        <div class="no-print" style="text-align:right; margin-bottom:16px; max-width:223mm; margin-left:auto; margin-right:auto;">
             <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
         </div>
-        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
-            {logo_html}
-            <div>
-                <h1 style="margin:0;font-size:18px;">{esc(school['name'] if school else '')}</h1>
-                <p style="margin:2px 0 0;font-size:15px;font-weight:bold;">CLASS TIMETABLE — {esc(section_label)} ({esc(education_level)})</p>
+        <div class="print-page">
+            <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
+                {logo_html}
+                <div>
+                    <h1 style="margin:0;font-size:18px;">{esc(school['name'] if school else '')}</h1>
+                    <p style="margin:2px 0 0;font-size:15px;font-weight:bold;">CLASS TIMETABLE — {esc(section_label)} ({esc(education_level)})</p>
+                </div>
             </div>
-        </div>
-        {grid_html}
-        <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#94a3b8;">
-            <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
-            <span>{esc(school['name'] if school else '')} — Timetable System</span>
+            {grid_html}
+            <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#94a3b8;">
+                <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
+                <span>{esc(school['name'] if school else '')} — Timetable System</span>
+            </div>
         </div>
     </body>
     </html>
@@ -2046,27 +2391,31 @@ def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Timetable — {esc(teacher_name)}</title>
         <style>
-            @page {{ size: landscape; margin: 10mm; }}
-            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; }}
-            @media print {{ .no-print {{ display: none !important; }} }}
+            @page {{ size: A4 landscape; margin: 12mm; }}
+            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; background:#f1f5f9; }}
+            @media print {{ .no-print {{ display: none !important; }} body {{ background: white; padding: 0; }} }}
             th {{ background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
+            .print-page {{ max-width: 223mm; margin: 0 auto; background: white; padding: 14mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
+            @media print {{ .print-page {{ box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }} }}
         </style>
     </head>
     <body>
-        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+        <div class="no-print" style="text-align:right; margin-bottom:16px; max-width:223mm; margin-left:auto; margin-right:auto;">
             <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
         </div>
-        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
-            {logo_html}
-            <div>
-                <h1 style="margin:0;font-size:18px;">{esc(school['name'] if school else '')}</h1>
-                <p style="margin:2px 0 0;font-size:15px;font-weight:bold;">TEACHER TIMETABLE — {esc(teacher_name)}</p>
+        <div class="print-page">
+            <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
+                {logo_html}
+                <div>
+                    <h1 style="margin:0;font-size:18px;">{esc(school['name'] if school else '')}</h1>
+                    <p style="margin:2px 0 0;font-size:15px;font-weight:bold;">TEACHER TIMETABLE — {esc(teacher_name)}</p>
+                </div>
             </div>
-        </div>
-        {grid_html}
-        <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#94a3b8;">
-            <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
-            <span>{esc(school['name'] if school else '')} — Timetable System</span>
+            {grid_html}
+            <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#94a3b8;">
+                <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
+                <span>{esc(school['name'] if school else '')} — Timetable System</span>
+            </div>
         </div>
     </body>
     </html>
@@ -2278,22 +2627,27 @@ def timetable_master_print(school_id: int, request: Request):
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Whole School Timetable — {esc(school['name'])}</title>
         <style>
-            @page {{ size: landscape; margin: 8mm; }}
-            body {{ font-family: Arial, sans-serif; padding: 12px; color: #1e293b; }}
-            @media print {{ .no-print {{ display: none !important; }} }}
+            @page {{ size: A4 landscape; margin: 10mm; }}
+            body {{ font-family: Arial, sans-serif; padding: 12px; color: #1e293b; background:#f1f5f9; }}
+            @media print {{ .no-print {{ display: none !important; }} body {{ background: white; padding: 0; }} }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 9px; }}
             th, td {{ border: 1px solid #cbd5e1; }}
             th {{ background:#f8fafc; }}
+            .print-page {{ max-width: 223mm; margin: 0 auto; background: white; padding: 12mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); overflow-x:auto; }}
+            @media print {{ .print-page {{ box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }} }}
         </style>
     </head>
     <body>
-        <div class="no-print" style="text-align:right; margin-bottom:12px;">
+        <div class="no-print" style="text-align:right; margin-bottom:12px; max-width:223mm; margin-left:auto; margin-right:auto;">
             <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
         </div>
-        <h1 style="margin:0;font-size:16px;">{esc(school['name'])} — Whole School Timetable</h1>
-        {body_html}
+        <div class="print-page">
+            <h1 style="margin:0;font-size:16px;">{esc(school['name'])} — Whole School Timetable</h1>
+            {body_html}
+        </div>
     </body>
     </html>
     """
