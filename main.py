@@ -2371,6 +2371,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
                 <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top 10 Students — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
             </div>
         </div>
+        {"<p class='no-print' style='background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 14px;border-radius:8px;font-size:12px;margin-top:12px;'>⚠️ No scores found for the <b>" + esc(str(st['active_cycle'])) + "</b> cycle for this stream. This report only looks at whichever exam cycle is currently marked active in Settings (Assessment Phase). If scores were entered under a different cycle (e.g. Opener/Midterm), either switch Assessment Phase to match, or enter scores for the currently active cycle.</p>" if not top10 else ""}
         <table>
             <thead>
                 <tr>
@@ -2478,6 +2479,7 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
                 <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top Student Per Subject — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
             </div>
         </div>
+        {"<p class='no-print' style='background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 14px;border-radius:8px;font-size:12px;margin-top:12px;'>⚠️ No scores found for the <b>" + esc(str(st['active_cycle'])) + "</b> cycle for this stream. This report only looks at whichever exam cycle is currently marked active in Settings (Assessment Phase). If scores were entered under a different cycle (e.g. Opener/Midterm), either switch Assessment Phase to match, or enter scores for the currently active cycle.</p>" if not all_scores else ""}
         <table>
             <thead>
                 <tr><th>Subject</th><th>Top Student</th><th style="text-align:center;">Adm No.</th><th style="text-align:center;">Score</th><th style="text-align:center;">Level</th></tr>
@@ -3073,6 +3075,21 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
             subjects = cur.fetchall()
 
+            # The subject table is the one part of this report whose height
+            # scales with the school's own data (4 subjects for Lower Primary
+            # vs 9 for Junior School) — a single fixed row padding that looks
+            # good and fits on one page for 4 subjects will push a 9-subject
+            # report past the bottom of the page. Scale row padding down as
+            # subject count goes up so every education level reliably fits
+            # on exactly one page.
+            _n_subjects = len(subjects)
+            if _n_subjects <= 5:
+                row_vpad, row_font, desc_font = "8px", "11px", "10.5px"
+            elif _n_subjects <= 7:
+                row_vpad, row_font, desc_font = "6px", "10.5px", "10px"
+            else:
+                row_vpad, row_font, desc_font = "4px", "10px", "9.5px"
+
             report_cards_html = []
             for s in students:
                 cur.execute("SELECT learning_area_id, cycle_name, raw_score FROM student_scores WHERE student_id = %s;", (s['student_id'],))
@@ -3123,19 +3140,19 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                     weighted_str = f"{weighted_total:.1f}%" if active_cycles else "0%"
 
                     exam_body_cells = (
-                        (f'<td style="padding: 9px 6px; border: 1px solid #222; text-align:center;">{op_str}</td>' if show_opener else "") +
-                        (f'<td style="padding: 9px 6px; border: 1px solid #222; text-align:center;">{mid_str}</td>' if show_midterm else "") +
-                        (f'<td style="padding: 9px 6px; border: 1px solid #222; text-align:center;">{end_str}</td>' if show_endterm else "")
+                        (f'<td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-size:{row_font};">{op_str}</td>' if show_opener else "") +
+                        (f'<td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-size:{row_font};">{mid_str}</td>' if show_midterm else "") +
+                        (f'<td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-size:{row_font};">{end_str}</td>' if show_endterm else "")
                     )
 
                     rows_markup += f"""
                     <tr>
-                        <td style="padding: 9px 6px; border: 1px solid #222; font-weight:bold;">{sub['name']}</td>
+                        <td style="padding: {row_vpad} 6px; border: 1px solid #222; font-weight:bold; font-size:{row_font};">{sub['name']}</td>
                         {exam_body_cells}
-                        <td style="padding: 9px 6px; border: 1px solid #222; text-align:center; background:#f9f9f9; font-weight:bold;">{weighted_str}</td>
-                        <td style="padding: 9px 6px; border: 1px solid #222; text-align:center; font-weight:bold;">{pld}</td>
-                        <td style="padding: 9px 6px; border: 1px solid #222; text-align:center; font-weight:bold;">{pts}</td>
-                        <td style="padding: 9px 6px; border: 1px solid #222; font-size:10.5px; line-height: 1.3;">{descriptor}</td>
+                        <td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; background:#f9f9f9; font-weight:bold; font-size:{row_font};">{weighted_str}</td>
+                        <td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-weight:bold; font-size:{row_font};">{pld}</td>
+                        <td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-weight:bold; font-size:{row_font};">{pts}</td>
+                        <td style="padding: {row_vpad} 6px; border: 1px solid #222; font-size:{desc_font}; line-height: 1.2;">{descriptor}</td>
                     </tr>
                     """
 
@@ -3161,7 +3178,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                 )
 
                 report_cards_html.append(f"""
-                <div class="report-card-container" style="background: white; padding: 24px; border: 5px solid {theme['hex']}; border-radius: 12px; width: 189mm; min-height: 267mm; box-sizing: border-box; margin: 0 auto; font-family: 'Arial', sans-serif; display: flex; flex-direction: column; justify-content: space-between;">
+                <div class="report-card-container" style="background: white; padding: 24px; border: 5px solid {theme['hex']}; border-radius: 12px; width: 199mm; min-height: 267mm; max-height: 282mm; overflow: hidden; box-sizing: border-box; margin: 0 auto; font-family: 'Arial', sans-serif; display: flex; flex-direction: column; justify-content: space-between;">
                     <div>
                         <div style="display: flex; align-items: center; border-bottom: 4px double {theme['hex']}; padding-bottom: 8px; margin-bottom: 12px;">
                             {logo_markup}
@@ -3293,17 +3310,19 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         .report-card-container {{
                             border-radius: 0 !important;
                             box-shadow: none !important;
-                            padding: 25px 30px !important;
-                            width: 189mm !important;
+                            padding: 20px 26px !important;
+                            width: 199mm !important;
                             min-height: 267mm !important;
-                            margin: 15mm auto !important;
+                            max-height: 282mm !important;
+                            overflow: hidden !important;
+                            margin: 6mm auto !important;
                             border-width: 6px !important;
                         }}
                     }}
                 </style>
             </head>
             <body style="background:#64748b; padding:30px 20px; margin:0;">
-                <div class="no-print" style="max-width:189mm; margin: 0 auto 20px auto; text-align:right;">
+                <div class="no-print" style="max-width:199mm; margin: 0 auto 20px auto; text-align:right;">
                     <button onclick="window.print()" style="background:#0f172a; color:white; border:none; padding:11px 22px; font-weight:bold; font-size:13px; border-radius:6px; cursor:pointer; box-shadow:0 3px 6px rgba(0,0,0,0.15);">🖨️ Commit Print Batch to Paper</button>
                 </div>
                 {joined_report_pages}
