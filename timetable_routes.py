@@ -367,10 +367,18 @@ EDUCATION_LEVELS = ["Lower Primary", "Upper Primary", "Junior School"]
 def get_school_days(cur, school_id: int):
     """Returns this school's configured list of teaching days (e.g. Mon-Fri
     or Mon-Sat), defaulting to a 5-day week only until the school sets its
-    own value on the Periods & Days page."""
+    own value on the Periods & Days page. Works whether the caller's cursor
+    is a RealDictCursor (dict-style rows) or a plain cursor (tuple rows) —
+    some call sites use a plain cursor for other queries in the same block."""
     cur.execute("SELECT days_per_week FROM timetable_settings WHERE school_id = %s;", (school_id,))
     row = cur.fetchone()
-    days_per_week = row['days_per_week'] if row else 5
+    if row is None:
+        days_per_week = 5
+    else:
+        try:
+            days_per_week = row['days_per_week']
+        except (TypeError, KeyError):
+            days_per_week = row[0]
     return ALL_POSSIBLE_DAYS[:days_per_week]
 
 
