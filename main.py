@@ -139,6 +139,7 @@ from shared import (
     require_superadmin_session,
     sort_subjects_for_display,
     abbreviate_subject,
+    with_query_param,
 )
 
 
@@ -1081,7 +1082,7 @@ async def update_school_logo_submit(school_id: int, request: Request, logo_file:
 
 
 @app.get("/admin/dashboard/{school_id}", response_class=HTMLResponse)
-def administrative_dashboard(school_id: int, request: Request, logo_storage: str = None):  
+def administrative_dashboard(school_id: int, request: Request, logo_storage: str = None, student_added: str = None, staff_added: str = None):  
     auth_error = require_admin_session(request, school_id)
     if auth_error:
         return auth_error
@@ -1335,6 +1336,8 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         </header>
 
         {"<div class='bg-amber-50 border-b border-amber-200 text-amber-800 text-xs px-8 py-2.5 text-center font-semibold'>⚠️ That logo was saved to temporary server storage, not cloud storage — it will likely disappear the next time the server restarts. Check that SUPABASE_URL and a Supabase secret/service key (SUPABASE_KEY, SUPABASE_SECRET_KEY, or SUPABASE_SERVICE_ROLE_KEY) are set correctly on Render, and that a public 'logos' bucket exists in Supabase, then re-upload.</div>" if logo_storage == "local" else ""}
+        {"<div class='bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-xs px-8 py-2.5 text-center font-semibold'>✅ Student registered successfully!</div>" if student_added else ""}
+        {"<div class='bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-xs px-8 py-2.5 text-center font-semibold'>✅ Staff account created successfully — activate it from the Staff panel once ready.</div>" if staff_added else ""}
 
         <div class="flex flex-col lg:flex-row flex-1 w-full max-w-[1600px] mx-auto">
 
@@ -1819,7 +1822,7 @@ def storage_diagnostics(school_id: int, request: Request):
 
 
 @app.get("/staff/dashboard/{school_id}", response_class=HTMLResponse)
-def staff_dashboard(school_id: int, request: Request, user_id: int = None):
+def staff_dashboard(school_id: int, request: Request, user_id: int = None, student_added: str = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -1932,6 +1935,8 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None):
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
+
+        {"<div class='bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-xs px-8 py-2.5 text-center font-semibold'>✅ Student registered successfully!</div>" if student_added else ""}
 
         <div class="p-8 max-w-6xl mx-auto w-full flex-1">
             <div class="flex items-center justify-between mb-4">
@@ -2841,7 +2846,9 @@ def educators_bulk_entry_grid(
     stream: str, 
     education_level: str, 
     learning_area_id: int = None, 
-    cycle_name: str = "End Term"
+    cycle_name: str = "End Term",
+    saved: int = None,
+    skipped: int = None,
 ):
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -2904,6 +2911,8 @@ def educators_bulk_entry_grid(
             </div>
             <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 px-4 py-2.5 rounded-lg text-xs font-black hover:bg-slate-300 text-center">Exit Workspace</a>
         </div>
+
+        {f'<div class="bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl">✅ {saved} score{"s" if saved != 1 else ""} saved successfully.' + (f' <span class="text-amber-700">({skipped} entr{"ies" if skipped != 1 else "y"} skipped — check for out-of-range or invalid values.)</span>' if skipped else '') + '</div>' if saved is not None else ''}
 
         <div class="bg-white p-4 sm:p-6 rounded-2xl border shadow-xs">
             <form method="get" action="/staff/bulk-entry/{school_id}" class="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
@@ -3414,13 +3423,17 @@ def backend_add_student(
                 raise HTTPException(status_code=400, detail="The selected grade/class does not exist.")
             education_level = class_row[0]
 
-            cur.execute("""
-                INSERT INTO students (school_id, admission_number, first_name, last_name, class_id, stream, education_level, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'ACTIVE');
-            """, (school_id, admission_number, first_name, last_name, class_id, processed_stream, education_level))
-            conn.commit()
+            try:
+                cur.execute("""
+                    INSERT INTO students (school_id, admission_number, first_name, last_name, class_id, stream, education_level, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'ACTIVE');
+                """, (school_id, admission_number, first_name, last_name, class_id, processed_stream, education_level))
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                raise HTTPException(status_code=400, detail=f"A student with admission number '{admission_number}' already exists in this school. Please use a different admission number.")
 
-    return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
+    return RedirectResponse(url=with_query_param(get_dashboard_url(request, school_id), "student_added", "1"), status_code=303)
 
 
 @app.get("/admin/student/edit/{school_id}/{student_id}", response_class=HTMLResponse)
@@ -3589,7 +3602,7 @@ def add_staff_node(
                 VALUES (%s, %s, 'staff', %s, FALSE, %s, %s, %s);
             """, (email, hashed_password, school_id, full_name, tsc_number, phone_number))
             conn.commit()
-    return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
+    return RedirectResponse(url=f"/admin/dashboard/{school_id}?staff_added=1", status_code=303)
 
 @app.post("/api/v1/staff/toggle-verification/{school_id}")
 def toggle_staff_verification(school_id: int, request: Request, user_id: int = Form(...)):
@@ -3680,7 +3693,21 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     if skipped_entries:
         logger.warning(f"Bulk score save for school {school_id} skipped {skipped_entries} invalid/mismatched entries.")
 
-    return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
+    saved_count = sum(
+        1 for key, val in form_data.items()
+        if key.startswith("score_") and str(val).strip() != ""
+    ) - skipped_entries
+
+    redirect_params = urllib.parse.urlencode({
+        "grade_name": form_data.get("grade_name", ""),
+        "education_level": form_data.get("education_level", ""),
+        "stream": form_data.get("stream", ""),
+        "learning_area_id": form_data.get("learning_area_id", ""),
+        "cycle_name": cycle_name,
+        "saved": saved_count,
+        "skipped": skipped_entries,
+    })
+    return RedirectResponse(url=f"/staff/bulk-entry/{school_id}?{redirect_params}", status_code=303)
 
 @app.post("/api/v1/wallet/stkpush/{school_id}")
 def process_simulated_mpesa_stk_push(school_id: int, request: Request, phone_number: str = Form(...), amount: float = Form(...)):
