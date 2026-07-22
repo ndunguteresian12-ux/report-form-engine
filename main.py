@@ -463,7 +463,7 @@ def landing_root():
 
 @app.get("/login", response_class=HTMLResponse)
 def login_portal():
-    return """
+    return f"""
     <!DOCTYPE html>
     <html>
     <head>
