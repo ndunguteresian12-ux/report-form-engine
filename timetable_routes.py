@@ -476,7 +476,7 @@ def timetable_dashboard(school_id: int, request: Request):
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Timetabling — {esc(school['name'])}</title>
+        <title>Elimu Hub | Timetabling — {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
         <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
@@ -579,7 +579,7 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Periods & Days — {esc(school['name'])}</title>
+        <title>Elimu Hub | Periods & Days — {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-[#F8FAFC] min-h-screen">
@@ -784,7 +784,7 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Assign Teachers</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Assign Teachers</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">Assign Teachers</h2>
@@ -872,7 +872,7 @@ def teacher_availability_picker(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Teacher Availability</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Teacher Availability</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">👩‍🏫 Teacher Availability</h2>
@@ -912,7 +912,7 @@ def teacher_timetable_picker(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Teacher Timetables</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Teacher Timetables</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">🖨 Teacher Timetables</h2>
@@ -964,7 +964,7 @@ def custom_subjects_view(school_id: int, request: Request, education_level: str 
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Custom Subjects — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Custom Subjects — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
         <div class="max-w-2xl mx-auto space-y-4">
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
@@ -1089,7 +1089,7 @@ def co_curricular_list(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Co-Curricular Activities — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Co-Curricular Activities — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-[#F8FAFC] min-h-screen">
         <header class="bg-white border-b border-slate-200/80 px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
             <div>
@@ -1243,7 +1243,7 @@ def co_curricular_roster(school_id: int, activity_id: int, request: Request, sea
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Roster — {esc(activity['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Roster — {esc(activity['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-2xl mx-auto space-y-4">
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
@@ -1348,7 +1348,7 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request,
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Availability — {esc(teacher['full_name'] or teacher['email'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Availability — {esc(teacher['full_name'] or teacher['email'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-4xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">👩‍🏫 {esc(teacher['full_name'] or teacher['email'])} — Availability</h2>
@@ -1441,7 +1441,7 @@ def subject_availability_picker(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Subject Time Off</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Subject Time Off</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">📚 Subject Time Off</h2>
@@ -1495,7 +1495,7 @@ def subject_availability_grid(school_id: int, learning_area_id: int, request: Re
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Time Off — {esc(subject['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Time Off — {esc(subject['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-4xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">📚 {esc(subject['name'])} — Time Off</h2>
@@ -1627,7 +1627,7 @@ def subject_sync_rules_view(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Same-Time Subject Rules</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Same-Time Subject Rules</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-3xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">🔗 Same-Time Subject Rules</h2>
@@ -1715,7 +1715,7 @@ def subject_constraints_view(school_id: int, request: Request, grade_name: str, 
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Subject Constraints</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Subject Constraints</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">⚙ Subject Constraints</h2>
@@ -1933,7 +1933,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Timetable — {esc(section_label)}</title>
+        <title>Elimu Hub | Timetable — {esc(section_label)}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
         <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
@@ -2493,7 +2493,7 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Timetable — {esc(section_label)}</title>
+        <title>Elimu Hub | Timetable — {esc(section_label)}</title>
         <style>
             @page {{ size: A4 landscape; margin: 12mm; }}
             body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; background:#f1f5f9; }}
@@ -2518,7 +2518,7 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
             {grid_html}
             <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#94a3b8;">
                 <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
-                <span>{esc(school['name'] if school else '')} — Timetable System</span>
+                <span>{esc(school['name'] if school else '')} — Powered by Elimu Hub</span>
             </div>
         </div>
     </body>
@@ -2595,7 +2595,7 @@ def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Timetable — {esc(teacher_name)}</title>
+        <title>Elimu Hub | Timetable — {esc(teacher_name)}</title>
         <style>
             @page {{ size: A4 landscape; margin: 12mm; }}
             body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; background:#f1f5f9; }}
@@ -2620,7 +2620,7 @@ def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
             {grid_html}
             <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#94a3b8;">
                 <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
-                <span>{esc(school['name'] if school else '')} — Timetable System</span>
+                <span>{esc(school['name'] if school else '')} — Powered by Elimu Hub</span>
             </div>
         </div>
     </body>
@@ -2745,7 +2745,7 @@ def timetable_master_view(school_id: int, request: Request):
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Whole School Timetable — {esc(school['name'])}</title>
+        <title>Elimu Hub | Whole School Timetable — {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-[#F8FAFC] min-h-screen">
@@ -2848,7 +2848,7 @@ def timetable_master_print(school_id: int, request: Request):
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Whole School Timetable — {esc(school['name'])}</title>
+        <title>Elimu Hub | Whole School Timetable — {esc(school['name'])}</title>
         <style>
             @page {{ size: A4 landscape; margin: 10mm; }}
             body {{ font-family: Arial, sans-serif; padding: 12px; color: #1e293b; background:#f1f5f9; }}

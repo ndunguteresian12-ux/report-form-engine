@@ -32,6 +32,27 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 # --- Logging & Initialization ---
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("cbe_engine")
+
+# Support contact shown to school admins/staff so they have someone to call
+# when something goes wrong — set these in Render's Environment tab. If
+# unset, the support line just doesn't show (no broken/empty contact info).
+SUPPORT_PHONE = (os.getenv("SUPPORT_PHONE") or "").strip() or None
+SUPPORT_EMAIL = (os.getenv("SUPPORT_EMAIL") or "").strip() or None
+
+def support_contact_html() -> str:
+    """A small 'need help?' line for dashboard footers. Returns an empty
+    string if no support contact has been configured."""
+    if not SUPPORT_PHONE and not SUPPORT_EMAIL:
+        return ""
+    parts = []
+    if SUPPORT_PHONE:
+        parts.append(f"📞 <a href='tel:{esc(SUPPORT_PHONE)}' class='underline hover:text-slate-500'>{esc(SUPPORT_PHONE)}</a>")
+    if SUPPORT_EMAIL:
+        parts.append(f"✉️ <a href='mailto:{esc(SUPPORT_EMAIL)}' class='underline hover:text-slate-500'>{esc(SUPPORT_EMAIL)}</a>")
+    return f"<p class='text-center text-[11px] text-slate-400 pb-2'>Need help? {' &nbsp;·&nbsp; '.join(parts)}</p>"
+
+ELIMU_HUB_ICON_DATA_URI = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iOTYiIGhlaWdodD0iOTYiIHZpZXdCb3g9IjAgMCA5NiA5NiIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KICA8ZGVmcz4KICAgIDxsaW5lYXJHcmFkaWVudCBpZD0iaHViR3JhZGllbnRJY29uIiB4MT0iMCUiIHkxPSIwJSIgeDI9IjEwMCUiIHkyPSIxMDAlIj4KICAgICAgPHN0b3Agb2Zmc2V0PSIwJSIgc3RvcC1jb2xvcj0iIzBkOTQ4OCIvPgogICAgICA8c3RvcCBvZmZzZXQ9IjEwMCUiIHN0b3AtY29sb3I9IiM0ZjQ2ZTUiLz4KICAgIDwvbGluZWFyR3JhZGllbnQ+CiAgPC9kZWZzPgoKICA8cmVjdCB3aWR0aD0iOTYiIGhlaWdodD0iOTYiIHJ4PSIyMCIgZmlsbD0iI0Y3RjlGOCIvPgoKICA8ZyB0cmFuc2Zvcm09InRyYW5zbGF0ZSg3LCA1KSI+CiAgICA8cG9seWdvbiBwb2ludHM9IjQ0LDIgODIsMjMgODIsNjUgNDQsODYgNiw2NSA2LDIzIgogICAgICBmaWxsPSJub25lIiBzdHJva2U9InVybCgjaHViR3JhZGllbnRJY29uKSIgc3Ryb2tlLXdpZHRoPSI1LjUiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KCiAgICA8ZyB0cmFuc2Zvcm09InRyYW5zbGF0ZSg0NCwgNDQpIj4KICAgICAgPHBhdGggZD0iTTAsLTYgQyAtMTQsLTE0IC0yNiwtMTIgLTI2LC0xMiBMIC0yNiwxNCBDIC0yNiwxNCAtMTQsMTIgMCwyMCBaIgogICAgICAgIGZpbGw9InVybCgjaHViR3JhZGllbnRJY29uKSIgb3BhY2l0eT0iMC45MiIvPgogICAgICA8cGF0aCBkPSJNMCwtNiBDIDE0LC0xNCAyNiwtMTIgMjYsLTEyIEwgMjYsMTQgQyAyNiwxNCAxNCwxMiAwLDIwIFoiCiAgICAgICAgZmlsbD0idXJsKCNodWJHcmFkaWVudEljb24pIiBvcGFjaXR5PSIwLjc1Ii8+CiAgICAgIDxsaW5lIHgxPSIwIiB5MT0iLTYiIHgyPSIwIiB5Mj0iMjAiIHN0cm9rZT0id2hpdGUiIHN0cm9rZS13aWR0aD0iMS44IiBvcGFjaXR5PSIwLjYiLz4KICAgIDwvZz4KCiAgICA8Y2lyY2xlIGN4PSI0NCIgY3k9IjIiIHI9IjMuNiIgZmlsbD0iIzRmNDZlNSIvPgogICAgPGNpcmNsZSBjeD0iODIiIGN5PSIyMyIgcj0iMy42IiBmaWxsPSIjMGQ5NDg4Ii8+CiAgICA8Y2lyY2xlIGN4PSI4MiIgY3k9IjY1IiByPSIzLjYiIGZpbGw9IiMwZDk0ODgiLz4KICAgIDxjaXJjbGUgY3g9IjQ0IiBjeT0iODYiIHI9IjMuNiIgZmlsbD0iIzRmNDZlNSIvPgogICAgPGNpcmNsZSBjeD0iNiIgY3k9IjY1IiByPSIzLjYiIGZpbGw9IiMwZDk0ODgiLz4KICAgIDxjaXJjbGUgY3g9IjYiIGN5PSIyMyIgcj0iMy42IiBmaWxsPSIjMGQ5NDg4Ii8+CiAgPC9nPgo8L3N2Zz4K"
+
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip() or None
 # Supabase renamed its API keys for newer projects: the old "service_role"
 # key (needed here for server-side writes past bucket RLS) is now called
@@ -447,12 +468,13 @@ def login_portal():
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Multi-Tenant Hub Gateway</title>
+        <title>Elimu Hub | Multi-Tenant Hub Gateway</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-slate-900 flex items-center justify-center h-screen font-sans">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
-            <h2 class="text-2xl font-black text-center text-slate-800 mb-2">CBE Reporting Hub</h2>
+            <img src="{ELIMU_HUB_ICON_DATA_URI}" alt="Elimu Hub" class="w-14 h-14 mx-auto mb-3 rounded-2xl shadow-sm" />
+            <h2 class="text-2xl font-black text-center text-slate-800 mb-2">Elimu Hub</h2>
             <p class="text-xs text-center text-slate-400 mb-6">Enterprise Institutional Gateway Node</p>
             
             <form action="/api/v1/auth/login" method="post" class="space-y-4">
@@ -601,7 +623,7 @@ def forgot_password_form(sent: str = None):
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Forgot Password</title>
+        <title>Elimu Hub | Forgot Password</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-slate-900 flex items-center justify-center h-screen font-sans">
@@ -647,7 +669,7 @@ def forgot_password_submit(email: str = Form(...)):
 
                 send_sms(
                     user['phone_number'],
-                    f"Your CBE Reporting Hub password reset code is {reset_code}. It expires in 15 minutes. "
+                    f"Your Elimu Hub password reset code is {reset_code}. It expires in 15 minutes. "
                     f"If you didn't request this, ignore this message."
                 )
 
@@ -669,7 +691,7 @@ def reset_password_form(email: str = "", sent: str = None):
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Reset Password</title>
+        <title>Elimu Hub | Reset Password</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-slate-900 flex items-center justify-center h-screen font-sans">
@@ -743,7 +765,7 @@ def terms_and_conditions_page():
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Terms and Conditions</title>
+        <title>Elimu Hub | Terms and Conditions</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-slate-100 min-h-screen py-10 px-6">
@@ -803,7 +825,7 @@ def public_registration_portal():
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Create School Tenant Account</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Create School Tenant Account</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="flex items-center justify-center min-h-screen font-sans p-6 bg-slate-900 bg-cover bg-center" style="background-image: linear-gradient(rgba(15,23,42,0.80), rgba(15,23,42,0.88)), url('data:image/jpeg;base64,{REGISTRATION_BG_IMAGE_B64}');">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-xl border-t-8 border-emerald-700">
             <h2 class="text-2xl font-black text-slate-800">Register Institutional Tenant</h2>
@@ -1002,7 +1024,7 @@ def update_school_logo_form(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Update School Logo</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Update School Logo</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-900 flex items-center justify-center min-h-screen font-sans p-6">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Update School Logo</h2>
@@ -1309,7 +1331,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     <html class="h-full">
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Control Deck - {esc(school['name'])}</title>
+        <title>Elimu Hub | Control Deck - {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1477,6 +1499,8 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                         {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No registered student profiles logged inside streams.</p>"}
                     </div>
                 </div>
+                {support_contact_html()}
+                <p class="text-center text-[11px] text-slate-300 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-400">Elimu Hub</span></p>
             </main>
         </div>
     </body>
@@ -1574,7 +1598,7 @@ def superadmin_dashboard(request: Request):
     <html class="h-full">
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Super Admin Portal</title>
+        <title>Elimu Hub | Super Admin Portal</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
         <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
@@ -1628,6 +1652,8 @@ def superadmin_dashboard(request: Request):
                     </table>
                 </div>
             </div>
+            {support_contact_html()}
+            <p class="text-center text-[11px] text-slate-500 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-300">Elimu Hub</span></p>
         </div>
     </body>
     </html>
@@ -1729,7 +1755,7 @@ def superadmin_reset_admin_password_form(school_id: int, request: Request, done:
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Reset Admin Password</title>
+        <title>Elimu Hub | Reset Admin Password</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-slate-900 flex items-center justify-center min-h-screen font-sans p-6">
@@ -1793,7 +1819,7 @@ def storage_diagnostics(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Storage Diagnostics</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Storage Diagnostics</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-8 font-sans">
         <div class="max-w-lg mx-auto bg-white rounded-2xl border shadow p-6 space-y-4">
             <h2 class="text-lg font-black text-slate-800">🔧 Logo Storage Diagnostics</h2>
@@ -1910,7 +1936,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
     <html class="h-full">
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Staff Portal - {esc(school['name'])}</title>
+        <title>Elimu Hub | Staff Portal - {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1945,6 +1971,8 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
             <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                 {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No classes have been set up for this school yet.</p>"}
             </div>
+            {support_contact_html()}
+            <p class="text-center text-[11px] text-slate-300 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-400">Elimu Hub</span></p>
         </div>
     </body>
     </html>
@@ -1999,7 +2027,7 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Class Roster — {esc(class_title)}</title>
+        <title>Elimu Hub | Class Roster — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
             @media print {{ .no-print {{ display: none !important; }} }}
@@ -2204,7 +2232,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Merit List — {esc(grade_name)}</title>
+        <title>Elimu Hub | Merit List — {esc(grade_name)}</title>
         <style>
             @page {{ size: landscape; margin: 10mm; }}
             body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; font-size: 11px; }}
@@ -2357,7 +2385,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Top 10 — {esc(class_title)}</title>
+        <title>Elimu Hub | Top 10 — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
             @media print {{ .no-print {{ display: none !important; }} }}
@@ -2465,7 +2493,7 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Top Student Per Subject — {esc(class_title)}</title>
+        <title>Elimu Hub | Top Student Per Subject — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
             @media print {{ .no-print {{ display: none !important; }} }}
@@ -2586,7 +2614,7 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Subject Analysis — {esc(class_title)}</title>
+        <title>Elimu Hub | Subject Analysis — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
             @media print {{ .no-print {{ display: none !important; }} }}
@@ -2624,7 +2652,7 @@ def add_student_view(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Add New Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Add New Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 flex items-center justify-center min-h-screen p-4">
         <div class="bg-white p-6 sm:p-8 rounded-2xl border shadow-md w-full max-w-lg">
             <h2 class="text-xl font-bold mb-4 text-slate-800">Add New Learner Profile</h2>
@@ -2678,7 +2706,7 @@ def staff_registration_panel(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Add Staff — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Add Staff — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-indigo-950 flex items-center justify-center min-h-screen font-sans p-6">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-sm border-t-8 border-indigo-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Add Staff Member</h2>
@@ -2789,7 +2817,7 @@ def manage_individual_scores_view(school_id: int, student_id: int, request: Requ
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Edit Matrix for {esc(student['first_name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Edit Matrix for {esc(student['first_name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-50 p-8 min-h-screen max-w-3xl mx-auto space-y-6">
         <div class="bg-white p-6 rounded-2xl border shadow-xs flex justify-between items-center">
             <div>
@@ -2902,7 +2930,7 @@ def educators_bulk_entry_grid(
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Bulk Sheet Entry Deck</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Bulk Sheet Entry Deck</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 p-3 sm:p-8 min-h-screen max-w-4xl mx-auto space-y-4 sm:space-y-6">
         <div class="bg-white p-4 sm:p-6 rounded-2xl border shadow-xs flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
             <div>
@@ -3296,7 +3324,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             <html>
             <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Print Out Queue Pipeline</title>
+                <title>Elimu Hub | Print Out Queue Pipeline</title>
                 <style>
                     * {{ box-sizing: border-box; }}
                     html, body {{ margin: 0; padding: 0; width: 100%; }}
@@ -3461,7 +3489,7 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Edit Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Edit Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 flex items-center justify-center min-h-screen p-4">
         <div class="bg-white p-6 sm:p-8 rounded-2xl border shadow-md w-full max-w-lg">
             <h2 class="text-xl font-bold mb-4 text-slate-800">Edit Learner Profile</h2>
