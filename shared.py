@@ -163,6 +163,12 @@ def require_admin_session(request: Request, school_id: int):
         )
     return None
 
+def with_query_param(base_url: str, key: str, value: str) -> str:
+    """Appends a query param to a URL, correctly using '?' or '&' depending
+    on whether the URL (e.g. from get_dashboard_url) already has one."""
+    sep = "&" if "?" in base_url else "?"
+    return f"{base_url}{sep}{key}={value}"
+
 def get_dashboard_url(request: Request, school_id: int) -> str:
     """Returns the correct 'home' dashboard URL for whoever is logged in —
     staff go back to their own portal, not the admin-only dashboard."""
