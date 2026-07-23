@@ -295,6 +295,27 @@ def bootstrap_database_schema():
                     entered_by_user_id INTEGER REFERENCES users(id),
                     UNIQUE(student_id, learning_area_id, cycle_name)
                 );
+
+                -- Some Junior School subjects (English, Kiswahili, Integrated
+                -- Science) are assessed as two separate papers, each with its
+                -- own "out of" max — e.g. Paper 1 out of 30, Paper 2 out of
+                -- 50. This table stores that raw paper-level detail purely
+                -- for re-editing/audit purposes; the BLENDED percentage
+                -- computed from it is written into student_scores.raw_score
+                -- as normal, so report cards, rankings, and every other
+                -- existing report keep working completely unchanged — they
+                -- never need to know a subject was entered as two papers.
+                CREATE TABLE IF NOT EXISTS paper_based_scores (
+                    id SERIAL PRIMARY KEY,
+                    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    cycle_name VARCHAR(50) NOT NULL,
+                    paper1_marks NUMERIC(6, 2),
+                    paper1_max NUMERIC(6, 2),
+                    paper2_marks NUMERIC(6, 2),
+                    paper2_max NUMERIC(6, 2),
+                    UNIQUE(student_id, learning_area_id, cycle_name)
+                );
             """)
 
             # Populate Classes
@@ -413,6 +434,15 @@ def evaluate_performance_metrics(score: float) -> dict:
     return {"pld": "N/A", "points": 0, "desc": "Out of Range"}
 
 POINTS_TO_PLD = {8: "EE1", 7: "EE2", 6: "ME1", 5: "ME2", 4: "AE1", 3: "AE2", 2: "BE1", 1: "BE2"}
+
+# These Junior School subjects are assessed as two separate papers (each with
+# its own "out of" max), rather than a single combined mark. Matched against
+# the lowercased, stripped subject name so it's resilient to minor naming
+# differences (e.g. a trailing period).
+PAPER_BASED_SUBJECTS = {"english", "kiswahili", "integrated science"}
+
+def is_paper_based_subject(subject_name: str) -> bool:
+    return (subject_name or "").strip().lower().rstrip(".") in PAPER_BASED_SUBJECTS
 
 def generate_teacher_comment(first_name: str, pld: str) -> str:
     """Class teacher remark, tailored to the learner's overall performance level for the term."""
@@ -2888,7 +2918,9 @@ def educators_bulk_entry_grid(
             subjects = cur.fetchall()
             
             selected_area_id = learning_area_id or (subjects[0]['id'] if subjects else None)
-            
+            selected_subject_name = next((sub['name'] for sub in subjects if sub['id'] == selected_area_id), "")
+            is_paper_mode = is_paper_based_subject(selected_subject_name)
+
             # FIXED: Added explicit JOIN onto classes table to resolve missing 'education_level' column runtime issue
             cur.execute("""
                 SELECT s.id, s.admission_number, s.first_name, s.last_name 
@@ -2903,7 +2935,21 @@ def educators_bulk_entry_grid(
             students = cur.fetchall()
 
             score_map = {}
-            if selected_area_id:
+            paper_map = {}
+            paper1_max, paper2_max = 30, 50
+            if selected_area_id and is_paper_mode:
+                cur.execute("""
+                    SELECT student_id, paper1_marks, paper1_max, paper2_marks, paper2_max FROM paper_based_scores
+                    WHERE learning_area_id = %s AND cycle_name = %s;
+                """, (selected_area_id, cycle_name))
+                rows = cur.fetchall()
+                for r in rows:
+                    paper_map[r['student_id']] = r
+                if rows:
+                    # Reuse whatever "out of" was last configured for this subject/cycle.
+                    paper1_max = float(rows[0]['paper1_max'])
+                    paper2_max = float(rows[0]['paper2_max'])
+            elif selected_area_id:
                 cur.execute("""
                     SELECT student_id, raw_score FROM student_scores 
                     WHERE learning_area_id = %s AND cycle_name = %s;
@@ -2915,15 +2961,29 @@ def educators_bulk_entry_grid(
 
     student_rows = ""
     for s in students:
-        existing_val = score_map.get(s['id'], "")
         search_key = f"{s['first_name']} {s['last_name']} {s['admission_number']}".lower()
+        if is_paper_mode:
+            p = paper_map.get(s['id'])
+            p1_val = p['paper1_marks'] if p else ""
+            p2_val = p['paper2_marks'] if p else ""
+            input_html = f"""
+            <div class="flex items-center gap-2 shrink-0">
+                <input type="number" inputmode="decimal" step="0.01" min="0" name="paper1_{s['id']}" value="{p1_val}" class="border-2 p-2 rounded-xl w-16 focus:border-emerald-600 font-bold text-center text-sm" placeholder="P1">
+                <span class="text-slate-300 text-xs">/</span>
+                <input type="number" inputmode="decimal" step="0.01" min="0" name="paper2_{s['id']}" value="{p2_val}" class="border-2 p-2 rounded-xl w-16 focus:border-emerald-600 font-bold text-center text-sm" placeholder="P2">
+            </div>
+            """
+        else:
+            existing_val = score_map.get(s['id'], "")
+            input_html = f'<input type="number" inputmode="decimal" step="0.01" min="0" max="100" name="score_{s["id"]}" value="{existing_val}" class="border-2 p-2.5 rounded-xl w-24 shrink-0 focus:border-emerald-600 font-bold text-center text-base" placeholder="-%">'
+
         student_rows += f"""
         <div class="student-row flex items-center justify-between gap-3 p-3.5 border-b last:border-0" data-search="{esc(search_key)}">
             <div class="min-w-0">
                 <p class="font-bold text-slate-800 text-sm truncate">{esc(s['first_name'])} {esc(s['last_name'])}</p>
                 <p class="text-xs text-slate-400 font-mono">#{esc(s['admission_number'])}</p>
             </div>
-            <input type="number" inputmode="decimal" step="0.01" min="0" max="100" name="score_{s['id']}" value="{existing_val}" class="border-2 p-2.5 rounded-xl w-24 shrink-0 focus:border-emerald-600 font-bold text-center text-base" placeholder="-%">
+            {input_html}
         </div>
         """
 
@@ -2969,12 +3029,24 @@ def educators_bulk_entry_grid(
             <input type="hidden" name="stream" value="{esc(stream)}">
             <input type="hidden" name="learning_area_id" value="{selected_area_id}">
             <input type="hidden" name="cycle_name" value="{cycle_name}">
+            <input type="hidden" name="is_paper_mode" value="{'1' if is_paper_mode else '0'}">
+
+            {f'''<div class="p-3.5 bg-indigo-50 border-b border-indigo-100 flex flex-wrap items-center gap-3 text-xs">
+                <span class="font-bold text-indigo-800">📄 {esc(selected_subject_name)} is assessed as two papers —</span>
+                <label class="flex items-center gap-1.5 font-semibold text-indigo-700">Paper 1 out of
+                    <input type="number" name="paper1_max" value="{paper1_max:.0f}" min="1" class="border-2 border-indigo-200 p-1.5 rounded-lg w-16 text-center font-bold">
+                </label>
+                <label class="flex items-center gap-1.5 font-semibold text-indigo-700">Paper 2 out of
+                    <input type="number" name="paper2_max" value="{paper2_max:.0f}" min="1" class="border-2 border-indigo-200 p-1.5 rounded-lg w-16 text-center font-bold">
+                </label>
+                <span class="text-indigo-400 italic">The two papers are combined into one percentage automatically on save.</span>
+            </div>''' if is_paper_mode else ""}
 
             <div class="p-3 border-b bg-white">
                 <input type="text" id="studentSearchBox" oninput="filterStudentRows(this.value)" placeholder="🔎 Search by name or admission number..." class="w-full border-2 p-2.5 rounded-xl text-sm focus:border-emerald-600" autocomplete="off">
             </div>
             <div class="px-3.5 py-2.5 bg-slate-50 text-slate-500 text-[10px] font-bold uppercase tracking-wider border-b flex justify-between">
-                <span>Learner</span><span>Score %</span>
+                <span>Learner</span><span>{"Paper 1 / Paper 2" if is_paper_mode else "Score %"}</span>
             </div>
             <div id="studentRowsContainer">{student_rows or "<p class='text-center p-6 text-slate-400 italic text-xs'>No registered class matching criterion.</p>"}</div>
             <p id="noSearchResults" class="hidden text-center p-6 text-slate-400 italic text-xs">No learners match that search.</p>
@@ -3689,6 +3761,84 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     cycle_name = (form_data.get('cycle_name') or "").strip()
     if not cycle_name:
         raise HTTPException(status_code=400, detail="An assessment cycle must be selected before saving.")
+
+    is_paper_mode = form_data.get("is_paper_mode") == "1"
+    skipped_entries = 0
+
+    if is_paper_mode:
+        try:
+            paper1_max = float(form_data.get("paper1_max") or 0)
+            paper2_max = float(form_data.get("paper2_max") or 0)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Paper 1/Paper 2 'out of' values must be numbers.")
+        if paper1_max <= 0 or paper2_max <= 0:
+            raise HTTPException(status_code=400, detail="Paper 1 and Paper 2 'out of' values must be greater than zero.")
+
+        # Collect each student's two paper marks first, since both fields
+        # need to be present together to compute a combined percentage.
+        student_papers = {}
+        for key, val in form_data.items():
+            if not key.startswith("paper1_") and not key.startswith("paper2_"):
+                continue
+            try:
+                sid = int(key.split("_")[1])
+                mark = float(val) if str(val).strip() != "" else None
+            except (IndexError, ValueError):
+                continue
+            entry = student_papers.setdefault(sid, {})
+            entry["paper1" if key.startswith("paper1_") else "paper2"] = mark
+
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                for sid, marks in student_papers.items():
+                    p1, p2 = marks.get("paper1"), marks.get("paper2")
+                    if p1 is None or p2 is None:
+                        continue  # need both papers entered to compute a combined score
+                    if not (0 <= p1 <= paper1_max) or not (0 <= p2 <= paper2_max):
+                        skipped_entries += 1
+                        continue
+
+                    cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (sid, school_id))
+                    if not cur.fetchone():
+                        skipped_entries += 1
+                        continue
+
+                    combined_percentage = round((p1 + p2) / (paper1_max + paper2_max) * 100, 2)
+
+                    cur.execute("""
+                        INSERT INTO paper_based_scores (student_id, learning_area_id, cycle_name, paper1_marks, paper1_max, paper2_marks, paper2_max)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (student_id, learning_area_id, cycle_name)
+                        DO UPDATE SET paper1_marks = EXCLUDED.paper1_marks, paper1_max = EXCLUDED.paper1_max,
+                                      paper2_marks = EXCLUDED.paper2_marks, paper2_max = EXCLUDED.paper2_max;
+                    """, (sid, learning_area_id, cycle_name, p1, paper1_max, p2, paper2_max))
+
+                    # The blended percentage is written into student_scores
+                    # exactly like any normal single-mark entry — report
+                    # cards, rankings, and every other report keep reading
+                    # this the same way, with no idea two papers were involved.
+                    cur.execute("""
+                        INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (student_id, learning_area_id, cycle_name) DO UPDATE SET raw_score = EXCLUDED.raw_score;
+                    """, (sid, learning_area_id, cycle_name, combined_percentage))
+                conn.commit()
+
+        if skipped_entries:
+            logger.warning(f"Bulk paper-score save for school {school_id} skipped {skipped_entries} invalid/mismatched entries.")
+
+        saved_count = len([1 for m in student_papers.values() if m.get("paper1") is not None and m.get("paper2") is not None]) - skipped_entries
+
+        redirect_params = urllib.parse.urlencode({
+            "grade_name": form_data.get("grade_name", ""),
+            "education_level": form_data.get("education_level", ""),
+            "stream": form_data.get("stream", ""),
+            "learning_area_id": form_data.get("learning_area_id", ""),
+            "cycle_name": cycle_name,
+            "saved": saved_count,
+            "skipped": skipped_entries,
+        })
+        return RedirectResponse(url=f"/staff/bulk-entry/{school_id}?{redirect_params}", status_code=303)
 
     skipped_entries = 0
     with get_db_connection() as conn:
