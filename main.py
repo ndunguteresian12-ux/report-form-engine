@@ -3121,11 +3121,11 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             # on exactly one page.
             _n_subjects = len(subjects)
             if _n_subjects <= 5:
-                row_vpad, row_font, desc_font = "8px", "11px", "10.5px"
+                row_vpad, row_font, desc_font = "16px", "12.5px", "11.5px"
             elif _n_subjects <= 7:
-                row_vpad, row_font, desc_font = "6px", "10.5px", "10px"
+                row_vpad, row_font, desc_font = "11px", "11.5px", "11px"
             else:
-                row_vpad, row_font, desc_font = "4px", "10px", "9.5px"
+                row_vpad, row_font, desc_font = "8px", "11px", "10.5px"
 
             report_cards_html = []
             for s in students:
@@ -3215,7 +3215,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                 )
 
                 report_cards_html.append(f"""
-                <div class="report-card-container" style="background: white; padding: 24px; border: 5px solid {theme['hex']}; border-radius: 12px; width: 199mm; min-height: 267mm; max-height: 282mm; overflow: hidden; box-sizing: border-box; margin: 0 auto; font-family: 'Arial', sans-serif; display: flex; flex-direction: column; justify-content: space-between;">
+                <div class="report-card-container" style="background: white; padding: 24px; border: 5px solid {theme['hex']}; border-radius: 12px; width: 199mm; min-height: 250mm; max-height: 282mm; overflow: hidden; box-sizing: border-box; margin: 0 auto; font-family: 'Plus Jakarta Sans', Arial, sans-serif; display: flex; flex-direction: column; justify-content: space-between;">
                     <div>
                         <div style="display: flex; align-items: center; border-bottom: 4px double {theme['hex']}; padding-bottom: 8px; margin-bottom: 12px;">
                             {logo_markup}
@@ -3264,11 +3264,11 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         </table>
                     </div>
 
-                    <div style="margin-top: 10px;">
-                        <div style="display: grid; grid-template-columns: 240px 1fr; gap: 14px; align-items: center; margin-bottom: 8px;">
-                            <div style="border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px; background: #f8fafc; text-align: center;">
-                                <span style="font-size: 9.5px; font-weight: bold; text-transform: uppercase; color: #475569; display: block; margin-bottom: 4px;">Performance Milestone Graph</span>
-                                <svg viewBox="0 0 200 80" style="width: 100%; height: 58px; overflow: visible;">
+                    <div style="margin-top: 18px;">
+                        <div style="display: grid; grid-template-columns: 280px 1fr; gap: 16px; align-items: center; margin-bottom: 12px;">
+                            <div style="border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; background: #f8fafc; text-align: center;">
+                                <span style="font-size: 11px; font-weight: bold; text-transform: uppercase; color: #475569; display: block; margin-bottom: 6px;">Performance Milestone Graph</span>
+                                <svg viewBox="0 0 200 80" style="width: 100%; height: 92px; overflow: visible;">
                                     <line x1="20" y1="10" x2="190" y2="10" stroke="#e2e8f0" stroke-width="0.5" />
                                     <line x1="20" y1="35" x2="190" y2="35" stroke="#e2e8f0" stroke-width="0.5" />
                                     <line x1="20" y1="60" x2="190" y2="60" stroke="#cbd5e1" stroke-width="1" />
@@ -3289,25 +3289,25 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                                 </svg>
                             </div>
 
-                            <div style="border:1px solid {theme['hex']}; background:#f4faf6; padding:10px; border-radius:6px; display:flex; flex-direction:column; justify-content:center; gap:6px; height:72px; box-sizing:border-box;">
-                                <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:11.5px;">
+                            <div style="border:1px solid {theme['hex']}; background:#f4faf6; padding:16px; border-radius:8px; display:flex; flex-direction:column; justify-content:center; gap:12px; height:110px; box-sizing:border-box;">
+                                <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:13px;">
                                     <span>Cumulative Scale Points:</span>
                                     <span style="color:{theme['hex']}; font-weight:800;">{accumulated_scale_points} Pts</span>
                                 </div>
-                                <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:11.5px;">
+                                <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:13px;">
                                     <span>Mean Performance Score:</span>
                                     <span style="font-weight:800;">{avg_summary_percentage:.1f}%</span>
                                 </div>
-                                <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:11.5px;">
+                                <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:13px;">
                                     <span>Aggregated Summary Level:</span>
-                                    <span style="background:white; padding:1px 6px; border:1px solid #333; border-radius:4px; color:{theme['hex']}; font-weight:800; font-size:10.5px;">{summary_meta['pld']}</span>
+                                    <span style="background:white; padding:2px 8px; border:1px solid #333; border-radius:4px; color:{theme['hex']}; font-weight:800; font-size:12px;">{summary_meta['pld']}</span>
                                 </div>
                             </div>
                         </div>
 
-                        <div style="border: 1px solid #cbd5e1; padding: 8px; border-radius: 6px; background: #fafafa; font-size: 11px; line-height: 1.4;">
-                            <div style="padding-bottom:4px; border-bottom:1px dashed #e2e8f0;"><b>Class Instructor Remarks:</b> {esc(generate_teacher_comment(s['first_name'], summary_meta['pld']))}</div>
-                            <div style="padding-top:4px;"><b>Headteacher Institutional Verdict:</b> {esc(generate_headteacher_comment(summary_meta['pld']))}</div>
+                        <div style="border: 1px solid #cbd5e1; padding: 14px; border-radius: 8px; background: #fafafa; font-size: 12px; line-height: 1.6;">
+                            <div style="padding-bottom:8px; margin-bottom:8px; border-bottom:1px dashed #e2e8f0;"><b>Class Instructor Remarks:</b> {esc(generate_teacher_comment(s['first_name'], summary_meta['pld']))}</div>
+                            <div><b>Headteacher Institutional Verdict:</b> {esc(generate_headteacher_comment(summary_meta['pld']))}</div>
                         </div>
 
                         <div style="display:flex; justify-content:space-between; margin-top: 8px; padding-top: 6px; border-top: 1.5px solid #cbd5e1; font-size: 11px; font-style: italic; color: #475569;">
@@ -3325,9 +3325,12 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Elimu Hub | Print Out Queue Pipeline</title>
+                <link rel="preconnect" href="https://fonts.googleapis.com">
+                <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+                <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
                 <style>
                     * {{ box-sizing: border-box; }}
-                    html, body {{ margin: 0; padding: 0; width: 100%; }}
+                    html, body {{ margin: 0; padding: 0; width: 100%; font-family: 'Plus Jakarta Sans', Arial, sans-serif; }}
                     
                     .report-card-container {{
                         page-break-inside: avoid !important;
