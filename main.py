@@ -3075,8 +3075,8 @@ def educators_bulk_entry_grid(
         search_key = f"{s['first_name']} {s['last_name']} {s['admission_number']}".lower()
         if is_paper_mode:
             p = paper_map.get(s['id'])
-            p1_val = p['paper1_marks'] if p else ""
-            p2_val = p['paper2_marks'] if p else ""
+            p1_val = p['paper1_marks'] if (p and p['paper1_marks'] is not None) else ""
+            p2_val = p['paper2_marks'] if (p and p['paper2_marks'] is not None) else ""
             input_html = f"""
             <div class="flex items-center gap-2 shrink-0">
                 <input type="number" inputmode="decimal" step="0.01" min="0" name="paper1_{s['id']}" value="{p1_val}" class="border-2 p-2 rounded-xl w-16 focus:border-emerald-600 font-bold text-center text-sm" placeholder="P1">
@@ -3903,9 +3903,13 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
             with conn.cursor() as cur:
                 for sid, marks in student_papers.items():
                     p1, p2 = marks.get("paper1"), marks.get("paper2")
-                    if p1 is None or p2 is None:
-                        continue  # need both papers entered to compute a combined score
-                    if not (0 <= p1 <= paper1_max) or not (0 <= p2 <= paper2_max):
+                    if p1 is None and p2 is None:
+                        continue  # nothing entered for this student this session
+
+                    if p1 is not None and not (0 <= p1 <= paper1_max):
+                        skipped_entries += 1
+                        continue
+                    if p2 is not None and not (0 <= p2 <= paper2_max):
                         skipped_entries += 1
                         continue
 
@@ -3914,7 +3918,20 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
                         skipped_entries += 1
                         continue
 
-                    combined_percentage = round((p1 + p2) / (paper1_max + paper2_max) * 100, 2)
+                    # A school can give just one paper for now and add the
+                    # other later — whichever paper(s) are actually present
+                    # determine the percentage, so a lone Paper 1 mark is
+                    # scored out of Paper 1's own max, not held back waiting
+                    # for a Paper 2 that may not exist yet. Once Paper 2 is
+                    # entered later (editing this same subject/cycle again),
+                    # this recomputes using both, exactly as a true combined
+                    # score should.
+                    if p1 is not None and p2 is not None:
+                        percentage = round((p1 + p2) / (paper1_max + paper2_max) * 100, 2)
+                    elif p1 is not None:
+                        percentage = round(p1 / paper1_max * 100, 2)
+                    else:
+                        percentage = round(p2 / paper2_max * 100, 2)
 
                     cur.execute("""
                         INSERT INTO paper_based_scores (student_id, learning_area_id, cycle_name, paper1_marks, paper1_max, paper2_marks, paper2_max)
@@ -3922,23 +3939,24 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
                         ON CONFLICT (student_id, learning_area_id, cycle_name)
                         DO UPDATE SET paper1_marks = EXCLUDED.paper1_marks, paper1_max = EXCLUDED.paper1_max,
                                       paper2_marks = EXCLUDED.paper2_marks, paper2_max = EXCLUDED.paper2_max;
-                    """, (sid, learning_area_id, cycle_name, p1, paper1_max, p2, paper2_max))
+                    """, (sid, learning_area_id, cycle_name, p1, paper1_max if p1 is not None else None,
+                          p2, paper2_max if p2 is not None else None))
 
-                    # The blended percentage is written into student_scores
+                    # The resulting percentage is written into student_scores
                     # exactly like any normal single-mark entry — report
                     # cards, rankings, and every other report keep reading
-                    # this the same way, with no idea two papers were involved.
+                    # this the same way, with no idea one or two papers were involved.
                     cur.execute("""
                         INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score)
                         VALUES (%s, %s, %s, %s)
                         ON CONFLICT (student_id, learning_area_id, cycle_name) DO UPDATE SET raw_score = EXCLUDED.raw_score;
-                    """, (sid, learning_area_id, cycle_name, combined_percentage))
+                    """, (sid, learning_area_id, cycle_name, percentage))
                 conn.commit()
 
         if skipped_entries:
             logger.warning(f"Bulk paper-score save for school {school_id} skipped {skipped_entries} invalid/mismatched entries.")
 
-        saved_count = len([1 for m in student_papers.values() if m.get("paper1") is not None and m.get("paper2") is not None]) - skipped_entries
+        saved_count = len([1 for m in student_papers.values() if m.get("paper1") is not None or m.get("paper2") is not None]) - skipped_entries
 
         redirect_params = urllib.parse.urlencode({
             "grade_name": form_data.get("grade_name", ""),
