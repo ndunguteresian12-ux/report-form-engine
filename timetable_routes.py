@@ -2458,31 +2458,31 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
     period cell (or None/'' for a free slot) — or a (html, bg_color_hex)
     tuple if the cell should be color-coded (e.g. by subject)."""
     header_cells = "".join(
-        f"<th style='padding:4px 6px;{'background:#eef2f7;' if not p['is_teaching_period'] else ''}'>{esc(p['short_label'] or p['label'])}</th>"
+        f"<th style='padding:8px 10px;font-size:13px;{'background:#eef2f7;' if not p['is_teaching_period'] else ''}'>{esc(p['short_label'] or p['label'])}</th>"
         for p in periods
     )
     time_cells = "".join(
-        f"<th style='font-weight:normal;font-size:9px;color:#64748b;'>{esc(p['start_time'] or '')}-{esc(p['end_time'] or '')}</th>"
+        f"<th style='font-weight:normal;font-size:11px;color:#64748b;padding-bottom:6px;'>{esc(p['start_time'] or '')}-{esc(p['end_time'] or '')}</th>"
         for p in periods
     )
 
     body_rows = ""
     for day_i, day in enumerate(days):
-        row = f"<td style='padding:6px 8px;font-weight:bold;white-space:nowrap;border:1px solid #cbd5e1;'>{esc(day[:2].upper())}</td>"
+        row = f"<td style='padding:12px 14px;font-weight:bold;font-size:14px;white-space:nowrap;border:1px solid #cbd5e1;'>{esc(day[:2].upper())}</td>"
         for p in periods:
             p_type = p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')
             if p_type == 'break':
                 if day_i == 0:
                     row += (
                         f"<td rowspan='{len(days)}' style='border:1px solid #cbd5e1;text-align:center;background:#f1f5f9;'>"
-                        f"<div style='writing-mode:vertical-rl;transform:rotate(180deg);font-size:10px;font-weight:bold;"
+                        f"<div style='writing-mode:vertical-rl;transform:rotate(180deg);font-size:13px;font-weight:bold;"
                         f"color:#475569;white-space:nowrap;margin:0 auto;'>{esc(p['label'])}</div></td>"
                     )
                 continue  # subsequent days: cell already covered by row 1's rowspan
             if p_type == 'prep':
                 row += (
-                    "<td style='padding:4px 6px;text-align:center;border:1px solid #e2e8f0;background:#f5f3ff;'>"
-                    "<span style='font-size:9px;font-weight:bold;color:#6d28d9;'>PREP</span></td>"
+                    "<td style='padding:12px 10px;text-align:center;border:1px solid #e2e8f0;background:#f5f3ff;'>"
+                    "<span style='font-size:12px;font-weight:bold;color:#6d28d9;'>PREP</span></td>"
                 )
                 continue
 
@@ -2494,13 +2494,13 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
             else:
                 content = result
             content = content or "<span style='color:#cbd5e1;'>-</span>"
-            row += f"<td style='padding:4px 6px;text-align:center;border:1px solid #e2e8f0;{cell_bg}'>{content}</td>"
+            row += f"<td style='padding:12px 10px;text-align:center;border:1px solid #e2e8f0;{cell_bg}'>{content}</td>"
         body_rows += f"<tr>{row}</tr>"
 
     return f"""
-    <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:14px;">
+    <table style="width:100%;border-collapse:collapse;font-size:14px;margin-top:18px;">
         <thead>
-            <tr style="background:#f8fafc;"><th style="padding:4px 8px;"></th>{header_cells}</tr>
+            <tr style="background:#f8fafc;"><th style="padding:8px 10px;"></th>{header_cells}</tr>
             <tr style="background:#f8fafc;"><th></th>{time_cells}</tr>
         </thead>
         <tbody>{body_rows}</tbody>
@@ -2568,12 +2568,12 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
             body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; background:#f1f5f9; }}
             @media print {{ .no-print {{ display: none !important; }} body {{ background: white; padding: 0; }} }}
             th {{ background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
-            .print-page {{ max-width: 223mm; margin: 0 auto; background: white; padding: 14mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
+            .print-page {{ max-width: 267mm; margin: 0 auto; background: white; padding: 14mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
             @media print {{ .print-page {{ box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }} }}
         </style>
     </head>
     <body>
-        <div class="no-print" style="text-align:right; margin-bottom:16px; max-width:223mm; margin-left:auto; margin-right:auto;">
+        <div class="no-print" style="text-align:right; margin-bottom:16px; max-width:267mm; margin-left:auto; margin-right:auto;">
             <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
         </div>
         <div class="print-page">
@@ -2672,12 +2672,12 @@ def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
             body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; background:#f1f5f9; }}
             @media print {{ .no-print {{ display: none !important; }} body {{ background: white; padding: 0; }} }}
             th {{ background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
-            .print-page {{ max-width: 223mm; margin: 0 auto; background: white; padding: 14mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
+            .print-page {{ max-width: 267mm; margin: 0 auto; background: white; padding: 14mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
             @media print {{ .print-page {{ box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }} }}
         </style>
     </head>
     <body>
-        <div class="no-print" style="text-align:right; margin-bottom:16px; max-width:223mm; margin-left:auto; margin-right:auto;">
+        <div class="no-print" style="text-align:right; margin-bottom:16px; max-width:267mm; margin-left:auto; margin-right:auto;">
             <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
         </div>
         <div class="print-page">
@@ -2932,12 +2932,12 @@ def timetable_master_print(school_id: int, request: Request):
             table {{ width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 9px; }}
             th, td {{ border: 1px solid #cbd5e1; }}
             th {{ background:#f8fafc; }}
-            .print-page {{ max-width: 223mm; margin: 0 auto; background: white; padding: 12mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); overflow-x:auto; }}
+            .print-page {{ max-width: 267mm; margin: 0 auto; background: white; padding: 12mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); overflow-x:auto; }}
             @media print {{ .print-page {{ box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }} }}
         </style>
     </head>
     <body>
-        <div class="no-print" style="text-align:right; margin-bottom:12px; max-width:223mm; margin-left:auto; margin-right:auto;">
+        <div class="no-print" style="text-align:right; margin-bottom:12px; max-width:267mm; margin-left:auto; margin-right:auto;">
             <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
         </div>
         <div class="print-page">
