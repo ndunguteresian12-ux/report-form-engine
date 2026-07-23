@@ -1383,6 +1383,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <span class="bg-gradient-to-r from-amber-500 to-amber-600 text-white px-3 py-2 rounded-xl shadow-xs">💰 KSh {float(school['wallet_balance']):,.2f}</span>
                 <span class="bg-gradient-to-r from-indigo-800 to-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 Timetable</a>
+                <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
@@ -2549,6 +2550,116 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
             </thead>
             <tbody>{rows_html or "<tr><td colspan='5' style='padding:20px;text-align:center;color:#94a3b8;'>No subjects configured for this level.</td></tr>"}</tbody>
         </table>
+    </body>
+    </html>
+    """
+
+
+@app.get("/admin/reports/marks-supervision/{school_id}", response_class=HTMLResponse)
+def marks_entry_supervision(school_id: int, request: Request):
+    """Read-only overview for admins: which classes/subjects have marks
+    entered for the currently active cycle, and which are still missing —
+    lets an admin supervise entry progress across the whole school without
+    opening each class's Bulk Entry page individually. Purely a report —
+    it only reads existing data, so it can't affect or risk anything."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings = cur.fetchone()
+            active_cycle = settings['active_cycle'] if settings else "End Term"
+
+            cur.execute("""
+                SELECT c.grade_name, c.education_level, st.stream,
+                       la.id AS subject_id, la.name AS subject_name,
+                       COUNT(DISTINCT st.id) AS total_students,
+                       COUNT(DISTINCT sc.student_id) AS entered_count
+                FROM students st
+                JOIN classes c ON st.class_id = c.id
+                JOIN learning_areas la ON la.education_level = c.education_level
+                LEFT JOIN student_scores sc
+                       ON sc.student_id = st.id AND sc.learning_area_id = la.id AND sc.cycle_name = %s
+                WHERE st.school_id = %s AND (st.status IS NULL OR st.status != 'GRADUATED')
+                GROUP BY c.grade_name, c.education_level, st.stream, la.id, la.name
+                ORDER BY c.education_level, c.grade_name, st.stream;
+            """, (active_cycle, school_id))
+            rows = cur.fetchall()
+
+    # Organize into: education_level -> (grade, stream) -> ordered subject list -> (entered, total)
+    levels = {}
+    for r in rows:
+        level_key = r['education_level']
+        class_key = (r['grade_name'], r['stream'])
+        levels.setdefault(level_key, {}).setdefault(class_key, {})[r['subject_name']] = (r['entered_count'], r['total_students'])
+
+    level_sections_html = ""
+    for level in ["Lower Primary", "Upper Primary", "Junior School"]:
+        if level not in levels:
+            continue
+        class_map = levels[level]
+        # Consistent subject column order, matching how report cards order them.
+        all_subject_names = sorted({name for subj_map in class_map.values() for name in subj_map.keys()})
+        try:
+            all_subject_names = sort_subjects_for_display([{"name": n} for n in all_subject_names], level)
+            all_subject_names = [s["name"] for s in all_subject_names]
+        except Exception:
+            pass  # fall back to alphabetical if the sort helper doesn't like a plain list
+
+        header_cells = "".join(f"<th style='padding:8px 6px;text-align:center;font-size:10.5px;'>{esc(name)}</th>" for name in all_subject_names)
+
+        body_rows = ""
+        for (grade_name, stream), subj_map in sorted(class_map.items()):
+            class_label = grade_name if (not stream or stream == "SINGLE STREAM") else f"{grade_name} — {stream}"
+            cells = ""
+            for name in all_subject_names:
+                entered, total = subj_map.get(name, (0, 0))
+                if total == 0:
+                    cells += "<td style='text-align:center;padding:6px;color:#cbd5e1;'>-</td>"
+                elif entered == total:
+                    cells += f"<td style='text-align:center;padding:6px;background:#f0fdf4;color:#166534;font-weight:bold;font-size:11px;'>✅ {entered}/{total}</td>"
+                elif entered == 0:
+                    cells += f"<td style='text-align:center;padding:6px;background:#fef2f2;color:#991b1b;font-weight:bold;font-size:11px;'>❌ {entered}/{total}</td>"
+                else:
+                    cells += f"<td style='text-align:center;padding:6px;background:#fffbeb;color:#92400e;font-weight:bold;font-size:11px;'>◐ {entered}/{total}</td>"
+            body_rows += f"<tr style='border-bottom:1px solid #f1f5f9;'><td style='padding:8px;font-weight:bold;white-space:nowrap;'>{esc(class_label)}</td>{cells}</tr>"
+
+        level_sections_html += f"""
+        <div class="bg-white rounded-2xl border shadow-xs overflow-hidden mb-6">
+            <div class="px-5 py-3 border-b bg-slate-50/60">
+                <h2 class="text-sm font-bold text-slate-800">{esc(level)}</h2>
+            </div>
+            <div class="overflow-x-auto">
+                <table style="width:100%;border-collapse:collapse;">
+                    <thead><tr style="background:#f8fafc;border-bottom:2px solid #e2e8f0;"><th style="padding:8px;text-align:left;font-size:11px;color:#64748b;">Class</th>{header_cells}</tr></thead>
+                    <tbody>{body_rows}</tbody>
+                </table>
+            </div>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Marks Entry Supervision</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">🔍 Marks Entry Supervision — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">Showing entry status for the currently active cycle: <b>{esc(active_cycle)}</b>. ✅ complete · ◐ partial · ❌ not started.</p>
+            </div>
+            <a href="/admin/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back</a>
+        </header>
+        <div class="p-4 sm:p-8 max-w-6xl mx-auto">
+            {level_sections_html or "<p class='text-slate-400 text-sm italic text-center py-16 bg-white border border-dashed rounded-2xl'>No students registered yet.</p>"}
+        </div>
     </body>
     </html>
     """
