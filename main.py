@@ -441,7 +441,13 @@ POINTS_TO_PLD = {8: "EE1", 7: "EE2", 6: "ME1", 5: "ME2", 4: "AE1", 3: "AE2", 2: 
 # differences (e.g. a trailing period).
 PAPER_BASED_SUBJECTS = {"english", "kiswahili", "integrated science"}
 
-def is_paper_based_subject(subject_name: str) -> bool:
+def is_paper_based_subject(subject_name: str, education_level: str) -> bool:
+    """Paper 1 / Paper 2 assessment is a Junior School thing only — English,
+    Kiswahili, and Integrated Science also exist at Lower/Upper Primary
+    under similar names, so the education_level check is required, not
+    just a name match."""
+    if (education_level or "").strip() != "Junior School":
+        return False
     return (subject_name or "").strip().lower().rstrip(".") in PAPER_BASED_SUBJECTS
 
 def generate_teacher_comment(first_name: str, pld: str) -> str:
@@ -1384,6 +1390,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <span class="bg-gradient-to-r from-indigo-800 to-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 Timetable</a>
                 <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
+                <a href="/admin/school/profile/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🏫 School Profile</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
@@ -3030,7 +3037,7 @@ def educators_bulk_entry_grid(
             
             selected_area_id = learning_area_id or (subjects[0]['id'] if subjects else None)
             selected_subject_name = next((sub['name'] for sub in subjects if sub['id'] == selected_area_id), "")
-            is_paper_mode = is_paper_based_subject(selected_subject_name)
+            is_paper_mode = is_paper_based_subject(selected_subject_name, education_level)
 
             # FIXED: Added explicit JOIN onto classes table to resolve missing 'education_level' column runtime issue
             cur.execute("""
@@ -3648,6 +3655,136 @@ def backend_add_student(
                 raise HTTPException(status_code=400, detail=f"A student with admission number '{admission_number}' already exists in this school. Please use a different admission number.")
 
     return RedirectResponse(url=with_query_param(get_dashboard_url(request, school_id), "student_added", "1"), status_code=303)
+
+
+@app.get("/admin/school/profile/{school_id}", response_class=HTMLResponse)
+def school_profile_view(school_id: int, request: Request, saved: str = None):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            admin_user_id = request.cookies.get("session_user_id")
+            cur.execute("SELECT * FROM users WHERE id = %s AND school_id = %s AND role = 'admin';", (admin_user_id, school_id))
+            admin = cur.fetchone()
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | School Profile</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">🏫 School Profile</h2>
+                <p class="text-xs text-slate-400 mt-1">Edit your school's details and your own administrator account details.</p>
+            </div>
+
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl'>✅ Profile updated successfully.</div>" if saved else ""}
+
+            <form action="/api/v1/school/profile/update/{school_id}" method="post" class="bg-white p-6 rounded-2xl border shadow-xs space-y-5">
+                <div>
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-indigo-700 mb-3">School Details</h3>
+                    <div class="space-y-3">
+                        <div>
+                            <label class="text-xs font-bold text-slate-600 block mb-1">School Name</label>
+                            <input type="text" name="school_name" value="{esc(school['name'])}" class="w-full border p-2.5 rounded-xl text-sm" required>
+                        </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                                <label class="text-xs font-bold text-slate-600 block mb-1">Sub-County</label>
+                                <input type="text" name="sub_county" value="{esc(school['sub_county'])}" class="w-full border p-2.5 rounded-xl text-sm" required>
+                            </div>
+                            <div>
+                                <label class="text-xs font-bold text-slate-600 block mb-1">Physical Address</label>
+                                <input type="text" name="physical_address" value="{esc(school['physical_address'])}" class="w-full border p-2.5 rounded-xl text-sm" required>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="pt-4 border-t">
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-violet-700 mb-3">Administrator Account</h3>
+                    <div class="space-y-3">
+                        <div>
+                            <label class="text-xs font-bold text-slate-600 block mb-1">Full Name</label>
+                            <input type="text" name="admin_full_name" value="{esc(admin['full_name'] or '') if admin else ''}" class="w-full border p-2.5 rounded-xl text-sm" required>
+                        </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                                <label class="text-xs font-bold text-slate-600 block mb-1">Email (used to log in)</label>
+                                <input type="email" name="admin_email" value="{esc(admin['email']) if admin else ''}" class="w-full border p-2.5 rounded-xl text-sm" required>
+                            </div>
+                            <div>
+                                <label class="text-xs font-bold text-slate-600 block mb-1">Phone Number</label>
+                                <input type="text" name="admin_phone_number" value="{esc(admin['phone_number'] or '') if admin else ''}" class="w-full border p-2.5 rounded-xl text-sm">
+                            </div>
+                        </div>
+                        <p class="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2.5">⚠️ Changing your email changes what you log in with — make sure it's correct and that you'll remember it. Your password stays the same; use "Forgot your password?" on the login page if you ever need to reset it.</p>
+                    </div>
+                </div>
+
+                <button type="submit" class="w-full bg-indigo-800 hover:bg-indigo-900 text-white font-bold py-3 rounded-xl text-sm transition">Save Changes</button>
+            </form>
+
+            <a href="/admin/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back to Dashboard</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/api/v1/school/profile/update/{school_id}")
+def update_school_profile(
+    school_id: int,
+    request: Request,
+    school_name: str = Form(...),
+    sub_county: str = Form(...),
+    physical_address: str = Form(...),
+    admin_full_name: str = Form(...),
+    admin_email: str = Form(...),
+    admin_phone_number: str = Form(""),
+):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    school_name = school_name.strip()
+    sub_county = sub_county.strip()
+    physical_address = physical_address.strip()
+    admin_full_name = admin_full_name.strip()
+    admin_email = admin_email.strip().lower()
+    admin_phone_number = admin_phone_number.strip()
+
+    if not school_name or not sub_county or not physical_address:
+        raise HTTPException(status_code=400, detail="School name, sub-county, and address are all required.")
+    if not admin_full_name or not admin_email:
+        raise HTTPException(status_code=400, detail="Your full name and email are required.")
+
+    admin_user_id = request.cookies.get("session_user_id")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE schools SET name = %s, sub_county = %s, physical_address = %s WHERE id = %s;
+            """, (school_name, sub_county, physical_address, school_id))
+
+            try:
+                cur.execute("""
+                    UPDATE users SET full_name = %s, email = %s, phone_number = %s
+                    WHERE id = %s AND school_id = %s AND role = 'admin';
+                """, (admin_full_name, admin_email, admin_phone_number, admin_user_id, school_id))
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                raise HTTPException(status_code=400, detail=f"Another account is already using the email '{admin_email}'. Please use a different email.")
+
+    return RedirectResponse(url=f"/admin/school/profile/{school_id}?saved=1", status_code=303)
 
 
 @app.get("/admin/student/edit/{school_id}/{student_id}", response_class=HTMLResponse)
