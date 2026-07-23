@@ -363,6 +363,33 @@ ALL_POSSIBLE_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Sa
 # Lower Primary's shorter 35-minute lessons vs Junior School's 40-minute ones.
 EDUCATION_LEVELS = ["Lower Primary", "Upper Primary", "Junior School"]
 
+# A curated, print-friendly palette (soft background + readable dark text)
+# for color-coding subjects on printed timetables. Assignment is by a stable
+# hash of the subject name, not Python's built-in hash() (which is
+# randomized per-process and would give different colors on every restart).
+SUBJECT_COLOR_PALETTE = [
+    ("#FEF3C7", "#92400E"),  # amber
+    ("#D1FAE5", "#065F46"),  # emerald
+    ("#FCE7F3", "#9D174D"),  # pink
+    ("#DBEAFE", "#1E40AF"),  # blue
+    ("#FFEDD5", "#9A3412"),  # orange
+    ("#EDE9FE", "#5B21B6"),  # violet
+    ("#CCFBF1", "#115E59"),  # teal
+    ("#FEE2E2", "#991B1B"),  # red
+    ("#E0E7FF", "#3730A3"),  # indigo
+    ("#ECFCCB", "#3F6212"),  # lime
+    ("#CFFAFE", "#155E75"),  # cyan
+    ("#FFE4E6", "#9F1239"),  # rose
+]
+
+def get_subject_color(name: str):
+    """Returns (background_hex, text_hex) for a subject/activity name,
+    consistent across every report and every server restart."""
+    if not name:
+        return ("#F1F5F9", "#475569")
+    stable_index = sum(ord(c) for c in name.strip().lower()) % len(SUBJECT_COLOR_PALETTE)
+    return SUBJECT_COLOR_PALETTE[stable_index]
+
 
 def get_school_days(cur, school_id: int):
     """Returns this school's configured list of teaching days (e.g. Mon-Fri
@@ -1901,6 +1928,8 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
             else:
                 current_value = ""
             teacher_label = (slot['full_name'] or slot['email']) if slot and (slot['full_name'] or slot['email']) else None
+            slot_name = (slot['academic_name'] or slot['custom_name'] or slot['activity_name']) if slot else None
+            cell_bg = f"background:{get_subject_color(slot_name)[0]};" if slot_name else ""
             options = f"""<option value=''>— Free —</option>
                 <optgroup label="Academic Subjects">{subject_optgroup}</optgroup>
                 {"<optgroup label='Custom Subjects'>" + custom_optgroup + "</optgroup>" if custom_optgroup else ""}
@@ -1909,7 +1938,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
             # Mark the currently-selected option, whichever group it's in.
             options = options.replace(f"value='{current_value}'", f"value='{current_value}' selected", 1) if current_value else options
             row_cells += f"""
-            <td class="p-1.5 align-top">
+            <td class="p-1.5 align-top" style="{cell_bg}">
                 <form action="/api/v1/timetable/slot/update/{school_id}" method="post" class="space-y-1">
                     <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                     <input type="hidden" name="education_level" value="{esc(education_level)}">
@@ -1945,6 +1974,12 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                 <p class="text-xs text-slate-400">{esc(school['name'] if school else '')} — {esc(education_level)}</p>
             </div>
             <div class="flex flex-wrap gap-2">
+                <form action="/api/v1/timetable/new/{school_id}" method="post" onsubmit="return confirm('Start a brand-new BLANK timetable for {esc(section_label)}? This clears every period currently scheduled — you\\'ll build it up from scratch by hand. This cannot be undone.');">
+                    <input type="hidden" name="grade_name" value="{esc(grade_name)}">
+                    <input type="hidden" name="education_level" value="{esc(education_level)}">
+                    <input type="hidden" name="stream" value="{esc(stream)}">
+                    <button type="submit" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">＋ New</button>
+                </form>
                 <form action="/api/v1/timetable/generate/{school_id}" method="post" onsubmit="return confirm('Generate a fresh draft timetable for {esc(section_label)}? This replaces any existing entries for this class.');">
                     <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                     <input type="hidden" name="education_level" value="{esc(education_level)}">
@@ -2221,6 +2256,29 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
     return RedirectResponse(url=f"/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}", status_code=303)
 
 
+@router.post("/api/v1/timetable/new/{school_id}")
+def create_blank_timetable(school_id: int, request: Request, grade_name: str = Form(...), education_level: str = Form(...), stream: str = Form(...)):
+    """Wipes this section's timetable to a completely blank slate — every
+    period free — as a starting point for building one by hand, entirely
+    separate from Generate Draft (which auto-fills subjects)."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM timetable_slots WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;",
+                (school_id, grade_name, education_level, stream)
+            )
+            conn.commit()
+
+    encoded_grade = urllib.parse.quote(grade_name)
+    encoded_level = urllib.parse.quote(education_level)
+    encoded_stream = urllib.parse.quote(stream)
+    return RedirectResponse(url=f"/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}", status_code=303)
+
+
 @router.post("/api/v1/timetable/slot/update/{school_id}")
 def update_timetable_slot(
     school_id: int,
@@ -2397,7 +2455,8 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
     still take up a column per day (unlike breaks), but are never eligible
     to be assigned a subject; cell_lookup_fn is never even consulted for
     them. cell_lookup_fn(day, period) returns the inner HTML for a teaching-
-    period cell, or None/'' for a free slot."""
+    period cell (or None/'' for a free slot) — or a (html, bg_color_hex)
+    tuple if the cell should be color-coded (e.g. by subject)."""
     header_cells = "".join(
         f"<th style='padding:4px 6px;{'background:#eef2f7;' if not p['is_teaching_period'] else ''}'>{esc(p['short_label'] or p['label'])}</th>"
         for p in periods
@@ -2426,8 +2485,16 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
                     "<span style='font-size:9px;font-weight:bold;color:#6d28d9;'>PREP</span></td>"
                 )
                 continue
-            content = cell_lookup_fn(day, p) or "<span style='color:#cbd5e1;'>-</span>"
-            row += f"<td style='padding:4px 6px;text-align:center;border:1px solid #e2e8f0;'>{content}</td>"
+
+            result = cell_lookup_fn(day, p)
+            cell_bg = ""
+            if isinstance(result, tuple):
+                content, bg_color = result
+                cell_bg = f"background:{bg_color};" if bg_color else ""
+            else:
+                content = result
+            content = content or "<span style='color:#cbd5e1;'>-</span>"
+            row += f"<td style='padding:4px 6px;text-align:center;border:1px solid #e2e8f0;{cell_bg}'>{content}</td>"
         body_rows += f"<tr>{row}</tr>"
 
     return f"""
@@ -2481,7 +2548,9 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
             return None
         teacher_short = (slot['full_name'] or slot['email'] or "").split(" ")[-1] if (slot['full_name'] or slot['email']) else ""
         teacher_line = f"<br><span style='font-size:9px;color:#64748b;'>{esc(teacher_short)}</span>" if teacher_short else ""
-        return f"<b>{esc(abbreviate_subject(slot['subject_name']))}</b>{teacher_line}"
+        bg_color, text_color = get_subject_color(slot['subject_name'])
+        content = f"<b style='color:{text_color};'>{esc(abbreviate_subject(slot['subject_name']))}</b>{teacher_line}"
+        return (content, bg_color)
 
     grid_html = _build_timetable_grid_html(days, periods, _class_cell)
 
@@ -2571,7 +2640,9 @@ def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
                     if not slot or not slot['subject_name']:
                         return None
                     class_label = _section_label(slot['grade_name'], slot['stream'])
-                    return f"<b>{esc(abbreviate_subject(slot['subject_name']))}</b><br><span style='font-size:9px;color:#64748b;'>{esc(class_label)}</span>"
+                    bg_color, text_color = get_subject_color(slot['subject_name'])
+                    content = f"<b style='color:{text_color};'>{esc(abbreviate_subject(slot['subject_name']))}</b><br><span style='font-size:9px;color:#64748b;'>{esc(class_label)}</span>"
+                    return (content, bg_color)
 
                 grid = _build_timetable_grid_html(days, level_periods, _teacher_cell)
                 if not level_periods:
@@ -2716,7 +2787,8 @@ def timetable_master_view(school_id: int, request: Request):
                         if entry and entry['subject_name']:
                             label = abbreviate_subject(entry['subject_name'])
                             teacher_title = f" title='{esc(entry['teacher_name'])}'" if entry.get('teacher_name') else ""
-                            row_cells += f"<td{teacher_title} style='{border}text-align:center;font-size:10px;padding:4px 2px;border-bottom:1px solid #f1f5f9;'>{esc(label)}</td>"
+                            bg_color, text_color = get_subject_color(entry['subject_name'])
+                            row_cells += f"<td{teacher_title} style='{border}text-align:center;font-size:10px;padding:4px 2px;border-bottom:1px solid #f1f5f9;background:{bg_color};color:{text_color};font-weight:bold;'>{esc(label)}</td>"
                         else:
                             row_cells += f"<td style='{border}background:#f8fafc;border-bottom:1px solid #f1f5f9;'></td>"
                 body_rows += f"""
@@ -2828,7 +2900,11 @@ def timetable_master_print(school_id: int, request: Request):
                 for p in periods:
                     entry = slot_map.get((sec['grade_name'], sec['education_level'], sec['stream'], day, p['id']))
                     label = abbreviate_subject(entry['subject_name']) if (entry and entry['subject_name']) else ""
-                    row_cells += f"<td style='text-align:center;padding:3px;'>{esc(label)}</td>"
+                    cell_style = "text-align:center;padding:3px;"
+                    if entry and entry['subject_name']:
+                        bg_color, text_color = get_subject_color(entry['subject_name'])
+                        cell_style += f"background:{bg_color};color:{text_color};font-weight:bold;"
+                    row_cells += f"<td style='{cell_style}'>{esc(label)}</td>"
             body_rows += f"<tr><td style='font-weight:bold;padding:4px 6px;white-space:nowrap;'>{esc(_section_label(sec['grade_name'], sec['stream']))}</td>{row_cells}</tr>"
 
         level_tables.append(f"""
