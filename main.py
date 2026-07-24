@@ -134,6 +134,25 @@ def send_sms(phone_number: str, message: str) -> bool:
 
 
 app = FastAPI(title="Kenyan CBE Multi-Tenant Enterprise Engine")
+
+# --- Security headers ---
+# Adds standard hardening headers to every response. This only *adds*
+# headers — it never blocks, rewrites, or rejects a request — so it can't
+# break any existing page, form, or session for schools already live.
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    # Only sent when the request actually arrived over HTTPS — Render
+    # terminates TLS in front of the app, so this is safe in production and
+    # simply won't fire during local HTTP development.
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
 # --- Configuration Constants ---
 ALLOWED_LOGO_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
 MAX_LOGO_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
@@ -763,8 +782,8 @@ def reset_password_submit(email: str = Form(...), reset_code: str = Form(...), n
     email = email.strip().lower()
     reset_code = reset_code.strip()
 
-    if len(new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -955,8 +974,8 @@ async def register_new_tenant_pipeline(
         raise HTTPException(status_code=400, detail="School name, sub-county, and address are all required.")
     if not admin_full_name:
         raise HTTPException(status_code=400, detail="Administrator full name is required.")
-    if len(admin_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
+    if len(admin_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
     if not accept_terms:
         raise HTTPException(status_code=400, detail="You must agree to the Terms and Conditions to register.")
 
@@ -1566,7 +1585,10 @@ def superadmin_dashboard(request: Request):
             cur.execute("""
                 SELECT sc.*,
                     (SELECT COUNT(*) FROM students st WHERE st.school_id = sc.id AND (st.status IS NULL OR st.status != 'GRADUATED')) AS student_count,
-                    (SELECT COUNT(*) FROM users u WHERE u.school_id = sc.id AND u.role = 'staff') AS staff_count
+                    (SELECT COUNT(*) FROM users u WHERE u.school_id = sc.id AND u.role = 'staff') AS staff_count,
+                    (SELECT u.full_name FROM users u WHERE u.school_id = sc.id AND u.role = 'admin' ORDER BY u.id ASC LIMIT 1) AS admin_full_name,
+                    (SELECT u.email FROM users u WHERE u.school_id = sc.id AND u.role = 'admin' ORDER BY u.id ASC LIMIT 1) AS admin_email,
+                    (SELECT u.phone_number FROM users u WHERE u.school_id = sc.id AND u.role = 'admin' ORDER BY u.id ASC LIMIT 1) AS admin_phone
                 FROM schools sc
                 ORDER BY
                     CASE sc.status WHEN 'pending' THEN 0 WHEN 'active' THEN 1 ELSE 2 END,
@@ -1623,6 +1645,11 @@ def superadmin_dashboard(request: Request):
                 <p class="text-xs text-slate-400">{esc(s['sub_county'])}</p>
             </td>
             <td class="p-4 text-center"><span class="text-xs font-bold px-2.5 py-1 rounded-full border {style_class}">{status_label}</span></td>
+            <td class="p-4">
+                <p class="text-xs font-semibold text-slate-700">{esc(s['admin_full_name'] or '—')}</p>
+                {f"<p class='text-xs text-slate-500'><a href='tel:{esc(s['admin_phone'])}' class='hover:underline'>📞 {esc(s['admin_phone'])}</a></p>" if s['admin_phone'] else "<p class='text-xs text-slate-300 italic'>No phone on file</p>"}
+                {f"<p class='text-[11px] text-slate-400'><a href='mailto:{esc(s['admin_email'])}' class='hover:underline'>{esc(s['admin_email'])}</a></p>" if s['admin_email'] else ""}
+            </td>
             <td class="p-4 text-center font-semibold">{s['student_count']}</td>
             <td class="p-4 text-center font-semibold">{s['staff_count']}</td>
             <td class="p-4 text-center">KSh {float(s['wallet_balance']):,.2f}</td>
@@ -1677,6 +1704,7 @@ def superadmin_dashboard(request: Request):
                             <tr class="bg-slate-50 text-slate-500 text-xs font-semibold border-b border-slate-100">
                                 <th class="p-4">School</th>
                                 <th class="p-4 text-center">Status</th>
+                                <th class="p-4">Admin Contact</th>
                                 <th class="p-4 text-center">Students</th>
                                 <th class="p-4 text-center">Staff</th>
                                 <th class="p-4 text-center">Wallet</th>
@@ -1685,7 +1713,7 @@ def superadmin_dashboard(request: Request):
                             </tr>
                         </thead>
                         <tbody>
-                            {rows_html or "<tr><td colspan='7' class='text-center p-8 text-slate-400 text-sm italic'>No schools registered yet.</td></tr>"}
+                            {rows_html or "<tr><td colspan='8' class='text-center p-8 text-slate-400 text-sm italic'>No schools registered yet.</td></tr>"}
                         </tbody>
                     </table>
                 </div>
@@ -3318,9 +3346,23 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                 row_vpad, row_font, desc_font = "8px", "11px", "10.5px"
 
             report_cards_html = []
+
+            # Fetch every student's scores in this batch in a single query,
+            # instead of one query per student — for a class of 35, that's
+            # 1 database round-trip instead of 35 held sequentially on the
+            # same connection, which matters a lot once several staff are
+            # printing report cards for different classes at the same time.
+            all_scores_by_student = {}
+            if student_ids_in_batch:
+                cur.execute(
+                    "SELECT student_id, learning_area_id, cycle_name, raw_score FROM student_scores WHERE student_id = ANY(%s);",
+                    (student_ids_in_batch,)
+                )
+                for sc in cur.fetchall():
+                    all_scores_by_student.setdefault(sc['student_id'], []).append(sc)
+
             for s in students:
-                cur.execute("SELECT learning_area_id, cycle_name, raw_score FROM student_scores WHERE student_id = %s;", (s['student_id'],))
-                scores = cur.fetchall()
+                scores = all_scores_by_student.get(s['student_id'], [])
                 
                 score_map = {}
                 for sc in scores:
@@ -3938,8 +3980,8 @@ def add_staff_node(
         raise HTTPException(status_code=400, detail="Staff TSC number is required.")
     if not phone_number:
         raise HTTPException(status_code=400, detail="Staff phone number is required.")
-    if len(password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long.")
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
 
     safe_staff_password = password[:72]
     hashed_password = get_password_hash(safe_staff_password)
