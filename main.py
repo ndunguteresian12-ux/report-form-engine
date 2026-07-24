@@ -297,6 +297,7 @@ def bootstrap_database_schema():
                     knec_lan VARCHAR(100) DEFAULT 'N/A',
                     UNIQUE(school_id, admission_number)
                 );
+                ALTER TABLE students ADD COLUMN IF NOT EXISTS middle_name VARCHAR(100);
 
                 CREATE TABLE IF NOT EXISTS learning_areas (
                     id SERIAL PRIMARY KEY,
@@ -2825,6 +2826,18 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
 # --- GET View Routes for Administration Subsystems ---
 @app.get("/admin/student/new/{school_id}", response_class=HTMLResponse)
 def add_student_view(school_id: int, request: Request):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT is_single_stream FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings_row = cur.fetchone()
+            is_single_stream = bool(settings_row['is_single_stream']) if settings_row else False
+
+    stream_field_html = (
+        "<div class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500'>ℹ️ This school is in <b>Single Stream Mode</b> — no stream assignment is needed.</div>"
+        if is_single_stream else
+        "<div><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" name=\"stream\" placeholder=\"e.g. N\" class=\"w-full border p-2.5 rounded mt-1 text-base\" required></div>"
+    )
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -2833,9 +2846,10 @@ def add_student_view(school_id: int, request: Request):
         <div class="bg-white p-6 sm:p-8 rounded-2xl border shadow-md w-full max-w-lg">
             <h2 class="text-xl font-bold mb-4 text-slate-800">Add New Learner Profile</h2>
             <form action="/api/v1/students/add/{school_id}" method="post" class="space-y-4">
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div><label class="text-xs font-bold text-slate-600">First Name</label><input type="text" name="first_name" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
-                    <div><label class="text-xs font-bold text-slate-600">Last Name</label><input type="text" name="last_name" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
+                    <div><label class="text-xs font-bold text-slate-600">Middle Name</label><input type="text" name="middle_name" class="w-full border p-2.5 rounded mt-1 text-base"></div>
+                    <div><label class="text-xs font-bold text-slate-600">Surname</label><input type="text" name="last_name" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
                 </div>
                 <div><label class="text-xs font-bold text-slate-600">Admission Number</label><input type="text" inputmode="numeric" name="admission_number" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -2854,7 +2868,7 @@ def add_student_view(school_id: int, request: Request):
                             <option value="9">Grade 9</option>
                         </select>
                     </div>
-                    <div><label class="text-xs font-bold text-slate-600">Class Stream Assignment</label><input type="text" name="stream" placeholder="e.g. N" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
+                    {stream_field_html}
                 </div>
                 <div class="flex flex-col sm:flex-row gap-3 pt-2">
                     <button type="submit" class="bg-emerald-700 text-white font-bold py-3 px-4 rounded hover:bg-emerald-800 transition text-center">Save Student</button>
@@ -3609,7 +3623,8 @@ def update_settings_endpoint(
     active_cycle: str = Form(...), 
     opening_date: str = Form(...), 
     closing_date: str = Form(...), 
-    theme_color: str = Form(...)
+    theme_color: str = Form(...),
+    is_single_stream: str = Form(None),
 ):
     auth_error = require_admin_session(request, school_id)
     if auth_error:
@@ -3628,18 +3643,22 @@ def update_settings_endpoint(
     if theme_color not in allowed_themes:
         theme_color = "emerald"
 
+    # A checkbox only appears in form data when it's checked — its absence
+    # here correctly means "unchecked", not "leave unchanged".
+    is_single_stream_bool = bool(is_single_stream)
+
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            # FIXED: Exactly 5 columns now map directly to 5 variables in the tuple
             cur.execute("""
-                INSERT INTO school_settings (school_id, active_term, active_cycle, opening_date, closing_date)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO school_settings (school_id, active_term, active_cycle, opening_date, closing_date, is_single_stream)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (school_id) DO UPDATE 
                 SET active_term = EXCLUDED.active_term, 
                     active_cycle = EXCLUDED.active_cycle, 
                     opening_date = EXCLUDED.opening_date, 
-                    closing_date = EXCLUDED.closing_date;
-            """, (school_id, active_term, active_cycle, opening_date, closing_date))
+                    closing_date = EXCLUDED.closing_date,
+                    is_single_stream = EXCLUDED.is_single_stream;
+            """, (school_id, active_term, active_cycle, opening_date, closing_date, is_single_stream_bool))
             
             # Sync the modern Tailwind color layout across the institution node
             cur.execute("UPDATE schools SET theme_color = %s WHERE id = %s;", (theme_color, school_id))
@@ -3652,6 +3671,7 @@ def backend_add_student(
     school_id: int, 
     request: Request,
     first_name: str = Form(...), 
+    middle_name: str = Form(""),
     last_name: str = Form(...), 
     admission_number: str = Form(...), 
     class_id: int = Form(...), 
@@ -3671,9 +3691,10 @@ def backend_add_student(
 
     admission_number = admission_number.strip().upper()
     first_name = first_name.strip()
+    middle_name = middle_name.strip() or None
     last_name = last_name.strip()
     if not admission_number or not first_name or not last_name:
-        raise HTTPException(status_code=400, detail="First name, last name, and admission number are required.")
+        raise HTTPException(status_code=400, detail="First name, surname, and admission number are required.")
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -3688,9 +3709,9 @@ def backend_add_student(
 
             try:
                 cur.execute("""
-                    INSERT INTO students (school_id, admission_number, first_name, last_name, class_id, stream, education_level, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'ACTIVE');
-                """, (school_id, admission_number, first_name, last_name, class_id, processed_stream, education_level))
+                    INSERT INTO students (school_id, admission_number, first_name, middle_name, last_name, class_id, stream, education_level, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE');
+                """, (school_id, admission_number, first_name, middle_name, last_name, class_id, processed_stream, education_level))
                 conn.commit()
             except psycopg2.errors.UniqueViolation:
                 conn.rollback()
@@ -3845,11 +3866,21 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
             cur.execute("SELECT id, grade_name FROM classes ORDER BY id ASC;")
             classes = cur.fetchall()
 
+            cur.execute("SELECT is_single_stream FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings_row = cur.fetchone()
+            is_single_stream = bool(settings_row['is_single_stream']) if settings_row else False
+
     grade_options = "".join(
         f"<option value='{c['id']}' {'selected' if c['id'] == student['class_id'] else ''}>{esc(c['grade_name'])}</option>"
         for c in classes
     )
     display_stream = "" if student['stream'] == "SINGLE STREAM" else student['stream']
+
+    stream_field_html = (
+        "<div class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500'>ℹ️ This school is in <b>Single Stream Mode</b> — no stream assignment is needed.</div>"
+        if is_single_stream else
+        f"<div><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" name=\"stream\" value=\"{esc(display_stream)}\" placeholder=\"e.g. N\" class=\"w-full border p-2.5 rounded mt-1 text-base\"></div>"
+    )
 
     return f"""
     <!DOCTYPE html>
@@ -3859,9 +3890,10 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
         <div class="bg-white p-6 sm:p-8 rounded-2xl border shadow-md w-full max-w-lg">
             <h2 class="text-xl font-bold mb-4 text-slate-800">Edit Learner Profile</h2>
             <form action="/api/v1/students/edit/{school_id}/{student_id}" method="post" class="space-y-4">
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div><label class="text-xs font-bold text-slate-600">First Name</label><input type="text" name="first_name" value="{esc(student['first_name'])}" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
-                    <div><label class="text-xs font-bold text-slate-600">Last Name</label><input type="text" name="last_name" value="{esc(student['last_name'])}" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
+                    <div><label class="text-xs font-bold text-slate-600">Middle Name</label><input type="text" name="middle_name" value="{esc(student.get('middle_name') or '')}" class="w-full border p-2.5 rounded mt-1 text-base"></div>
+                    <div><label class="text-xs font-bold text-slate-600">Surname</label><input type="text" name="last_name" value="{esc(student['last_name'])}" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
                 </div>
                 <div><label class="text-xs font-bold text-slate-600">Admission Number</label><input type="text" inputmode="numeric" name="admission_number" value="{esc(student['admission_number'])}" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -3869,7 +3901,7 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
                         <label class="text-xs font-bold text-slate-600">Education Track Segment</label>
                         <select name="class_id" class="w-full border p-2.5 rounded mt-1 bg-white text-sm font-medium text-slate-800" required>{grade_options}</select>
                     </div>
-                    <div><label class="text-xs font-bold text-slate-600">Class Stream Assignment</label><input type="text" name="stream" value="{esc(display_stream)}" placeholder="e.g. N" class="w-full border p-2.5 rounded mt-1 text-base"></div>
+                    {stream_field_html}
                 </div>
                 <div class="flex flex-col sm:flex-row gap-3 pt-2">
                     <button type="submit" class="bg-emerald-700 text-white font-bold py-3 px-4 rounded hover:bg-emerald-800 transition text-center">Save Changes</button>
@@ -3891,6 +3923,7 @@ def backend_edit_student(
     student_id: int,
     request: Request,
     first_name: str = Form(...),
+    middle_name: str = Form(""),
     last_name: str = Form(...),
     admission_number: str = Form(...),
     class_id: int = Form(...),
@@ -3910,9 +3943,10 @@ def backend_edit_student(
 
     admission_number = admission_number.strip().upper()
     first_name = first_name.strip()
+    middle_name = middle_name.strip() or None
     last_name = last_name.strip()
     if not admission_number or not first_name or not last_name:
-        raise HTTPException(status_code=400, detail="First name, last name, and admission number are required.")
+        raise HTTPException(status_code=400, detail="First name, surname, and admission number are required.")
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -3929,10 +3963,10 @@ def backend_edit_student(
             try:
                 cur.execute("""
                     UPDATE students
-                    SET first_name = %s, last_name = %s, admission_number = %s,
+                    SET first_name = %s, middle_name = %s, last_name = %s, admission_number = %s,
                         class_id = %s, stream = %s, education_level = %s
                     WHERE id = %s AND school_id = %s;
-                """, (first_name, last_name, admission_number, class_id, processed_stream, education_level, student_id, school_id))
+                """, (first_name, middle_name, last_name, admission_number, class_id, processed_stream, education_level, student_id, school_id))
                 conn.commit()
             except psycopg2.errors.UniqueViolation:
                 conn.rollback()
