@@ -30,6 +30,7 @@ from shared import (
     get_dashboard_url,
     sort_subjects_for_display,
     abbreviate_subject,
+    full_student_name,
 )
 
 router = APIRouter()
@@ -1227,7 +1228,7 @@ def co_curricular_roster(school_id: int, activity_id: int, request: Request, sea
                 raise HTTPException(status_code=404, detail="Activity not found.")
 
             cur.execute("""
-                SELECT s.id, s.first_name, s.last_name, s.admission_number
+                SELECT s.id, s.first_name, s.middle_name, s.last_name, s.admission_number
                 FROM co_curricular_participants p
                 JOIN students s ON p.student_id = s.id
                 WHERE p.activity_id = %s
@@ -1240,16 +1241,16 @@ def co_curricular_roster(school_id: int, activity_id: int, request: Request, sea
             candidates = []
             if search:
                 cur.execute("""
-                    SELECT id, first_name, last_name, admission_number FROM students
+                    SELECT id, first_name, middle_name, last_name, admission_number FROM students
                     WHERE school_id = %s AND (status IS NULL OR status != 'GRADUATED')
-                      AND (LOWER(first_name || ' ' || last_name) LIKE LOWER(%s) OR admission_number LIKE %s)
+                      AND (LOWER(first_name || ' ' || COALESCE(middle_name, '') || ' ' || last_name) LIKE LOWER(%s) OR admission_number LIKE %s)
                     ORDER BY first_name ASC LIMIT 20;
                 """, (school_id, f"%{search}%", f"%{search}%"))
                 candidates = [s for s in cur.fetchall() if s['id'] not in enrolled_ids]
 
     enrolled_html = "".join(f"""
         <div class="flex items-center justify-between py-2 border-b last:border-0">
-            <span class="text-sm text-slate-700">{esc(s['first_name'])} {esc(s['last_name'])} <span class="text-slate-400 font-mono text-xs">#{esc(s['admission_number'])}</span></span>
+            <span class="text-sm text-slate-700">{esc(full_student_name(s))} <span class="text-slate-400 font-mono text-xs">#{esc(s['admission_number'])}</span></span>
             <form action="/api/v1/timetable/co-curricular/roster/remove/{school_id}/{activity_id}/{s['id']}" method="post">
                 <button type="submit" class="text-rose-600 hover:text-rose-800 text-xs font-bold">Remove</button>
             </form>
@@ -1258,7 +1259,7 @@ def co_curricular_roster(school_id: int, activity_id: int, request: Request, sea
 
     candidates_html = "".join(f"""
         <div class="flex items-center justify-between py-2 border-b last:border-0">
-            <span class="text-sm text-slate-700">{esc(s['first_name'])} {esc(s['last_name'])} <span class="text-slate-400 font-mono text-xs">#{esc(s['admission_number'])}</span></span>
+            <span class="text-sm text-slate-700">{esc(full_student_name(s))} <span class="text-slate-400 font-mono text-xs">#{esc(s['admission_number'])}</span></span>
             <form action="/api/v1/timetable/co-curricular/roster/add/{school_id}/{activity_id}" method="post">
                 <input type="hidden" name="student_id" value="{s['id']}">
                 <input type="hidden" name="search" value="{esc(search)}">

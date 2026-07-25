@@ -201,6 +201,12 @@ SUBJECT_ABBREVIATIONS = {
     'agriculture': 'AGRI', 'pretechnical studies.': 'PRE TECH', 'pretechnical studies': 'PRE TECH',
 }
 
+def full_student_name(student_row) -> str:
+    """Builds 'First Middle Surname' from a student row, correctly handling
+    students with no middle name on file (no double-space, no 'None')."""
+    parts = [student_row.get('first_name'), student_row.get('middle_name'), student_row.get('last_name')]
+    return " ".join(p for p in parts if p)
+
 def sort_subjects_for_display(subjects, education_level):
     """Orders a list of {'id', 'name'} learning-area rows using the canonical
     subject sequence for that education level, so report columns read in a

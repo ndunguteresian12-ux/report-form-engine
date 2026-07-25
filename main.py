@@ -190,6 +190,7 @@ from shared import (
     sort_subjects_for_display,
     abbreviate_subject,
     with_query_param,
+    full_student_name,
 )
 
 
@@ -2211,7 +2212,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             # Whole grade, every stream combined — matches how this report is
             # actually used at the school (one merit list per grade, not per stream).
             cur.execute("""
-                SELECT s.id, s.admission_number, s.first_name, s.last_name, s.stream
+                SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name, s.stream
                 FROM students s
                 JOIN classes c ON s.class_id = c.id
                 WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
@@ -2336,7 +2337,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             <tr>
                 <td style='text-align:center;'>{i}</td>
                 <td style='font-family:monospace;'>{esc(s['admission_number'])}</td>
-                <td>{esc(s['first_name'])} {esc(s['last_name'])}</td>
+                <td>{esc(full_student_name(s))}</td>
                 <td style='text-align:center;'>{esc(s['stream'])}</td>
                 <td style='text-align:center;font-weight:bold;'>{stream_positions.get(s['id'], '-')}</td>
                 <td style='text-align:center;font-weight:bold;'>{overall_positions.get(s['id'], '-')}</td>
@@ -2454,7 +2455,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
 
             cur.execute("""
-                SELECT s.id, s.admission_number, s.first_name, s.last_name
+                SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name
                 FROM students s
                 JOIN classes c ON s.class_id = c.id
                 WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s AND s.stream = %s
@@ -2508,7 +2509,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
         <tr>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{i}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;'>{esc(r['student']['admission_number'])}</td>
-            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{esc(r['student']['first_name'])} {esc(r['student']['last_name'])}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{esc(full_student_name(r['student']))}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['total_marks']:.0f}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{r['avg_marks']:.1f}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['total_points']}</td>
@@ -2577,7 +2578,7 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
             cur.execute("""
-                SELECT sc.learning_area_id, sc.raw_score, s.id AS student_id, s.admission_number, s.first_name, s.last_name
+                SELECT sc.learning_area_id, sc.raw_score, s.id AS student_id, s.admission_number, s.first_name, s.middle_name, s.last_name
                 FROM student_scores sc
                 JOIN students s ON sc.student_id = s.id
                 JOIN classes c ON s.class_id = c.id
@@ -2610,7 +2611,7 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
             rows_html += f"""
             <tr>
                 <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:bold;'>{esc(sub['name'])}</td>
-                <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{esc(top_student['first_name'])} {esc(top_student['last_name'])}</td>
+                <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{esc(full_student_name(top_student))}</td>
                 <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;text-align:center;'>{esc(top_student['admission_number'])}</td>
                 <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{best['score']:.0f}%</td>
                 <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{pld}</td>
@@ -3081,7 +3082,7 @@ def manage_individual_scores_view(school_id: int, student_id: int, request: Requ
         <div class="bg-white p-6 rounded-2xl border shadow-xs flex justify-between items-center">
             <div>
                 <h1 class="text-xl font-black">Score Management Engine Matrix</h1>
-                <p class="text-xs text-slate-500 mt-1">Student context: <strong>{esc(student['first_name'])} {esc(student['last_name'])} ({esc(student['admission_number'])})</strong></p>
+                <p class="text-xs text-slate-500 mt-1">Student context: <strong>{esc(full_student_name(student))} ({esc(student['admission_number'])})</strong></p>
             </div>
             <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 px-4 py-1.5 rounded-lg text-xs font-bold hover:bg-slate-300">Return Deck</a>
         </div>
@@ -3152,7 +3153,7 @@ def educators_bulk_entry_grid(
 
             # FIXED: Added explicit JOIN onto classes table to resolve missing 'education_level' column runtime issue
             cur.execute("""
-                SELECT s.id, s.admission_number, s.first_name, s.last_name 
+                SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name 
                 FROM students s
                 JOIN classes c ON s.class_id = c.id
                 WHERE s.school_id = %s 
@@ -3190,7 +3191,7 @@ def educators_bulk_entry_grid(
 
     student_rows = ""
     for s in students:
-        search_key = f"{s['first_name']} {s['last_name']} {s['admission_number']}".lower()
+        search_key = f"{full_student_name(s)} {s['admission_number']}".lower()
         if is_paper_mode:
             p = paper_map.get(s['id'])
             p1_val = p['paper1_marks'] if (p and p['paper1_marks'] is not None) else ""
@@ -3209,7 +3210,7 @@ def educators_bulk_entry_grid(
         student_rows += f"""
         <div class="student-row flex items-center justify-between gap-3 p-3.5 border-b last:border-0" data-search="{esc(search_key)}">
             <div class="min-w-0">
-                <p class="font-bold text-slate-800 text-sm truncate">{esc(s['first_name'])} {esc(s['last_name'])}</p>
+                <p class="font-bold text-slate-800 text-sm truncate">{esc(full_student_name(s))}</p>
                 <p class="text-xs text-slate-400 font-mono">#{esc(s['admission_number'])}</p>
             </div>
             {input_html}
@@ -3335,6 +3336,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         s.id AS student_id,
                         s.admission_number,
                         s.first_name,
+                        s.middle_name,
                         s.last_name,
                         s.knec_lan,
                         s.stream,
@@ -3359,7 +3361,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                     WHERE s.school_id = %s 
                       AND c.grade_name = %s
                       AND (s.status IS NULL OR s.status != 'GRADUATED')
-                    GROUP BY s.id, s.admission_number, s.first_name, s.last_name, s.knec_lan, s.stream, c.grade_name
+                    GROUP BY s.id, s.admission_number, s.first_name, s.middle_name, s.last_name, s.knec_lan, s.stream, c.grade_name
                 ),
                 cohort_rankings AS (
                     SELECT 
@@ -3542,7 +3544,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         </div>
 
                         <div style="display:grid; grid-template-columns: 1fr 1fr; gap:4px 12px; background:#f8fafc; border:1px solid #cbd5e1; padding:10px; border-radius:6px; font-size:11px; margin-bottom:12px; line-height:1.4;">
-                            <div><b>Learner Name:</b> <span style="font-weight:bold; text-transform:uppercase;">{esc(s['first_name'])} {esc(s['last_name'])}</span></div>
+                            <div><b>Learner Name:</b> <span style="font-weight:bold; text-transform:uppercase;">{esc(full_student_name(s))}</span></div>
                             <div><b>Admission Identifier Number:</b> <span style="font-weight:bold;">{esc(s['admission_number'])}</span></div>
                             <div><b>Education Bracket:</b> {esc(grade_name)} ({esc(education_level)}) — Stream: <b>{esc(stream)}</b></div>
                             <div><b>KNEC Assessment Identifier (LAN):</b> {s['knec_lan'] or 'N/A'}</div>
@@ -3977,7 +3979,7 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
                     <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 text-slate-700 py-3 px-4 rounded hover:bg-slate-300 font-bold transition text-center">Cancel</a>
                 </div>
             </form>
-            <form action="/api/v1/students/delete/{school_id}/{student_id}" method="post" class="mt-4 pt-4 border-t" onsubmit="return confirm('Permanently delete {esc(student['first_name'])} {esc(student['last_name'])}? This also deletes all of their recorded scores. This cannot be undone.');">
+            <form action="/api/v1/students/delete/{school_id}/{student_id}" method="post" class="mt-4 pt-4 border-t" onsubmit="return confirm('Permanently delete {esc(full_student_name(student))}? This also deletes all of their recorded scores. This cannot be undone.');">
                 <button type="submit" class="w-full bg-rose-50 border border-rose-200 text-rose-700 font-bold py-2.5 px-4 rounded-lg hover:bg-rose-100 transition text-sm">🗑 Delete Student Permanently</button>
             </form>
         </div>
