@@ -1231,7 +1231,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     grouped_students = {}
     class_group_order = []
     for s in students:
-        disp_stream = "Single Stream" if (is_single_stream or not s['stream'] or s['stream'].upper() == "SINGLE STREAM") else s['stream']
+        disp_stream = "Single Stream" if (not s['stream'] or s['stream'].upper() == "SINGLE STREAM") else s['stream']
         key = (s['grade_name'], disp_stream, s['education_level'], s['stream'])
         if key not in grouped_students:
             grouped_students[key] = []
@@ -1270,13 +1270,13 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     for (grade_name, disp_stream, education_level, raw_stream) in class_group_order:
         group_students = grouped_students[(grade_name, disp_stream, education_level, raw_stream)]
         is_stream_blank = not raw_stream or raw_stream.strip() == "" or raw_stream.upper() == "SINGLE STREAM"
-        stream_param = "SINGLE STREAM" if (is_single_stream or is_stream_blank) else raw_stream
+        stream_param = "SINGLE STREAM" if is_stream_blank else raw_stream
 
         encoded_grade = urllib.parse.quote(grade_name)
         encoded_stream = urllib.parse.quote(stream_param)
         encoded_level = urllib.parse.quote(education_level)
 
-        title_label = grade_name if (is_single_stream or is_stream_blank) else f"{grade_name} — {esc(disp_stream)}"
+        title_label = grade_name if is_stream_blank else f"{grade_name} — {esc(disp_stream)}"
 
         rows_html = "".join(f"""
             <li class='flex justify-between items-center gap-2 py-1.5 border-b border-slate-50 last:border-0'>
@@ -1345,7 +1345,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     for c in classes:
         is_stream_blank = not c['stream'] or c['stream'].strip() == "" or c['stream'].upper() == "SINGLE STREAM"
         
-        if is_single_stream or is_stream_blank:
+        if is_stream_blank:
             display_title = c['grade_name']
             stream_param = "SINGLE STREAM"
         else:
@@ -1440,7 +1440,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                         <span class="w-2 h-2 rounded-full bg-indigo-600"></span> Classes
                     </h2>
                     <div class="space-y-1 max-h-40 overflow-y-auto pr-1">
-                        {"".join(f"<a href='/staff/bulk-entry/{school_id}?grade_name={urllib.parse.quote(c['grade_name'])}&stream={urllib.parse.quote('SINGLE STREAM' if (is_single_stream or not c['stream'] or c['stream'].strip()=='' or c['stream'].upper()=='SINGLE STREAM') else c['stream'])}&education_level={urllib.parse.quote(c['education_level'])}' class='block text-xs font-semibold text-slate-600 hover:text-indigo-700 hover:bg-indigo-50 rounded-lg px-2.5 py-1.5 transition truncate'>{esc(c['grade_name'] if (is_single_stream or not c['stream'] or c['stream'].strip()=='' or c['stream'].upper()=='SINGLE STREAM') else c['grade_name'] + ' — ' + c['stream'])}</a>" for c in classes) or "<p class='text-slate-400 text-xs italic px-2.5'>No classes yet.</p>"}
+                        {"".join(f"<a href='/staff/bulk-entry/{school_id}?grade_name={urllib.parse.quote(c['grade_name'])}&stream={urllib.parse.quote('SINGLE STREAM' if (not c['stream'] or c['stream'].strip()=='' or c['stream'].upper()=='SINGLE STREAM') else c['stream'])}&education_level={urllib.parse.quote(c['education_level'])}' class='block text-xs font-semibold text-slate-600 hover:text-indigo-700 hover:bg-indigo-50 rounded-lg px-2.5 py-1.5 transition truncate'>{esc(c['grade_name'] if (not c['stream'] or c['stream'].strip()=='' or c['stream'].upper()=='SINGLE STREAM') else c['grade_name'] + ' — ' + c['stream'])}</a>" for c in classes) or "<p class='text-slate-400 text-xs italic px-2.5'>No classes yet.</p>"}
                     </div>
                 </div>
 
@@ -2015,7 +2015,6 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
             classes = cur.fetchall()
 
     st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'is_single_stream': False}
-    is_single_stream = st.get('is_single_stream', False)
 
     logo_src = school.get('logo_url')
     logo_html = ""
@@ -2030,7 +2029,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
     class_blocks = []
     for c in classes:
         is_stream_blank = not c['stream'] or c['stream'].strip() == "" or c['stream'].upper() == "SINGLE STREAM"
-        if is_single_stream or is_stream_blank:
+        if is_stream_blank:
             display_title = c['grade_name']
             stream_param = "SINGLE STREAM"
         else:
