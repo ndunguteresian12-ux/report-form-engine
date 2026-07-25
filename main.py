@@ -3185,10 +3185,16 @@ def educators_bulk_entry_grid(
                 rows = cur.fetchall()
                 for r in rows:
                     paper_map[r['student_id']] = r
-                if rows:
-                    # Reuse whatever "out of" was last configured for this subject/cycle.
-                    paper1_max = float(rows[0]['paper1_max'])
-                    paper2_max = float(rows[0]['paper2_max'])
+                # Reuse whatever "out of" was last configured for this
+                # subject/cycle — scan every row rather than trusting just
+                # the first one, since a student scored on only one paper
+                # has the other paper's max stored as NULL on their row.
+                first_p1_max = next((r['paper1_max'] for r in rows if r['paper1_max'] is not None), None)
+                first_p2_max = next((r['paper2_max'] for r in rows if r['paper2_max'] is not None), None)
+                if first_p1_max is not None:
+                    paper1_max = float(first_p1_max)
+                if first_p2_max is not None:
+                    paper2_max = float(first_p2_max)
             elif selected_area_id:
                 cur.execute("""
                     SELECT student_id, raw_score FROM student_scores 
@@ -4233,8 +4239,7 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
                         ON CONFLICT (student_id, learning_area_id, cycle_name)
                         DO UPDATE SET paper1_marks = EXCLUDED.paper1_marks, paper1_max = EXCLUDED.paper1_max,
                                       paper2_marks = EXCLUDED.paper2_marks, paper2_max = EXCLUDED.paper2_max;
-                    """, (sid, learning_area_id, cycle_name, p1, paper1_max if p1 is not None else None,
-                          p2, paper2_max if p2 is not None else None))
+                    """, (sid, learning_area_id, cycle_name, p1, paper1_max, p2, paper2_max))
 
                     # The resulting percentage is written into student_scores
                     # exactly like any normal single-mark entry — report
