@@ -1612,6 +1612,8 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
     pending_count = len([s for s in schools if s['status'] == 'pending'])
     active_count = len([s for s in schools if s['status'] == 'active'])
     deactivated_count = len([s for s in schools if s['status'] == 'deactivated'])
+    total_students_all_schools = sum(s['student_count'] for s in schools)
+    total_staff_all_schools = sum(s['staff_count'] for s in schools)
 
     status_styles = {
         'pending': ("bg-amber-50 text-amber-700 border-amber-200", "Pending Approval"),
@@ -1695,7 +1697,7 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
         {f"<div class='bg-rose-50 border-b border-rose-200 text-rose-800 text-xs px-8 py-2.5 text-center font-semibold'>⚠️ {esc(backup_error)}</div>" if backup_error else ""}
 
         <div class="p-8 max-w-6xl mx-auto w-full">
-            <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
+            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
                 <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 border-l-4" style="border-left-color:#4f46e5;">
                     <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Total Schools</p>
                     <p class="text-2xl font-black text-slate-900 mt-1">{total_schools}</p>
@@ -1711,6 +1713,14 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
                 <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 border-l-4" style="border-left-color:#e11d48;">
                     <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Deactivated</p>
                     <p class="text-2xl font-black text-slate-900 mt-1">{deactivated_count}</p>
+                </div>
+                <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 border-l-4" style="border-left-color:#0891b2;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Total Students</p>
+                    <p class="text-2xl font-black text-slate-900 mt-1">{total_students_all_schools}</p>
+                </div>
+                <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 border-l-4" style="border-left-color:#7c3aed;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Total Staff</p>
+                    <p class="text-2xl font-black text-slate-900 mt-1">{total_staff_all_schools}</p>
                 </div>
             </div>
 
