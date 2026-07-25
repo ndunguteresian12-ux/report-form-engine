@@ -145,6 +145,38 @@ def send_sms(phone_number: str, message: str) -> bool:
 
 app = FastAPI(title="Kenyan CBE Multi-Tenant Enterprise Engine")
 
+# --- CSRF protection (Origin/Referer validation) ---
+# Deliberately NOT a per-form-token approach: retrofitting a hidden token
+# field into every one of this app's 50+ existing forms risks silently
+# breaking a live school's ability to submit some form if even one is
+# missed. Origin/Referer validation requires ZERO changes to any existing
+# HTML — it's a pure server-side check that only rejects the one thing a
+# real CSRF attack actually looks like: a state-changing request whose
+# Origin/Referer explicitly names a DIFFERENT site. If the header is
+# simply absent (some legitimate clients omit it), the request is let
+# through rather than risking a false block on traffic we didn't
+# anticipate — this only ever blocks requests that positively prove
+# they came from elsewhere, never requests we're merely unsure about.
+CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+def _hostname_from_url(url_str: str):
+    try:
+        return urllib.parse.urlparse(url_str).hostname
+    except Exception:
+        return None
+
+@app.middleware("http")
+async def csrf_origin_check(request: Request, call_next):
+    if request.method not in CSRF_SAFE_METHODS:
+        expected_host = request.headers.get("host", "").split(":")[0].lower()
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if origin and expected_host:
+            actual_host = _hostname_from_url(origin)
+            if actual_host and actual_host.lower() != expected_host:
+                logger.warning(f"Blocked cross-site request: {request.method} {request.url.path} from origin/referer host '{actual_host}' (expected '{expected_host}')")
+                return _branded_error_page(403, "This request could not be verified as coming from this site. Please go back and try again.")
+    return await call_next(request)
+
 # --- Security headers ---
 # Adds standard hardening headers to every response. This only *adds*
 # headers — it never blocks, rewrites, or rejects a request — so it can't
@@ -162,6 +194,43 @@ async def add_security_headers(request: Request, call_next):
     if request.url.scheme == "https":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
+
+def _branded_error_page(status_code: int, message: str) -> HTMLResponse:
+    return HTMLResponse(status_code=status_code, content=f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
+        <title>Elimu Hub | {status_code}</title>
+        <link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;700;800&display=swap" rel="stylesheet">
+        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
+    </head>
+    <body class="bg-[#F7F9F8] min-h-screen flex items-center justify-center p-4">
+        <div class="bg-white p-8 rounded-2xl border shadow-md max-w-md w-full text-center">
+            <img src="{ELIMU_HUB_ICON_DATA_URI}" class="w-14 h-14 mx-auto mb-4 rounded-2xl" alt="">
+            <p class="text-5xl font-black text-slate-200 mb-2">{status_code}</p>
+            <p class="text-sm text-slate-600 mb-6">{esc(message)}</p>
+            <a href="/login" class="bg-indigo-800 hover:bg-indigo-900 text-white font-bold py-2.5 px-6 rounded-xl text-sm transition inline-block">Back to Login</a>
+        </div>
+    </body>
+    </html>
+    """)
+
+@app.exception_handler(HTTPException)
+async def branded_http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code == 404:
+        return _branded_error_page(404, "That page doesn't exist, or the link may be out of date.")
+    return _branded_error_page(exc.status_code, str(exc.detail))
+
+@app.exception_handler(Exception)
+async def branded_unhandled_exception_handler(request: Request, exc: Exception):
+    # Log the real error server-side (with full detail for debugging), but
+    # never show a raw stack trace to the browser — that's both unfriendly
+    # and a minor information-leak risk.
+    logger.error(f"Unhandled exception on {request.url.path}: {exc}", exc_info=True)
+    return _branded_error_page(500, "Something went wrong on our end. The team behind Elimu Hub has been notified — please try again shortly.")
 
 # --- Configuration Constants ---
 ALLOWED_LOGO_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
@@ -288,6 +357,17 @@ def bootstrap_database_schema():
                     attempted_at TIMESTAMP DEFAULT NOW()
                 );
                 CREATE INDEX IF NOT EXISTS idx_login_attempts_identifier ON login_attempts (identifier, attempted_at);
+
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    actor_label VARCHAR(255),
+                    action VARCHAR(100) NOT NULL,
+                    details TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_audit_log_school_time ON audit_log (school_id, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS classes (
                     id SERIAL PRIMARY KEY,
@@ -440,6 +520,28 @@ bootstrap_timetable_schema()
 app.include_router(timetable_router)
 
 # --- Core Business & CBE Analytics Helper Logic ---
+def log_audit_action(cur, request: Request, school_id: int, action: str, details: str = ""):
+    """Records an entry in the audit log, using the same cursor/transaction
+    as the action it's logging, so they commit together. Never raises — a
+    logging failure must never be allowed to block the real action."""
+    try:
+        user_id = request.cookies.get("session_user_id")
+        actor_label = None
+        if user_id:
+            cur.execute("SELECT full_name, email FROM users WHERE id = %s;", (user_id,))
+            row = cur.fetchone()
+            if row:
+                try:
+                    actor_label = row['full_name'] or row['email']
+                except (TypeError, KeyError):
+                    actor_label = row[0] or row[1]
+        cur.execute(
+            "INSERT INTO audit_log (school_id, user_id, actor_label, action, details) VALUES (%s, %s, %s, %s, %s);",
+            (school_id, user_id, actor_label, action, details)
+        )
+    except Exception as e:
+        logger.warning(f"Audit log entry failed (non-fatal, action was not blocked): {e}")
+
 def evaluate_performance_metrics(score: float) -> dict:
     try:
         val = float(score)
@@ -534,7 +636,7 @@ def login_portal():
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Multi-Tenant Hub Gateway</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -689,7 +791,7 @@ def forgot_password_form(sent: str = None):
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Forgot Password</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -757,7 +859,7 @@ def reset_password_form(email: str = "", sent: str = None):
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Reset Password</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -831,7 +933,7 @@ def terms_and_conditions_page():
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Terms and Conditions</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -892,7 +994,7 @@ def public_registration_portal():
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Create School Tenant Account</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Create School Tenant Account</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="flex items-center justify-center min-h-screen font-sans p-6 bg-slate-900 bg-cover bg-center" style="background-image: linear-gradient(rgba(15,23,42,0.80), rgba(15,23,42,0.88)), url('data:image/jpeg;base64,{REGISTRATION_BG_IMAGE_B64}');">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-xl border-t-8 border-emerald-700">
             <h2 class="text-2xl font-black text-slate-800">Register Institutional Tenant</h2>
@@ -1091,7 +1193,7 @@ def update_school_logo_form(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Update School Logo</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Update School Logo</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-900 flex items-center justify-center min-h-screen font-sans p-6">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Update School Logo</h2>
@@ -1216,6 +1318,9 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             """, (school_id,))
             classes = cur.fetchall()
 
+            cur.execute("SELECT COUNT(*) AS cnt FROM timetable_periods WHERE school_id = %s;", (school_id,))
+            has_timetable_periods = cur.fetchone()['cnt'] > 0
+
     if not school:
         raise HTTPException(status_code=404, detail="Institution Tenant Context Missed.")
     
@@ -1245,6 +1350,31 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     total_levels = len({c['education_level'] for c in classes})
     total_staff = len(staff_members)
     active_staff = len([m for m in staff_members if m['is_verified']])
+
+    checklist_items = [
+        (bool(classes), "Register your first student", f"/admin/student/new/{school_id}"),
+        (bool(staff_members), "Add a staff account", f"/staff/register-panel/{school_id}"),
+        (bool(school.get('logo_url')), "Upload your school logo", f"/admin/school/update-logo/{school_id}"),
+        (has_timetable_periods, "Set up your timetable periods & bell times", f"/timetable/periods/{school_id}"),
+    ]
+    incomplete_items = [item for item in checklist_items if not item[0]]
+    onboarding_html = ""
+    if incomplete_items:
+        checklist_rows = "".join(
+            f"""<a href="{url}" class="flex items-center gap-3 py-2 hover:bg-indigo-50/60 rounded-lg px-2 -mx-2 transition">
+                <span class="w-5 h-5 rounded-full border-2 border-indigo-300 shrink-0"></span>
+                <span class="text-sm font-semibold text-slate-700">{label}</span>
+                <span class="ml-auto text-indigo-600 text-xs font-bold">Set up →</span>
+            </a>"""
+            for _, label, url in incomplete_items
+        )
+        onboarding_html = f"""
+        <div class="bg-white rounded-2xl border border-indigo-100 shadow-xs p-5">
+            <h2 class="text-xs font-bold uppercase tracking-wider text-indigo-700 mb-1">🚀 Getting Started</h2>
+            <p class="text-xs text-slate-400 mb-3">A few things left to finish setting up your school.</p>
+            {checklist_rows}
+        </div>
+        """
 
     def _stat_card(label, value, accent_hex, sub=None):
         sub_html = f"<p class='text-[10px] text-slate-400 mt-0.5'>{sub}</p>" if sub else ""
@@ -1397,7 +1527,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     <!DOCTYPE html>
     <html class="h-full">
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Control Deck - {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1421,6 +1551,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <span class="bg-gradient-to-r from-indigo-800 to-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 Timetable</a>
                 <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
+                <a href="/admin/audit-log/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📋 Activity Log</a>
                 <a href="/admin/school/profile/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🏫 School Profile</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
@@ -1558,6 +1689,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
 
             <!-- ============ CENTER: PERFORMANCE ANALYSIS & INTERACTIVE CARDS ============ -->
             <main class="flex-1 p-4 sm:p-8 space-y-8 min-w-0">
+                {onboarding_html}
                 {stats_html}
                 <div>
                     <div class="flex items-center justify-between mb-4">
@@ -1676,7 +1808,7 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
     <!DOCTYPE html>
     <html class="h-full">
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Super Admin Portal</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -1765,6 +1897,8 @@ def superadmin_approve_school(school_id: int, request: Request):
         with conn.cursor() as cur:
             cur.execute("UPDATE schools SET status = 'active' WHERE id = %s;", (school_id,))
             conn.commit()
+            log_audit_action(cur, request, school_id, "school_approved", "Approved school registration")
+            conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
 
 
@@ -1777,6 +1911,8 @@ def superadmin_deactivate_school(school_id: int, request: Request):
         with conn.cursor() as cur:
             cur.execute("UPDATE schools SET status = 'deactivated' WHERE id = %s;", (school_id,))
             conn.commit()
+            log_audit_action(cur, request, school_id, "school_deactivated", "Deactivated school")
+            conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
 
 
@@ -1788,6 +1924,8 @@ def superadmin_reactivate_school(school_id: int, request: Request):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE schools SET status = 'active' WHERE id = %s;", (school_id,))
+            conn.commit()
+            log_audit_action(cur, request, school_id, "school_reactivated", "Reactivated school")
             conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
 
@@ -1846,10 +1984,20 @@ def superadmin_delete_school(school_id: int, request: Request):
         return auth_error
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school_row = cur.fetchone()
+            school_name = school_row[0] if school_row else f"school #{school_id}"
+
             # Cascades to school_settings, users (admin+staff), students, and
             # (via students) student_scores. Classes and learning_areas are
             # shared lookup tables, not school-specific, so they're untouched.
             cur.execute("DELETE FROM schools WHERE id = %s;", (school_id,))
+            conn.commit()
+
+            # Logged with school_id=NULL deliberately — audit_log.school_id
+            # cascades on delete, so logging against the now-deleted school's
+            # own id would erase this very record the instant it's inserted.
+            log_audit_action(cur, request, None, "school_deleted", f"Permanently deleted school: {school_name} (was ID {school_id})")
             conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
 
@@ -1897,7 +2045,7 @@ def superadmin_reset_admin_password_form(school_id: int, request: Request, done:
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Reset Admin Password</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
@@ -1962,7 +2110,7 @@ def storage_diagnostics(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Storage Diagnostics</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Storage Diagnostics</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-8 font-sans">
         <div class="max-w-lg mx-auto bg-white rounded-2xl border shadow p-6 space-y-4">
             <h2 class="text-lg font-black text-slate-800">🔧 Logo Storage Diagnostics</h2>
@@ -2077,7 +2225,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
     <!DOCTYPE html>
     <html class="h-full">
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Staff Portal - {esc(school['name'])}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -2173,7 +2321,7 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Class Roster — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
@@ -2378,7 +2526,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Merit List — {esc(grade_name)}</title>
         <style>
             @page {{ size: landscape; margin: 10mm; }}
@@ -2531,7 +2679,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Top 10 — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
@@ -2639,7 +2787,7 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Top Student Per Subject — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
@@ -2764,7 +2912,7 @@ def marks_entry_supervision(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Marks Entry Supervision</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Marks Entry Supervision</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-[#F7F9F8] min-h-screen">
         <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
             <div>
@@ -2775,6 +2923,78 @@ def marks_entry_supervision(school_id: int, request: Request):
         </header>
         <div class="p-4 sm:p-8 max-w-6xl mx-auto">
             {level_sections_html or "<p class='text-slate-400 text-sm italic text-center py-16 bg-white border border-dashed rounded-2xl'>No students registered yet.</p>"}
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.get("/admin/audit-log/{school_id}", response_class=HTMLResponse)
+def view_audit_log(school_id: int, request: Request):
+    """Read-only view of recent actions taken on this school's account —
+    who registered a student, who changed settings, who deactivated a staff
+    member, etc. Purely a report; it only reads existing log entries."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("""
+                SELECT action, actor_label, details, created_at FROM audit_log
+                WHERE school_id = %s
+                ORDER BY created_at DESC
+                LIMIT 200;
+            """, (school_id,))
+            entries = cur.fetchall()
+
+    action_labels = {
+        "student_added": ("👤 Student Added", "text-emerald-700"),
+        "student_edited": ("✏️ Student Edited", "text-indigo-700"),
+        "student_deleted": ("🗑 Student Deleted", "text-rose-700"),
+        "staff_added": ("🧑‍🏫 Staff Added", "text-emerald-700"),
+        "staff_activated": ("✅ Staff Activated", "text-emerald-700"),
+        "staff_deactivated": ("⛔ Staff Deactivated", "text-amber-700"),
+        "staff_deleted": ("🗑 Staff Deleted", "text-rose-700"),
+        "settings_updated": ("⚙️ Settings Updated", "text-slate-700"),
+        "marks_saved": ("📝 Marks Saved", "text-indigo-700"),
+    }
+
+    rows_html = ""
+    for e in entries:
+        label, color = action_labels.get(e['action'], (e['action'], "text-slate-700"))
+        rows_html += f"""
+        <div class="flex items-start justify-between gap-3 py-2.5 border-b border-slate-50 last:border-0">
+            <div class="min-w-0">
+                <p class="text-xs font-bold {color}">{esc(label)}</p>
+                <p class="text-xs text-slate-500 mt-0.5">{esc(e['details'] or '')}</p>
+                <p class="text-[11px] text-slate-400 mt-0.5">by {esc(e['actor_label'] or 'Unknown')}</p>
+            </div>
+            <span class="text-[11px] text-slate-400 whitespace-nowrap">{e['created_at'].strftime('%d %b %Y, %H:%M') if e['created_at'] else ''}</span>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Activity Log</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">📋 Activity Log — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">The last 200 actions taken on this school's account.</p>
+            </div>
+            <a href="/admin/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back</a>
+        </header>
+        <div class="p-4 sm:p-8 max-w-3xl mx-auto">
+            <div class="bg-white rounded-2xl border shadow-xs p-5">
+                {rows_html or "<p class='text-slate-400 text-xs italic text-center py-8'>No activity recorded yet.</p>"}
+            </div>
         </div>
     </body>
     </html>
@@ -2870,7 +3090,7 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
     <!DOCTYPE html>
     <html>
     <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Subject Analysis — {esc(class_title)}</title>
         <style>
             body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
@@ -2921,7 +3141,7 @@ def add_student_view(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Add New Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Add New Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 flex items-center justify-center min-h-screen p-4">
         <div class="bg-white p-6 sm:p-8 rounded-2xl border shadow-md w-full max-w-lg">
             <h2 class="text-xl font-bold mb-4 text-slate-800">Add New Learner Profile</h2>
@@ -2976,7 +3196,7 @@ def staff_registration_panel(school_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Add Staff — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Add Staff — {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-indigo-950 flex items-center justify-center min-h-screen font-sans p-6">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-sm border-t-8 border-indigo-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Add Staff Member</h2>
@@ -3022,7 +3242,10 @@ def toggle_staff_active_status(staff_id: int, school_id: int, request: Request):
         return auth_error
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT full_name, email, is_verified FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (staff_id, school_id))
+            staff_row = cur.fetchone()
+
             # Flips the current boolean value of is_verified (acting as our active flag)
             cur.execute("""
                 UPDATE users 
@@ -3030,6 +3253,11 @@ def toggle_staff_active_status(staff_id: int, school_id: int, request: Request):
                 WHERE id = %s AND school_id = %s AND role = 'staff';
             """, (staff_id, school_id))
             conn.commit()
+
+            if staff_row:
+                new_state = "deactivated" if staff_row['is_verified'] else "activated"
+                log_audit_action(cur, request, school_id, f"staff_{new_state}", f"{new_state.capitalize()} {staff_row['full_name'] or staff_row['email']}")
+                conn.commit()
             
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
@@ -3043,8 +3271,15 @@ def delete_staff_permanently(staff_id: int, school_id: int, request: Request):
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT full_name, email FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (staff_id, school_id))
+            staff_row = cur.fetchone()
+
             cur.execute("DELETE FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (staff_id, school_id))
             conn.commit()
+
+            if staff_row:
+                log_audit_action(cur, request, school_id, "staff_deleted", f"Deleted staff account: {staff_row[0] or staff_row[1]}")
+                conn.commit()
             
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
@@ -3087,7 +3322,7 @@ def manage_individual_scores_view(school_id: int, student_id: int, request: Requ
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Edit Matrix for {esc(student['first_name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Edit Matrix for {esc(student['first_name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-50 p-8 min-h-screen max-w-3xl mx-auto space-y-6">
         <div class="bg-white p-6 rounded-2xl border shadow-xs flex justify-between items-center">
             <div>
@@ -3236,7 +3471,7 @@ def educators_bulk_entry_grid(
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Bulk Sheet Entry Deck</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Bulk Sheet Entry Deck</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 p-3 sm:p-8 min-h-screen max-w-4xl mx-auto space-y-4 sm:space-y-6">
         <div class="bg-white p-4 sm:p-6 rounded-2xl border shadow-xs flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
             <div>
@@ -3656,7 +3891,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             <!DOCTYPE html>
             <html>
             <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
                 <title>Elimu Hub | Print Out Queue Pipeline</title>
                 <link rel="preconnect" href="https://fonts.googleapis.com">
                 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -3750,6 +3985,8 @@ def update_settings_endpoint(
             # Sync the modern Tailwind color layout across the institution node
             cur.execute("UPDATE schools SET theme_color = %s WHERE id = %s;", (theme_color, school_id))
             conn.commit()
+            log_audit_action(cur, request, school_id, "settings_updated", f"Term={active_term}, Cycle={active_cycle}, Theme={theme_color}, SingleStream={is_single_stream_bool}")
+            conn.commit()
             
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
@@ -3800,6 +4037,8 @@ def backend_add_student(
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE');
                 """, (school_id, admission_number, first_name, middle_name, last_name, class_id, processed_stream, education_level))
                 conn.commit()
+                log_audit_action(cur, request, school_id, "student_added", f"Registered {first_name} {last_name} (Adm #{admission_number})")
+                conn.commit()
             except psycopg2.errors.UniqueViolation:
                 conn.rollback()
                 raise HTTPException(status_code=400, detail=f"A student with admission number '{admission_number}' already exists in this school. Please use a different admission number.")
@@ -3827,7 +4066,7 @@ def school_profile_view(school_id: int, request: Request, saved: str = None):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | School Profile</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | School Profile</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
         <div class="max-w-2xl mx-auto space-y-4">
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
@@ -3972,7 +4211,7 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Edit Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Edit Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 flex items-center justify-center min-h-screen p-4">
         <div class="bg-white p-6 sm:p-8 rounded-2xl border shadow-md w-full max-w-lg">
             <h2 class="text-xl font-bold mb-4 text-slate-800">Edit Learner Profile</h2>
@@ -4055,6 +4294,8 @@ def backend_edit_student(
                     WHERE id = %s AND school_id = %s;
                 """, (first_name, middle_name, last_name, admission_number, class_id, processed_stream, education_level, student_id, school_id))
                 conn.commit()
+                log_audit_action(cur, request, school_id, "student_edited", f"Edited {first_name} {last_name} (Adm #{admission_number})")
+                conn.commit()
             except psycopg2.errors.UniqueViolation:
                 conn.rollback()
                 raise HTTPException(status_code=400, detail="Another student in this school already has that admission number.")
@@ -4070,9 +4311,16 @@ def backend_delete_student(school_id: int, student_id: int, request: Request):
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT first_name, last_name, admission_number FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
+            deleted_student = cur.fetchone()
+
             # Cascades to student_scores via the existing foreign key.
             cur.execute("DELETE FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
             conn.commit()
+
+            if deleted_student:
+                log_audit_action(cur, request, school_id, "student_deleted", f"Deleted {deleted_student[0]} {deleted_student[1]} (Adm #{deleted_student[2]})")
+                conn.commit()
 
     return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
 @app.post("/api/v1/staff/add/{school_id}")
@@ -4115,6 +4363,8 @@ def add_staff_node(
                 INSERT INTO users (email, password_hash, role, school_id, is_verified, full_name, tsc_number, phone_number)
                 VALUES (%s, %s, 'staff', %s, FALSE, %s, %s, %s);
             """, (email, hashed_password, school_id, full_name, tsc_number, phone_number))
+            conn.commit()
+            log_audit_action(cur, request, school_id, "staff_added", f"Registered staff account for {full_name} ({email})")
             conn.commit()
     return RedirectResponse(url=f"/admin/dashboard/{school_id}?staff_added=1", status_code=303)
 
@@ -4306,6 +4556,12 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
         1 for key, val in form_data.items()
         if key.startswith("score_") and str(val).strip() != ""
     ) - skipped_entries
+
+    if saved_count > 0:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                log_audit_action(cur, request, school_id, "marks_saved", f"Saved {saved_count} score(s) — {form_data.get('grade_name', '')} {form_data.get('stream', '')}, cycle {cycle_name}")
+                conn.commit()
 
     redirect_params = urllib.parse.urlencode({
         "grade_name": form_data.get("grade_name", ""),
