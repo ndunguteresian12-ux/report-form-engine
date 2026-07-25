@@ -1194,7 +1194,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             settings = cur.fetchone()
             
             cur.execute("""
-                SELECT s.id, s.admission_number, s.first_name, s.last_name, s.stream, 
+                SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name, s.stream, 
                        c.grade_name, c.education_level
                 FROM students s
                 JOIN classes c ON s.class_id = c.id
@@ -1280,7 +1280,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
 
         rows_html = "".join(f"""
             <li class='flex justify-between items-center gap-2 py-1.5 border-b border-slate-50 last:border-0'>
-                <span class='text-slate-700 truncate'>{esc(st['first_name'])} {esc(st['last_name'])}
+                <span class='text-slate-700 truncate'>{esc(st['first_name'])} {esc(st['middle_name']) + ' ' if st.get('middle_name') else ''}{esc(st['last_name'])}
                     <span class='text-slate-400 font-mono text-[10px] block'>#{esc(st['admission_number'])}</span>
                 </span>
                 <span class='flex items-center gap-2 shrink-0'>
@@ -2129,7 +2129,7 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
                 raise HTTPException(status_code=404, detail="School not found.")
 
             cur.execute("""
-                SELECT s.admission_number, s.first_name, s.last_name, s.stream
+                SELECT s.admission_number, s.first_name, s.middle_name, s.last_name, s.stream
                 FROM students s
                 JOIN classes c ON s.class_id = c.id
                 WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
@@ -2145,9 +2145,13 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
         final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
         logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
 
+    def _full_name(st):
+        parts = [st['first_name'], st.get('middle_name'), st['last_name']]
+        return " ".join(esc(p) for p in parts if p)
+
     rows_html = "".join(
         f"<tr><td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;'>{esc(st['admission_number'])}</td>"
-        f"<td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{esc(st['first_name'])} {esc(st['last_name'])}</td></tr>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{_full_name(st)}</td></tr>"
         for st in roster_students
     )
 
