@@ -2150,9 +2150,10 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
         return " ".join(esc(p) for p in parts if p)
 
     rows_html = "".join(
-        f"<tr><td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;'>{esc(st['admission_number'])}</td>"
+        f"<tr><td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;color:#94a3b8;'>{i}</td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;'>{esc(st['admission_number'])}</td>"
         f"<td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{_full_name(st)}</td></tr>"
-        for st in roster_students
+        for i, st in enumerate(roster_students, start=1)
     )
 
     class_title = grade_name if stream == "SINGLE STREAM" else f"{grade_name} — {stream}"
@@ -2182,8 +2183,8 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
             </div>
         </div>
         <table>
-            <thead><tr><th>Adm No.</th><th>Full Name</th></tr></thead>
-            <tbody>{rows_html or "<tr><td colspan='2' style='padding:20px;text-align:center;color:#94a3b8;'>No students in this class.</td></tr>"}</tbody>
+            <thead><tr><th style="text-align:center;">S.No</th><th>Adm No.</th><th>Full Name</th></tr></thead>
+            <tbody>{rows_html or "<tr><td colspan='3' style='padding:20px;text-align:center;color:#94a3b8;'>No students in this class.</td></tr>"}</tbody>
         </table>
     </body>
     </html>
