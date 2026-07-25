@@ -39,6 +39,16 @@ logger = logging.getLogger("cbe_engine")
 SUPPORT_PHONE = (os.getenv("SUPPORT_PHONE") or "").strip() or None
 SUPPORT_EMAIL = (os.getenv("SUPPORT_EMAIL") or "").strip() or None
 
+# "Backup Now" button config — triggers the existing GitHub Actions backup
+# workflow (scripts/backup_db.py + .github/workflows/db-backup.yml) on demand
+# via GitHub's API, instead of waiting for its nightly schedule. Reuses the
+# same pg_dump + Supabase upload pipeline already set up; pg_dump itself
+# isn't available inside this Render service, so triggering the workflow
+# that already has it (via GitHub Actions' own runner) is the reliable path.
+GITHUB_PAT = (os.getenv("GITHUB_PAT") or "").strip() or None
+GITHUB_REPO = (os.getenv("GITHUB_REPO") or "").strip() or None  # format: "username/repo-name"
+GITHUB_BACKUP_WORKFLOW_FILE = (os.getenv("GITHUB_BACKUP_WORKFLOW_FILE") or "db-backup.yml").strip()
+
 def support_contact_html() -> str:
     """A small 'need help?' line for dashboard footers. Returns an empty
     string if no support contact has been configured."""
@@ -1576,7 +1586,7 @@ def logout():
 
 
 @app.get("/superadmin/dashboard", response_class=HTMLResponse)
-def superadmin_dashboard(request: Request):
+def superadmin_dashboard(request: Request, backup_started: str = None, backup_error: str = None):
     auth_error = require_superadmin_session(request)
     if auth_error:
         return auth_error
@@ -1672,8 +1682,16 @@ def superadmin_dashboard(request: Request):
     <body class="bg-[#F8FAFC] text-slate-800 antialiased min-h-full">
         <header class="bg-slate-900 text-white px-8 py-4 flex justify-between items-center">
             <h1 class="text-base font-bold tracking-tight">🛡️ Super Admin Portal</h1>
-            <a href="/logout" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs transition">Log Out</a>
+            <div class="flex items-center gap-2">
+                <form action="/api/v1/superadmin/backup-now" method="post" onsubmit="return confirm('Trigger an on-demand database backup now? This runs in the background via GitHub Actions and does not affect any school\\'s live data.');">
+                    <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded-xl text-xs font-bold transition">💾 Backup Now</button>
+                </form>
+                <a href="/logout" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs transition">Log Out</a>
+            </div>
         </header>
+
+        {"<div class='bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-xs px-8 py-2.5 text-center font-semibold'>✅ Backup triggered — check the Actions tab in your GitHub repo for progress.</div>" if backup_started else ""}
+        {f"<div class='bg-rose-50 border-b border-rose-200 text-rose-800 text-xs px-8 py-2.5 text-center font-semibold'>⚠️ {esc(backup_error)}</div>" if backup_error else ""}
 
         <div class="p-8 max-w-6xl mx-auto w-full">
             <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
@@ -1761,6 +1779,53 @@ def superadmin_reactivate_school(school_id: int, request: Request):
             cur.execute("UPDATE schools SET status = 'active' WHERE id = %s;", (school_id,))
             conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
+@app.post("/api/v1/superadmin/backup-now")
+def trigger_backup_now(request: Request):
+    """Manually triggers the existing GitHub Actions backup workflow (which
+    already runs pg_dump + uploads to Supabase nightly) instead of waiting
+    for its schedule. This route only ever reads config and calls GitHub's
+    API — it never touches the database directly, so it can't affect any
+    school's data."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    if not GITHUB_PAT or not GITHUB_REPO:
+        return RedirectResponse(
+            url="/superadmin/dashboard?backup_error=" + urllib.parse.quote(
+                "Backup Now isn't configured yet. Set GITHUB_PAT (a GitHub Personal Access Token with 'repo' and 'workflow' scope) and GITHUB_REPO (e.g. 'yourusername/report_form_engine') in Render's Environment tab."
+            ),
+            status_code=303,
+        )
+
+    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/workflows/{GITHUB_BACKUP_WORKFLOW_FILE}/dispatches"
+    try:
+        response = http_requests.post(
+            api_url,
+            headers={
+                "Authorization": f"Bearer {GITHUB_PAT}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"ref": "main"},
+            timeout=10,
+        )
+    except http_requests.RequestException as e:
+        return RedirectResponse(
+            url="/superadmin/dashboard?backup_error=" + urllib.parse.quote(f"Could not reach GitHub: {e}"),
+            status_code=303,
+        )
+
+    if response.status_code == 204:
+        return RedirectResponse(url="/superadmin/dashboard?backup_started=1", status_code=303)
+
+    return RedirectResponse(
+        url="/superadmin/dashboard?backup_error=" + urllib.parse.quote(
+            f"GitHub rejected the request (status {response.status_code}). Check that GITHUB_PAT is valid and GITHUB_REPO/workflow filename are correct."
+        ),
+        status_code=303,
+    )
 
 
 @app.post("/api/v1/superadmin/school/delete/{school_id}")
@@ -2104,7 +2169,7 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#059669;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
+            <button onclick="window.print()" style="background:#059669;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
         </div>
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #059669;padding-bottom:12px;">
             {logo_html}
@@ -2312,7 +2377,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
+            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
         </div>
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
@@ -2462,7 +2527,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
+            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
         </div>
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
@@ -2570,7 +2635,7 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
+            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
         </div>
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
@@ -2801,7 +2866,7 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#0d9488;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print</button>
+            <button onclick="window.print()" style="background:#0d9488;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
         </div>
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #0d9488;padding-bottom:12px;">
             {logo_html}
