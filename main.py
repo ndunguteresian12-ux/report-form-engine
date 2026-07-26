@@ -387,6 +387,13 @@ def bootstrap_database_schema():
                 );
                 CREATE INDEX IF NOT EXISTS idx_login_attempts_identifier ON login_attempts (identifier, attempted_at);
 
+                CREATE TABLE IF NOT EXISTS platform_announcements (
+                    id SERIAL PRIMARY KEY,
+                    message TEXT NOT NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id SERIAL PRIMARY KEY,
                     school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
@@ -1350,6 +1357,9 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             cur.execute("SELECT COUNT(*) AS cnt FROM timetable_periods WHERE school_id = %s;", (school_id,))
             has_timetable_periods = cur.fetchone()['cnt'] > 0
 
+            cur.execute("SELECT message FROM platform_announcements WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 3;")
+            active_announcements = cur.fetchall()
+
             # School-wide average score per exam cycle, for the trend chart —
             # one simple aggregate query, no per-student loop.
             cur.execute("""
@@ -1415,6 +1425,14 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             {checklist_rows}
         </div>
         """
+
+    announcement_banners_html = "".join(
+        f"""<div class="bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-2xl px-5 py-3 flex items-center gap-3 shadow-xs">
+            <span class="text-lg">📣</span>
+            <p class="text-sm font-semibold">{esc(a['message'])}</p>
+        </div>"""
+        for a in active_announcements
+    )
 
     trend_chart_html = ""
     cycles_with_data = [c for c in ["Opener", "Midterm", "End Term"] if c in trend_rows]
@@ -1762,6 +1780,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
 
             <!-- ============ CENTER: PERFORMANCE ANALYSIS & INTERACTIVE CARDS ============ -->
             <main class="flex-1 p-4 sm:p-8 space-y-8 min-w-0">
+                {announcement_banners_html}
                 {onboarding_html}
                 {stats_html}
                 {trend_chart_html}
@@ -1813,6 +1832,9 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
                     sc.created_at DESC;
             """)
             schools = cur.fetchall()
+
+            cur.execute("SELECT * FROM platform_announcements ORDER BY created_at DESC LIMIT 20;")
+            announcements = cur.fetchall()
 
     total_schools = len(schools)
     pending_count = len([s for s in schools if s['status'] == 'pending'])
@@ -1955,6 +1977,34 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
                     </table>
                 </div>
             </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6 mt-6">
+                <h2 class="text-sm font-bold text-slate-800 mb-1">📣 Platform Announcements</h2>
+                <p class="text-xs text-slate-400 mb-4">Active announcements show as a banner on every school admin's dashboard.</p>
+                <form action="/api/v1/superadmin/announcements/add" method="post" class="flex gap-2 mb-4">
+                    <input type="text" name="message" placeholder="e.g. Finance module coming soon!" class="flex-1 border p-2.5 rounded-xl text-sm" required maxlength="300">
+                    <button type="submit" class="bg-indigo-800 hover:bg-indigo-900 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">+ Post</button>
+                </form>
+                <div class="space-y-2">
+                    {"".join(f'''
+                    <div class="flex items-center justify-between gap-3 p-3 rounded-xl border {'border-emerald-200 bg-emerald-50/50' if a['is_active'] else 'border-slate-100 bg-slate-50'}">
+                        <div class="min-w-0">
+                            <p class="text-sm {'text-slate-800 font-semibold' if a['is_active'] else 'text-slate-400 line-through'}">{esc(a['message'])}</p>
+                            <p class="text-[11px] text-slate-400 mt-0.5">{a['created_at'].strftime('%d %b %Y, %H:%M') if a['created_at'] else ''} {'· Live' if a['is_active'] else '· Hidden'}</p>
+                        </div>
+                        <div class="flex items-center gap-2 shrink-0">
+                            <form action="/api/v1/superadmin/announcements/toggle/{a['id']}" method="post">
+                                <button type="submit" class="text-xs font-bold {'text-amber-700 hover:text-amber-900' if a['is_active'] else 'text-emerald-700 hover:text-emerald-900'}">{'Hide' if a['is_active'] else 'Show'}</button>
+                            </form>
+                            <form action="/api/v1/superadmin/announcements/delete/{a['id']}" method="post" onsubmit="return confirm('Delete this announcement permanently?');">
+                                <button type="submit" class="text-xs font-bold text-rose-600 hover:text-rose-800">Delete</button>
+                            </form>
+                        </div>
+                    </div>
+                    ''' for a in announcements) or "<p class='text-slate-400 text-xs italic text-center py-4'>No announcements posted yet.</p>"}
+                </div>
+            </div>
+
             {support_contact_html()}
             <p class="text-center text-[11px] text-slate-500 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-300">Elimu Hub</span></p>
         </div>
@@ -2073,6 +2123,45 @@ def superadmin_delete_school(school_id: int, request: Request):
             # cascades on delete, so logging against the now-deleted school's
             # own id would erase this very record the instant it's inserted.
             log_audit_action(cur, request, None, "school_deleted", f"Permanently deleted school: {school_name} (was ID {school_id})")
+            conn.commit()
+    return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
+@app.post("/api/v1/superadmin/announcements/add")
+def add_platform_announcement(request: Request, message: str = Form(...)):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    message = message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Announcement message cannot be empty.")
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO platform_announcements (message, is_active) VALUES (%s, TRUE);", (message,))
+            conn.commit()
+    return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
+@app.post("/api/v1/superadmin/announcements/toggle/{announcement_id}")
+def toggle_platform_announcement(announcement_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE platform_announcements SET is_active = NOT is_active WHERE id = %s;", (announcement_id,))
+            conn.commit()
+    return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
+@app.post("/api/v1/superadmin/announcements/delete/{announcement_id}")
+def delete_platform_announcement(announcement_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM platform_announcements WHERE id = %s;", (announcement_id,))
             conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
 
