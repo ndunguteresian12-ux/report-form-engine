@@ -188,14 +188,14 @@ def _ensure_default_category(cur, school_id: int) -> int:
     return new_id[0] if not isinstance(new_id, dict) else new_id['id']
 
 
-def _generate_receipt_number(cur, school_id: int) -> str:
-    """A simple, human-friendly sequential receipt number per school, e.g.
-    RCT-000123. Not globally unique by design — scoped per school, which is
-    all that matters since each school only ever sees its own receipts."""
-    cur.execute("SELECT COUNT(*) FROM fee_payments WHERE school_id = %s;", (school_id,))
-    count_row = cur.fetchone()
-    count = (count_row[0] if not isinstance(count_row, dict) else count_row['count']) or 0
-    return f"RCT-{school_id:03d}-{count + 1:06d}"
+def _receipt_number_from_id(school_id: int, payment_id: int) -> str:
+    """Builds a human-friendly receipt number from a payment's own row id —
+    e.g. RCT-005-000042. Unlike a COUNT(*)-based scheme, this can never
+    collide: id is a real auto-incrementing primary key that Postgres
+    guarantees is unique and never reused, even after a payment is later
+    deleted, and even when many rows are inserted in the same transaction
+    (as a CSV import does)."""
+    return f"RCT-{school_id:03d}-{payment_id:06d}"
 
 
 def _get_school_and_settings(cur, school_id):
@@ -896,12 +896,13 @@ def add_fee_payment(
 
             category_id = fee_category_id or _ensure_default_category(cur, school_id)
             recorded_by = request.cookies.get("session_user_id")
-            receipt_number = _generate_receipt_number(cur, school_id)
 
             cur.execute("""
-                INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, receipt_number, term, year, recorded_by_user_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-            """, (student_id, school_id, category_id, amount, payment_method, reference_note.strip() or None, receipt_number, term, year, recorded_by))
+                INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, term, year, recorded_by_user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+            """, (student_id, school_id, category_id, amount, payment_method, reference_note.strip() or None, term, year, recorded_by))
+            new_payment_id = cur.fetchone()[0]
+            cur.execute("UPDATE fee_payments SET receipt_number = %s WHERE id = %s;", (_receipt_number_from_id(school_id, new_payment_id), new_payment_id))
             conn.commit()
 
     return RedirectResponse(url=f"/finance/student/{school_id}/{student_id}?term={urllib.parse.quote(term)}&year={year}&saved=1", status_code=303)
@@ -1241,17 +1242,18 @@ async def upload_fee_import(school_id: int, request: Request, file: UploadFile =
                 batch_id = cur.fetchone()['id']
 
                 for row in imported_rows:
-                    receipt_number = _generate_receipt_number(cur, school_id)
                     if row["paid_at"]:
                         cur.execute("""
-                            INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, receipt_number, term, year, recorded_by_user_id, paid_at, import_batch_id)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                        """, (row["student_id"], school_id, row["category_id"], row["amount"], row["payment_method"], row["reference_note"], receipt_number, row["term"], row["year"], recorded_by, row["paid_at"], batch_id))
+                            INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, term, year, recorded_by_user_id, paid_at, import_batch_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+                        """, (row["student_id"], school_id, row["category_id"], row["amount"], row["payment_method"], row["reference_note"], row["term"], row["year"], recorded_by, row["paid_at"], batch_id))
                     else:
                         cur.execute("""
-                            INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, receipt_number, term, year, recorded_by_user_id, import_batch_id)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                        """, (row["student_id"], school_id, row["category_id"], row["amount"], row["payment_method"], row["reference_note"], receipt_number, row["term"], row["year"], recorded_by, batch_id))
+                            INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, term, year, recorded_by_user_id, import_batch_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+                        """, (row["student_id"], school_id, row["category_id"], row["amount"], row["payment_method"], row["reference_note"], row["term"], row["year"], recorded_by, batch_id))
+                    new_payment_id = cur.fetchone()['id']
+                    cur.execute("UPDATE fee_payments SET receipt_number = %s WHERE id = %s;", (_receipt_number_from_id(school_id, new_payment_id), new_payment_id))
                 conn.commit()
 
     import base64
