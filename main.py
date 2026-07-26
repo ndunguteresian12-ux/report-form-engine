@@ -555,6 +555,11 @@ from timetable_routes import router as timetable_router, bootstrap_timetable_sch
 bootstrap_timetable_schema()
 app.include_router(timetable_router)
 
+# --- Finance module (extracted to its own file — see finance_routes.py) ---
+from finance_routes import router as finance_router, bootstrap_finance_schema
+bootstrap_finance_schema()
+app.include_router(finance_router)
+
 # --- Core Business & CBE Analytics Helper Logic ---
 def log_audit_action(cur, request: Request, school_id: int, action: str, details: str = ""):
     """Records an entry in the audit log, using the same cursor/transaction
@@ -1644,6 +1649,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
                 <a href="/admin/audit-log/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📋 Activity Log</a>
                 <a href="/admin/school/profile/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🏫 School Profile</a>
+                <a href="/finance/dashboard/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-3 py-2 rounded-xl transition">💰 Finance</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
