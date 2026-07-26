@@ -21,10 +21,12 @@ A student's balance for a given term is simply:
 """
 
 import os
+import csv
+import io
 import urllib.parse
 from datetime import datetime
-from fastapi import APIRouter, Request, HTTPException, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, Request, HTTPException, Form, File, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 from shared import (
     esc,
@@ -145,6 +147,24 @@ def bootstrap_finance_schema():
                 conn.commit()
 
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_payments_receipt_number ON fee_payments (receipt_number) WHERE receipt_number IS NOT NULL;")
+
+            # Historical backlog import tracking — every bulk-imported batch
+            # of past payments (e.g. a school's old Excel sheet) is tagged,
+            # so it can be reviewed or reversed as a whole if something in
+            # the file turns out to be wrong, without touching any payment
+            # entered normally through the app.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fee_payment_imports (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    filename VARCHAR(255),
+                    imported_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    row_count INTEGER NOT NULL DEFAULT 0,
+                    skipped_count INTEGER NOT NULL DEFAULT 0,
+                    imported_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            cur.execute("ALTER TABLE fee_payments ADD COLUMN IF NOT EXISTS import_batch_id INTEGER REFERENCES fee_payment_imports(id) ON DELETE CASCADE;")
             conn.commit()
 
 
@@ -379,6 +399,7 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
             </div>
             <div class="flex items-center gap-2 flex-wrap">
                 <a href="/finance/categories/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">🏷️ Fee Categories</a>
+                <a href="/finance/import/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">📥 Import History</a>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">← Back to Dashboard</a>
             </div>
         </header>
@@ -926,3 +947,272 @@ def view_receipt(school_id: int, payment_id: int, request: Request):
     </body>
     </html>
     """
+
+
+# ============================================================
+# Historical backlog import — bring in past payments schools have
+# been tracking in Excel, so balances are accurate from day one
+# instead of everyone appearing to owe their full fee.
+# ============================================================
+
+IMPORT_CSV_COLUMNS = ["admission_number", "fee_category", "term", "year", "amount", "payment_method", "payment_date", "reference_note"]
+
+
+@router.get("/finance/import/{school_id}", response_class=HTMLResponse)
+def finance_import_view(school_id: int, request: Request, result: str = None):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            school, _, _ = _get_school_and_settings(cur, school_id)
+            _ensure_default_category(cur, school_id)
+            conn.commit()
+
+            cur.execute("SELECT name FROM fee_categories WHERE school_id = %s ORDER BY is_default DESC, name ASC;", (school_id,))
+            categories = [r['name'] for r in cur.fetchall()]
+
+            cur.execute("""
+                SELECT fpi.*, u.full_name AS imported_by_name
+                FROM fee_payment_imports fpi LEFT JOIN users u ON fpi.imported_by_user_id = u.id
+                WHERE fpi.school_id = %s ORDER BY fpi.imported_at DESC LIMIT 20;
+            """, (school_id,))
+            past_imports = cur.fetchall()
+
+    imports_html = "".join(f"""
+        <div class="flex items-center justify-between py-2.5 border-b border-slate-50 last:border-0">
+            <div>
+                <p class="text-sm font-semibold text-slate-700">{esc(imp['filename'] or 'Untitled file')}</p>
+                <p class="text-[11px] text-slate-400">{imp['imported_at'].strftime('%d %b %Y, %H:%M') if imp['imported_at'] else ''} by {esc(imp['imported_by_name'] or 'Unknown')} — {imp['row_count']} imported, {imp['skipped_count']} skipped</p>
+            </div>
+            <form action="/api/v1/finance/import/reverse/{school_id}/{imp['id']}" method="post" onsubmit="return confirm('Undo this entire import batch? This permanently removes all {imp['row_count']} payment(s) it added. This cannot be undone.');">
+                <button type="submit" class="text-rose-600 hover:text-rose-800 text-xs font-bold">Undo Batch</button>
+            </form>
+        </div>
+    """ for imp in past_imports)
+
+    result_banner = ""
+    if result:
+        parts = result.split(":", 2)
+        if len(parts) == 3:
+            imported_n, skipped_n, errors_b64 = parts
+            import base64
+            try:
+                error_lines = base64.b64decode(errors_b64).decode("utf-8").split("\n") if errors_b64 else []
+            except Exception:
+                error_lines = []
+            error_list_html = "".join(f"<li>{esc(line)}</li>" for line in error_lines if line)
+            result_banner = f"""
+            <div class="bg-{'emerald' if int(skipped_n) == 0 else 'amber'}-50 border border-{'emerald' if int(skipped_n) == 0 else 'amber'}-200 rounded-xl p-4">
+                <p class="text-sm font-bold text-slate-800">✅ {imported_n} payment(s) imported successfully{f', ⚠️ {skipped_n} row(s) skipped' if int(skipped_n) > 0 else ''}.</p>
+                {f"<ul class='text-xs text-amber-800 mt-2 list-disc list-inside space-y-0.5'>{error_list_html}</ul>" if error_list_html else ""}
+            </div>
+            """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Import Fee History</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">📥 Import Fee History</h2>
+                <p class="text-xs text-slate-400 mt-1">Bring in payments a student already made before you started using this system (e.g. from an Excel sheet) — so their balance here is accurate from day one, instead of showing they owe their full fee.</p>
+            </div>
+
+            {result_banner}
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-bold text-slate-800 mb-2">Step 1 — Download the template</h3>
+                <p class="text-xs text-slate-500 mb-3">Fill this in from your existing Excel sheet, one row per historical payment. In Excel: <b>File → Save As → CSV (Comma delimited)</b>.</p>
+                <a href="/finance/import/template/{school_id}" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold px-4 py-2.5 rounded-xl text-sm transition inline-block">⬇ Download CSV Template</a>
+                <div class="mt-3 text-xs text-slate-500 bg-slate-50 rounded-lg p-3">
+                    <p class="font-bold text-slate-600 mb-1">Columns:</p>
+                    <p><b>admission_number</b> — must match an existing student</p>
+                    <p><b>fee_category</b> — one of: {esc(', '.join(categories))}</p>
+                    <p><b>term</b> — e.g. Term 1, Term 2, Term 3</p>
+                    <p><b>year</b> — e.g. 2024</p>
+                    <p><b>amount</b> — the amount that was paid</p>
+                    <p><b>payment_method</b> — cash / bank / mpesa / other (optional, defaults to cash)</p>
+                    <p><b>payment_date</b> — YYYY-MM-DD (optional, defaults to today)</p>
+                    <p><b>reference_note</b> — optional free text</p>
+                </div>
+            </div>
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-bold text-slate-800 mb-3">Step 2 — Upload your filled-in CSV</h3>
+                <form action="/api/v1/finance/import/upload/{school_id}" method="post" enctype="multipart/form-data" class="space-y-3">
+                    <input type="file" name="file" accept=".csv" required class="w-full border p-2.5 rounded-xl text-sm bg-white">
+                    <button type="submit" class="w-full bg-indigo-800 hover:bg-indigo-900 text-white font-bold py-3 rounded-xl text-sm transition">Import Payments</button>
+                </form>
+                <p class="text-[11px] text-slate-400 mt-2">Every row that can't be matched or validated is skipped and listed afterward — nothing partial or guessed gets silently imported.</p>
+            </div>
+
+            <div class="bg-white rounded-2xl border shadow-xs p-6">
+                <h3 class="text-sm font-bold text-slate-800 mb-2">Past Imports</h3>
+                {imports_html or "<p class='text-slate-400 text-xs italic py-2'>No imports done yet.</p>"}
+            </div>
+
+            <a href="/finance/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back to Finance</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/finance/import/template/{school_id}")
+def download_import_template(school_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(IMPORT_CSV_COLUMNS)
+    writer.writerow(["1001", "School Fees", "Term 1", "2025", "15000", "cash", "2025-01-15", "Term 1 opening balance"])
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=fee_import_template.csv"},
+    )
+
+
+@router.post("/api/v1/finance/import/upload/{school_id}")
+async def upload_fee_import(school_id: int, request: Request, file: UploadFile = File(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    raw_bytes = await file.read()
+    try:
+        text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw_bytes.decode("latin-1")
+
+    reader = csv.DictReader(io.StringIO(text))
+    missing_cols = [c for c in ["admission_number", "term", "year", "amount"] if c not in (reader.fieldnames or [])]
+    if missing_cols:
+        raise HTTPException(status_code=400, detail=f"This CSV is missing required column(s): {', '.join(missing_cols)}. Download the template and check your headers match exactly.")
+
+    imported_rows = []
+    errors = []
+    recorded_by = request.cookies.get("session_user_id")
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            default_category_id = _ensure_default_category(cur, school_id)
+            conn.commit()
+
+            cur.execute("SELECT id, name FROM fee_categories WHERE school_id = %s;", (school_id,))
+            category_by_name = {r['name'].strip().lower(): r['id'] for r in cur.fetchall()}
+
+            cur.execute("SELECT id, admission_number FROM students WHERE school_id = %s;", (school_id,))
+            student_by_adm = {r['admission_number'].strip().lower(): r['id'] for r in cur.fetchall()}
+
+            for i, row in enumerate(reader, start=2):  # row 1 is the header
+                adm = (row.get("admission_number") or "").strip()
+                if not adm:
+                    errors.append(f"Row {i}: missing admission_number — skipped.")
+                    continue
+                student_id = student_by_adm.get(adm.lower())
+                if not student_id:
+                    errors.append(f"Row {i}: no student found with admission number '{adm}' — skipped.")
+                    continue
+
+                category_name = (row.get("fee_category") or "School Fees").strip()
+                category_id = category_by_name.get(category_name.lower(), default_category_id if not category_name else None)
+                if category_id is None:
+                    errors.append(f"Row {i}: fee category '{category_name}' doesn't exist for this school — skipped. Add it under Fee Categories first, or leave blank for School Fees.")
+                    continue
+
+                term = (row.get("term") or "").strip()
+                if not term:
+                    errors.append(f"Row {i}: missing term — skipped.")
+                    continue
+
+                try:
+                    year = int((row.get("year") or "").strip())
+                except ValueError:
+                    errors.append(f"Row {i}: '{row.get('year')}' is not a valid year — skipped.")
+                    continue
+
+                try:
+                    amount = float((row.get("amount") or "").strip())
+                    if amount <= 0:
+                        raise ValueError()
+                except ValueError:
+                    errors.append(f"Row {i}: '{row.get('amount')}' is not a valid positive amount — skipped.")
+                    continue
+
+                payment_method = (row.get("payment_method") or "cash").strip().lower()
+                if payment_method not in ("cash", "bank", "mpesa", "other"):
+                    payment_method = "other"
+
+                payment_date_raw = (row.get("payment_date") or "").strip()
+                paid_at = None
+                if payment_date_raw:
+                    try:
+                        paid_at = datetime.strptime(payment_date_raw, "%Y-%m-%d")
+                    except ValueError:
+                        errors.append(f"Row {i}: date '{payment_date_raw}' isn't in YYYY-MM-DD format — used today's date instead.")
+
+                reference_note = (row.get("reference_note") or "").strip() or "Imported from historical records"
+
+                imported_rows.append({
+                    "student_id": student_id, "category_id": category_id, "term": term, "year": year,
+                    "amount": amount, "payment_method": payment_method, "paid_at": paid_at, "reference_note": reference_note,
+                })
+
+            if imported_rows:
+                cur.execute("""
+                    INSERT INTO fee_payment_imports (school_id, filename, imported_by_user_id, row_count, skipped_count)
+                    VALUES (%s, %s, %s, %s, %s) RETURNING id;
+                """, (school_id, file.filename, recorded_by, len(imported_rows), len(errors)))
+                batch_id = cur.fetchone()['id']
+
+                for row in imported_rows:
+                    receipt_number = _generate_receipt_number(cur, school_id)
+                    if row["paid_at"]:
+                        cur.execute("""
+                            INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, receipt_number, term, year, recorded_by_user_id, paid_at, import_batch_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (row["student_id"], school_id, row["category_id"], row["amount"], row["payment_method"], row["reference_note"], receipt_number, row["term"], row["year"], recorded_by, row["paid_at"], batch_id))
+                    else:
+                        cur.execute("""
+                            INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, receipt_number, term, year, recorded_by_user_id, import_batch_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (row["student_id"], school_id, row["category_id"], row["amount"], row["payment_method"], row["reference_note"], receipt_number, row["term"], row["year"], recorded_by, batch_id))
+                conn.commit()
+
+    import base64
+    errors_b64 = base64.b64encode("\n".join(errors[:50]).encode("utf-8")).decode("ascii") if errors else ""
+    result_param = f"{len(imported_rows)}:{len(errors)}:{errors_b64}"
+    return RedirectResponse(url=f"/finance/import/{school_id}?result={urllib.parse.quote(result_param)}", status_code=303)
+
+
+@router.post("/api/v1/finance/import/reverse/{school_id}/{batch_id}")
+def reverse_fee_import(school_id: int, batch_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # Deletes every payment tagged with this batch (cascades from
+            # fee_payment_imports), then the batch record itself — a clean,
+            # complete undo of exactly what that one import added, leaving
+            # every other payment (imported or manually entered) untouched.
+            cur.execute("DELETE FROM fee_payment_imports WHERE id = %s AND school_id = %s;", (batch_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/finance/import/{school_id}", status_code=303)
