@@ -23,10 +23,13 @@ A student's balance for a given term is simply:
 import os
 import csv
 import io
+import logging
 import urllib.parse
 from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException, Form, File, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+
+logger = logging.getLogger("cbe_engine")
 
 from shared import (
     esc,
@@ -138,11 +141,16 @@ def bootstrap_finance_schema():
             # Wrapped defensively: if the constraint is already in this shape,
             # or under a different name than expected, this simply no-ops
             # rather than raising — never blocks the rest of the bootstrap.
+            # (The actual save logic no longer depends on this constraint
+            # existing — see save_fee_structure — but we still attempt it
+            # here since a real uniqueness guarantee at the DB level is
+            # good practice regardless.)
             try:
                 cur.execute("ALTER TABLE fee_structures DROP CONSTRAINT IF EXISTS fee_structures_school_id_grade_name_term_year_key;")
                 cur.execute("ALTER TABLE fee_structures ADD CONSTRAINT fee_structures_category_grade_term_year_key UNIQUE (school_id, fee_category_id, grade_name, term, year);")
-            except Exception:
+            except Exception as e:
                 conn.rollback()
+                logger.warning(f"Could not add fee_structures uniqueness constraint (non-fatal, save logic doesn't depend on it): {e}")
             else:
                 conn.commit()
 
@@ -550,12 +558,34 @@ async def save_fee_structure(school_id: int, request: Request):
                     continue
                 if amount < 0:
                     continue
-                cur.execute("""
-                    INSERT INTO fee_structures (school_id, fee_category_id, grade_name, education_level, term, year, amount)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (school_id, fee_category_id, grade_name, term, year) DO UPDATE SET amount = EXCLUDED.amount;
-                """, (school_id, category_id, g['grade_name'], g['education_level'], term, year, amount))
-            conn.commit()
+
+                # Deliberately not using ON CONFLICT here — that requires a
+                # specific named unique constraint to exist on the table,
+                # and relying on that turned out to be fragile (a schema
+                # migration adding it could silently fail on some databases,
+                # which would make every single save here error out with
+                # "no unique or exclusion constraint matching ON CONFLICT").
+                # This check-then-update-or-insert works regardless of
+                # whether that constraint actually exists.
+                try:
+                    cur.execute("""
+                        SELECT id FROM fee_structures
+                        WHERE school_id = %s AND fee_category_id = %s AND grade_name = %s AND term = %s AND year = %s;
+                    """, (school_id, category_id, g['grade_name'], term, year))
+                    existing_row = cur.fetchone()
+                    if existing_row:
+                        cur.execute("UPDATE fee_structures SET amount = %s WHERE id = %s;", (amount, existing_row['id']))
+                    else:
+                        cur.execute("""
+                            INSERT INTO fee_structures (school_id, fee_category_id, grade_name, education_level, term, year, amount)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s);
+                        """, (school_id, category_id, g['grade_name'], g['education_level'], term, year, amount))
+                    conn.commit()
+                except Exception as e:
+                    # One bad grade shouldn't stop every other grade in this
+                    # same save from going through.
+                    conn.rollback()
+                    logger.warning(f"Failed to save fee structure for school {school_id}, grade {g['grade_name']}: {e}")
 
     return RedirectResponse(url=f"/finance/dashboard/{school_id}?term={urllib.parse.quote(term)}&year={year}", status_code=303)
 
