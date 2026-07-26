@@ -700,18 +700,41 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
             """, (student_id, term, year))
             paid_by_category = {r['fee_category_id']: float(r['paid']) for r in cur.fetchall()}
 
+            # The balance/fee summary above is deliberately for ONE specific
+            # period (whichever term is selected) — but the payment history
+            # below shows EVERY payment ever recorded for this student,
+            # regardless of term. This matters specifically for imported
+            # backlog data: a payment from Term 1 2024 should always be
+            # visible here, not just when someone happens to be viewing
+            # that exact historical term.
             cur.execute("""
                 SELECT fp.*, fc.name AS category_name FROM fee_payments fp
                 LEFT JOIN fee_categories fc ON fp.fee_category_id = fc.id
-                WHERE fp.student_id = %s AND fp.term = %s AND fp.year = %s ORDER BY fp.paid_at DESC;
-            """, (student_id, term, year))
+                WHERE fp.student_id = %s ORDER BY fp.paid_at DESC;
+            """, (student_id,))
             payments = cur.fetchall()
+
+            # Every term/year that either has a configured fee or has any
+            # payment recorded for this student, so the period selector
+            # covers historical terms too, not just currently-active ones.
+            cur.execute("""
+                SELECT DISTINCT term, year FROM fee_structures WHERE school_id = %s
+                UNION
+                SELECT DISTINCT term, year FROM fee_payments WHERE student_id = %s
+                ORDER BY year DESC, term DESC;
+            """, (school_id, student_id))
+            available_periods = cur.fetchall()
 
     total_fee = sum(fee_by_category.values())
     total_paid = sum(paid_by_category.values())
     total_balance = total_fee - total_paid
 
     category_options = "".join(f"<option value='{c['id']}'>{esc(c['name'])}</option>" for c in categories)
+
+    period_options = "".join(
+        f"<option value='{esc(p['term'])}|{p['year']}' {'selected' if p['term'] == term and p['year'] == year else ''}>{esc(p['term'])} {p['year']}</option>"
+        for p in available_periods
+    )
 
     breakdown_html = ""
     for c in categories:
@@ -732,6 +755,7 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
     payments_html = "".join(f"""
         <tr class="border-b border-slate-50">
             <td class="p-3 text-xs text-slate-400">{p['paid_at'].strftime('%d %b %Y') if p['paid_at'] else ''}</td>
+            <td class="p-3 text-xs text-slate-500">{esc(p['term'])} {p['year']}</td>
             <td class="p-3 text-xs font-semibold text-indigo-700">{esc(p['category_name'] or 'School Fees')}</td>
             <td class="p-3 text-sm font-semibold text-slate-700 capitalize">{esc(p['payment_method'])}</td>
             <td class="p-3 text-right font-bold text-emerald-700">KSh {float(p['amount']):,.0f}</td>
@@ -752,11 +776,19 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
     <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
         <div class="max-w-2xl mx-auto space-y-4">
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
-                <h2 class="text-lg font-black text-slate-800">{esc(full_student_name(student))}</h2>
-                <p class="text-xs text-slate-400">#{esc(student['admission_number'])} — {esc(student['grade_name'])} — {esc(term)} {year}</p>
+                <div class="flex items-center justify-between gap-3 flex-wrap">
+                    <div>
+                        <h2 class="text-lg font-black text-slate-800">{esc(full_student_name(student))}</h2>
+                        <p class="text-xs text-slate-400">#{esc(student['admission_number'])} — {esc(student['grade_name'])}</p>
+                    </div>
+                    <form method="get" class="flex items-center gap-2">
+                        <label class="text-xs font-bold text-slate-500">Viewing period:</label>
+                        <select onchange="const [t,y]=this.value.split('|'); window.location.href='/finance/student/{school_id}/{student_id}?term='+encodeURIComponent(t)+'&year='+y;" class="border p-2 rounded-lg text-xs bg-white font-semibold">{period_options}</select>
+                    </form>
+                </div>
                 <div class="grid grid-cols-3 gap-3 mt-4">
-                    <div class="bg-slate-50 rounded-xl p-3 text-center"><p class="text-[10px] font-bold text-slate-400 uppercase">Total Fees</p><p class="font-black text-slate-800">KSh {total_fee:,.0f}</p></div>
-                    <div class="bg-emerald-50 rounded-xl p-3 text-center"><p class="text-[10px] font-bold text-emerald-600 uppercase">Total Paid</p><p class="font-black text-emerald-800">KSh {total_paid:,.0f}</p></div>
+                    <div class="bg-slate-50 rounded-xl p-3 text-center"><p class="text-[10px] font-bold text-slate-400 uppercase">Fees ({esc(term)} {year})</p><p class="font-black text-slate-800">KSh {total_fee:,.0f}</p></div>
+                    <div class="bg-emerald-50 rounded-xl p-3 text-center"><p class="text-[10px] font-bold text-emerald-600 uppercase">Paid ({esc(term)} {year})</p><p class="font-black text-emerald-800">KSh {total_paid:,.0f}</p></div>
                     <div class="bg-rose-50 rounded-xl p-3 text-center"><p class="text-[10px] font-bold text-rose-600 uppercase">Balance</p><p class="font-black text-rose-800">KSh {total_balance:,.0f}</p></div>
                 </div>
                 {f"<div class='mt-3 pt-3 border-t'>{breakdown_html}</div>" if breakdown_html else ""}
@@ -794,10 +826,10 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
             </div>
 
             <div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
-                <div class="px-5 py-3 border-b bg-slate-50/60"><h3 class="text-sm font-bold text-slate-800">Payment History</h3></div>
+                <div class="px-5 py-3 border-b bg-slate-50/60"><h3 class="text-sm font-bold text-slate-800">Payment History (All Terms)</h3></div>
                 <table class="w-full text-sm">
-                    <thead><tr class="bg-slate-50 text-slate-500 text-xs border-b"><th class="p-3 text-left">Date</th><th class="p-3 text-left">Category</th><th class="p-3 text-left">Method</th><th class="p-3 text-right">Amount</th><th class="p-3"></th></tr></thead>
-                    <tbody>{payments_html or "<tr><td colspan='5' class='p-6 text-center text-slate-400 text-xs italic'>No payments recorded yet.</td></tr>"}</tbody>
+                    <thead><tr class="bg-slate-50 text-slate-500 text-xs border-b"><th class="p-3 text-left">Date</th><th class="p-3 text-left">Term</th><th class="p-3 text-left">Category</th><th class="p-3 text-left">Method</th><th class="p-3 text-right">Amount</th><th class="p-3"></th></tr></thead>
+                    <tbody>{payments_html or "<tr><td colspan='6' class='p-6 text-center text-slate-400 text-xs italic'>No payments recorded yet.</td></tr>"}</tbody>
                 </table>
             </div>
 
