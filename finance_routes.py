@@ -473,7 +473,7 @@ def fee_structure_view(school_id: int, request: Request, category_id: int = None
             categories = cur.fetchall()
             current_category = next((c for c in categories if c['id'] == category_id), categories[0] if categories else None)
 
-            cur.execute("SELECT DISTINCT grade_name, education_level FROM classes ORDER BY id ASC;")
+            cur.execute("SELECT grade_name, education_level FROM classes GROUP BY grade_name, education_level ORDER BY MIN(id) ASC;")
             all_grades = cur.fetchall()
 
             cur.execute("SELECT grade_name, amount FROM fee_structures WHERE school_id = %s AND fee_category_id = %s AND term = %s AND year = %s;", (school_id, category_id, term, year))
@@ -545,7 +545,7 @@ async def save_fee_structure(school_id: int, request: Request):
             if not cur.fetchone():
                 raise HTTPException(status_code=400, detail="Invalid fee category.")
 
-            cur.execute("SELECT DISTINCT grade_name, education_level FROM classes ORDER BY id ASC;")
+            cur.execute("SELECT grade_name, education_level FROM classes GROUP BY grade_name, education_level ORDER BY MIN(id) ASC;")
             all_grades = cur.fetchall()
 
             for g in all_grades:
