@@ -49,6 +49,35 @@ GITHUB_PAT = (os.getenv("GITHUB_PAT") or "").strip() or None
 GITHUB_REPO = (os.getenv("GITHUB_REPO") or "").strip() or None  # format: "username/repo-name"
 GITHUB_BACKUP_WORKFLOW_FILE = (os.getenv("GITHUB_BACKUP_WORKFLOW_FILE") or "db-backup.yml").strip()
 
+TOAST_CONTAINER_HTML = """
+<div id="toast-container" style="position:fixed; top:20px; right:20px; z-index:9999; display:flex; flex-direction:column; gap:8px;"></div>
+<script>
+function showToast(message, type) {
+    var container = document.getElementById('toast-container');
+    if (!container) return;
+    var colors = {success: '#059669', error: '#dc2626', warning: '#d97706'};
+    var toast = document.createElement('div');
+    toast.style.cssText = "background:" + (colors[type] || colors.success) + ";color:white;padding:12px 20px;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.18);font-family:'Plus Jakarta Sans',sans-serif;font-size:13px;font-weight:600;opacity:0;transform:translateX(24px);transition:all 0.3s ease;max-width:320px;";
+    toast.textContent = message;
+    container.appendChild(toast);
+    requestAnimationFrame(function() { toast.style.opacity = '1'; toast.style.transform = 'translateX(0)'; });
+    setTimeout(function() {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(24px)';
+        setTimeout(function() { toast.remove(); }, 300);
+    }, 4200);
+}
+</script>
+"""
+
+def toast_trigger(message: str, toast_type: str = "success") -> str:
+    """Returns a script tag that shows a toast on page load. Use for
+    transient one-time confirmations (e.g. 'Student added') — not for
+    persistent warnings someone needs to actually act on, which should stay
+    as a real, visible banner instead."""
+    safe_message = esc(message).replace("'", "\\'")
+    return f"<script>document.addEventListener('DOMContentLoaded', function() {{ showToast('{safe_message}', '{toast_type}'); }});</script>"
+
 def support_contact_html() -> str:
     """A small 'need help?' line for dashboard footers. Returns an empty
     string if no support contact has been configured."""
@@ -1321,6 +1350,17 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             cur.execute("SELECT COUNT(*) AS cnt FROM timetable_periods WHERE school_id = %s;", (school_id,))
             has_timetable_periods = cur.fetchone()['cnt'] > 0
 
+            # School-wide average score per exam cycle, for the trend chart —
+            # one simple aggregate query, no per-student loop.
+            cur.execute("""
+                SELECT sc.cycle_name, AVG(sc.raw_score) AS avg_score, COUNT(DISTINCT sc.student_id) AS student_count
+                FROM student_scores sc
+                JOIN students s ON sc.student_id = s.id
+                WHERE s.school_id = %s
+                GROUP BY sc.cycle_name;
+            """, (school_id,))
+            trend_rows = {r['cycle_name']: r for r in cur.fetchall()}
+
     if not school:
         raise HTTPException(status_code=404, detail="Institution Tenant Context Missed.")
     
@@ -1373,6 +1413,38 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             <h2 class="text-xs font-bold uppercase tracking-wider text-indigo-700 mb-1">🚀 Getting Started</h2>
             <p class="text-xs text-slate-400 mb-3">A few things left to finish setting up your school.</p>
             {checklist_rows}
+        </div>
+        """
+
+    trend_chart_html = ""
+    cycles_with_data = [c for c in ["Opener", "Midterm", "End Term"] if c in trend_rows]
+    if cycles_with_data:
+        bar_width = 100
+        gap = 40
+        chart_bars = ""
+        for i, cycle in enumerate(cycles_with_data):
+            avg = float(trend_rows[cycle]['avg_score'])
+            bar_height = max(4, (avg / 100) * 140)
+            x = 20 + i * (bar_width + gap)
+            chart_bars += f"""
+            <rect x="{x}" y="{160 - bar_height}" width="{bar_width}" height="{bar_height}" rx="6" fill="url(#trendGrad)" />
+            <text x="{x + bar_width/2}" y="{160 - bar_height - 8}" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e293b" font-family="'Plus Jakarta Sans',sans-serif">{avg:.1f}%</text>
+            <text x="{x + bar_width/2}" y="180" text-anchor="middle" font-size="11" fill="#64748b" font-family="'Plus Jakarta Sans',sans-serif">{cycle}</text>
+            """
+        chart_width = 20 + len(cycles_with_data) * (bar_width + gap)
+        trend_chart_html = f"""
+        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
+            <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📈 Performance Trend This Term</h2>
+            <svg viewBox="0 0 {chart_width} 195" style="width:100%; max-width:480px; height:auto;">
+                <defs>
+                    <linearGradient id="trendGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                        <stop offset="0%" stop-color="#4f46e5"/>
+                        <stop offset="100%" stop-color="#0d9488"/>
+                    </linearGradient>
+                </defs>
+                <line x1="10" y1="160" x2="{chart_width - 10}" y2="160" stroke="#e2e8f0" stroke-width="1"/>
+                {chart_bars}
+            </svg>
         </div>
         """
 
@@ -1536,6 +1608,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
     </head>
     <body class="bg-[#F7F8FB] text-slate-800 antialiased min-h-full flex flex-col relative">
+        {TOAST_CONTAINER_HTML}
 
         <header class="bg-white border-b border-slate-200/80 px-4 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 sticky top-0 z-40 backdrop-blur-md bg-white/90 shadow-2xs">
             <div class="flex items-center space-x-4">
@@ -1558,8 +1631,8 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         </header>
 
         {"<div class='bg-amber-50 border-b border-amber-200 text-amber-800 text-xs px-8 py-2.5 text-center font-semibold'>⚠️ That logo was saved to temporary server storage, not cloud storage — it will likely disappear the next time the server restarts. Check that SUPABASE_URL and a Supabase secret/service key (SUPABASE_KEY, SUPABASE_SECRET_KEY, or SUPABASE_SERVICE_ROLE_KEY) are set correctly on Render, and that a public 'logos' bucket exists in Supabase, then re-upload.</div>" if logo_storage == "local" else ""}
-        {"<div class='bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-xs px-8 py-2.5 text-center font-semibold'>✅ Student registered successfully!</div>" if student_added else ""}
-        {"<div class='bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-xs px-8 py-2.5 text-center font-semibold'>✅ Staff account created successfully — activate it from the Staff panel once ready.</div>" if staff_added else ""}
+        {toast_trigger("Student registered successfully!") if student_added else ""}
+        {toast_trigger("Staff account created — activate it from the Staff panel once ready.") if staff_added else ""}
 
         <div class="flex flex-col lg:flex-row flex-1 w-full max-w-[1600px] mx-auto">
 
@@ -1691,6 +1764,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             <main class="flex-1 p-4 sm:p-8 space-y-8 min-w-0">
                 {onboarding_html}
                 {stats_html}
+                {trend_chart_html}
                 <div>
                     <div class="flex items-center justify-between mb-4">
                         <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Classroom Cohorts Grouping</h2>
@@ -1815,6 +1889,7 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
         <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
     </head>
     <body class="bg-[#F8FAFC] text-slate-800 antialiased min-h-full">
+        {TOAST_CONTAINER_HTML}
         <header class="bg-slate-900 text-white px-8 py-4 flex justify-between items-center">
             <h1 class="text-base font-bold tracking-tight">🛡️ Super Admin Portal</h1>
             <div class="flex items-center gap-2">
@@ -1825,8 +1900,8 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
             </div>
         </header>
 
-        {"<div class='bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-xs px-8 py-2.5 text-center font-semibold'>✅ Backup triggered — check the Actions tab in your GitHub repo for progress.</div>" if backup_started else ""}
-        {f"<div class='bg-rose-50 border-b border-rose-200 text-rose-800 text-xs px-8 py-2.5 text-center font-semibold'>⚠️ {esc(backup_error)}</div>" if backup_error else ""}
+        {toast_trigger("Backup triggered — check the Actions tab in your GitHub repo for progress.") if backup_started else ""}
+        {toast_trigger(backup_error, "error") if backup_error else ""}
 
         <div class="p-8 max-w-6xl mx-auto w-full">
             <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
@@ -2234,6 +2309,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
         <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
     </head>
     <body class="bg-[#F8FAFC] text-slate-800 antialiased min-h-full flex flex-col relative">
+        {TOAST_CONTAINER_HTML}
 
         <header class="bg-white border-b border-slate-200/80 px-8 py-4 flex justify-between items-center sticky top-0 z-40 backdrop-blur-md bg-white/90 shadow-2xs">
             <div class="flex items-center space-x-4">
@@ -2252,7 +2328,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
             </div>
         </header>
 
-        {"<div class='bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-xs px-8 py-2.5 text-center font-semibold'>✅ Student registered successfully!</div>" if student_added else ""}
+        {toast_trigger("Student registered successfully!") if student_added else ""}
 
         <div class="p-8 max-w-6xl mx-auto w-full flex-1">
             <div class="flex items-center justify-between mb-4">
@@ -3145,7 +3221,7 @@ def add_student_view(school_id: int, request: Request):
     <body class="bg-slate-100 flex items-center justify-center min-h-screen p-4">
         <div class="bg-white p-6 sm:p-8 rounded-2xl border shadow-md w-full max-w-lg">
             <h2 class="text-xl font-bold mb-4 text-slate-800">Add New Learner Profile</h2>
-            <form action="/api/v1/students/add/{school_id}" method="post" class="space-y-4">
+            <form action="/api/v1/students/add/{school_id}" method="post" class="space-y-4" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){{b.disabled=true; b.textContent='Saving...'; b.style.opacity='0.7';}}">
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div><label class="text-xs font-bold text-slate-600">First Name</label><input type="text" name="first_name" class="w-full border p-2.5 rounded mt-1 text-base" required></div>
                     <div><label class="text-xs font-bold text-slate-600">Middle Name</label><input type="text" name="middle_name" class="w-full border p-2.5 rounded mt-1 text-base"></div>
@@ -3201,7 +3277,7 @@ def staff_registration_panel(school_id: int, request: Request):
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-sm border-t-8 border-indigo-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Add Staff Member</h2>
             <p class="text-xs text-slate-400 mb-6">{esc(school['name'])}</p>
-            <form action="/api/v1/staff/add/{school_id}" method="post" class="space-y-4">
+            <form action="/api/v1/staff/add/{school_id}" method="post" class="space-y-4" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){{b.disabled=true; b.textContent='Saving...'; b.style.opacity='0.7';}}">
                 <div>
                     <label class="text-xs font-bold uppercase tracking-wider text-slate-600">Full Name</label>
                     <input type="text" name="full_name" class="w-full border border-slate-200 p-2.5 rounded-lg text-sm mt-1" required>
@@ -3504,7 +3580,7 @@ def educators_bulk_entry_grid(
             </form>
         </div>
 
-        <form action="/api/v1/scores/bulk-save/{school_id}" method="post" class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+        <form action="/api/v1/scores/bulk-save/{school_id}" method="post" class="bg-white rounded-2xl border shadow-xs overflow-hidden" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){{b.disabled=true; b.textContent='Saving...'; b.style.opacity='0.7';}}">
             <input type="hidden" name="grade_name" value="{esc(grade_name)}">
             <input type="hidden" name="education_level" value="{esc(education_level)}">
             <input type="hidden" name="stream" value="{esc(stream)}">
@@ -3641,7 +3717,12 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             students = cur.fetchall()
             
             if not students:
-                return "<h2 style='font-family:sans-serif; text-align:center; padding:50px;'>No students registered in this segment group stream yet.</h2>"
+                return f"""
+                <div style="font-family:'Plus Jakarta Sans',Arial,sans-serif; text-align:center; padding:80px 20px; background:#F7F9F8; min-height:100vh;">
+                    <p style="font-size:15px; color:#475569; margin-bottom:20px;">No students are registered in this class yet, so there's nothing to generate report cards for.</p>
+                    <a href="/admin/dashboard/{school_id}" style="background:#1e1b4b; color:white; padding:12px 24px; border-radius:10px; font-weight:bold; text-decoration:none; font-size:13px;">← Back to Dashboard</a>
+                </div>
+                """
 
             # Only show a column for an exam cycle if it's actually been keyed
             # in anywhere for this batch — e.g. if only End Term has been
