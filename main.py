@@ -3882,6 +3882,35 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                 for sc in cur.fetchall():
                     all_scores_by_student.setdefault(sc['student_id'], []).append(sc)
 
+            # A non-blocking alert (not a hard stop) listing any student who
+            # has zero marks entered for one or more subjects this term —
+            # so whoever's printing notices before handing out incomplete
+            # report cards, rather than after.
+            missing_marks_by_student = {}
+            for s in students:
+                subjects_with_scores = {sc['learning_area_id'] for sc in all_scores_by_student.get(s['student_id'], [])}
+                missing_subject_names = [sub['name'] for sub in subjects if sub['id'] not in subjects_with_scores]
+                if missing_subject_names:
+                    missing_marks_by_student[s['student_id']] = {
+                        'name': full_student_name(s),
+                        'admission_number': s['admission_number'],
+                        'missing_subjects': missing_subject_names,
+                    }
+
+            missing_marks_banner = ""
+            if missing_marks_by_student:
+                missing_rows = "".join(
+                    f"<li><b>{esc(info['name'])}</b> (#{esc(info['admission_number'])}) — missing: {esc(', '.join(info['missing_subjects']))}</li>"
+                    for info in missing_marks_by_student.values()
+                )
+                missing_marks_banner = f"""
+                <div class="no-print" style="max-width:223mm; margin:0 auto 16px auto; background:#fffbeb; border:1px solid #fde68a; color:#92400e; padding:14px 18px; border-radius:10px; font-family:'Plus Jakarta Sans',Arial,sans-serif;">
+                    <p style="margin:0 0 8px; font-weight:800; font-size:13px;">⚠️ {len(missing_marks_by_student)} student(s) in this class are missing marks for one or more subjects:</p>
+                    <ul style="margin:0; padding-left:18px; font-size:12px; line-height:1.6;">{missing_rows}</ul>
+                    <p style="margin:8px 0 0; font-size:11px; color:#78350f;">This is just a heads-up — report cards below still print normally, using whichever marks are actually entered.</p>
+                </div>
+                """
+
             for s in students:
                 scores = all_scores_by_student.get(s['student_id'], [])
                 
@@ -4118,6 +4147,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                 <div class="no-print" style="max-width:199mm; margin: 0 auto 20px auto; text-align:right;">
                     <button onclick="window.print()" style="background:#0f172a; color:white; border:none; padding:11px 22px; font-weight:bold; font-size:13px; border-radius:6px; cursor:pointer; box-shadow:0 3px 6px rgba(0,0,0,0.15);">🖨️ Commit Print Batch to Paper</button>
                 </div>
+                {missing_marks_banner}
                 {joined_report_pages}
             </body>
             </html>
