@@ -521,6 +521,7 @@ def timetable_dashboard(school_id: int, request: Request):
                 <a href="/timetable/subject-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
                 <a href="/timetable/sync-rules/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Same-Time Rules</a>
                 <a href="/timetable/teachers/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🖨 Teacher Timetables</a>
+                <a href="/timetable/collision-check/{school_id}" class="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🔍 Check for Collisions</a>
                 <a href="/timetable/co-curricular/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🎭 Co-Curricular</a>
                 <a href="/timetable/custom-subjects/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">➕ Custom Subjects</a>
                 <a href="/timetable/master/{school_id}" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🗓 Whole School View</a>
@@ -949,6 +950,114 @@ def teacher_timetable_picker(school_id: int, request: Request):
             <div class="pt-4">
                 <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back</a>
             </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/timetable/collision-check/{school_id}", response_class=HTMLResponse)
+def timetable_collision_check(school_id: int, request: Request, education_level: str = None):
+    """Scans every slot currently in the timetable (optionally scoped to one
+    education level) for a teacher booked into two different classes at the
+    exact same day/period — a real double-booking, not a hypothetical one.
+    Purely read-only; only reports what it finds, changes nothing. This is
+    the direct equivalent of ASC Timetables' clash/conflict report."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            query = """
+                SELECT ts.day_of_week, ts.period_id, tp.label AS period_label, tp.start_time, tp.end_time,
+                       ts.staff_user_id, u.full_name, u.email,
+                       ts.grade_name, ts.stream, ts.education_level,
+                       COALESCE(la.name, cs.name, ca.name) AS subject_name
+                FROM timetable_slots ts
+                JOIN timetable_periods tp ON ts.period_id = tp.id
+                LEFT JOIN users u ON ts.staff_user_id = u.id
+                LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+                LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
+                WHERE ts.school_id = %s AND ts.staff_user_id IS NOT NULL
+            """
+            params = [school_id]
+            if education_level:
+                query += " AND ts.education_level = %s"
+                params.append(education_level)
+            cur.execute(query, tuple(params))
+            all_slots = cur.fetchall()
+
+    # Group every slot by (day, period, teacher) — any group containing
+    # more than one distinct (grade, stream) is a genuine double-booking.
+    groups = {}
+    for slot in all_slots:
+        key = (slot['day_of_week'], slot['period_id'], slot['staff_user_id'])
+        groups.setdefault(key, []).append(slot)
+
+    collisions = []
+    for key, slots in groups.items():
+        distinct_classes = {(s['grade_name'], s['stream']) for s in slots}
+        if len(distinct_classes) > 1:
+            collisions.append(slots)
+
+    # Sort collisions for a stable, readable report: by day, then period, then teacher.
+    day_order = {d: i for i, d in enumerate(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"])}
+    collisions.sort(key=lambda slots: (day_order.get(slots[0]['day_of_week'], 99), slots[0]['period_id'], slots[0]['full_name'] or ''))
+
+    collision_rows_html = ""
+    for slots in collisions:
+        teacher_name = slots[0]['full_name'] or slots[0]['email'] or 'Unknown teacher'
+        period_label = slots[0]['period_label']
+        time_range = f"{slots[0]['start_time']}–{slots[0]['end_time']}"
+        classes_html = "".join(
+            f"<li><b>{esc(_section_label(s['grade_name'], s['stream']))}</b> ({esc(s['education_level'])}) — {esc(s['subject_name'] or 'Unknown subject')}"
+            f" <a href='/timetable/grade/{school_id}?grade_name={urllib.parse.quote(s['grade_name'])}&education_level={urllib.parse.quote(s['education_level'])}&stream={urllib.parse.quote(s['stream'])}' class='text-indigo-700 hover:underline text-xs font-bold ml-2'>Fix →</a></li>"
+            for s in slots
+        )
+        collision_rows_html += f"""
+        <div class="bg-white rounded-2xl border border-rose-200 shadow-xs p-5 mb-4">
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="text-sm font-bold text-rose-700">⚠️ {esc(teacher_name)} — double-booked</h3>
+                <span class="text-xs text-slate-400">{esc(slots[0]['day_of_week'])}, {esc(period_label)} ({esc(time_range)})</span>
+            </div>
+            <ul class="text-sm text-slate-700 space-y-1 list-disc list-inside">{classes_html}</ul>
+        </div>
+        """
+
+    level_tabs = "".join(
+        f"""<a href="/timetable/collision-check/{school_id}?education_level={urllib.parse.quote(lvl)}"
+               class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-rose-700 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
+        for lvl in EDUCATION_LEVELS
+    )
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Timetable Collision Check</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">🔍 Timetable Collision Check — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">Scans every currently scheduled slot for a teacher double-booked across two different classes at the same time.</p>
+            </div>
+            <a href="/timetable/dashboard/{school_id}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Timetables</a>
+        </header>
+        <div class="p-4 sm:p-8 max-w-3xl mx-auto space-y-4">
+            <div class="flex gap-2 flex-wrap">
+                <a href="/timetable/collision-check/{school_id}" class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-rose-700 text-white' if not education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">All Levels</a>
+                {level_tabs}
+            </div>
+
+            {f"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl font-semibold'>✅ No collisions found{' for ' + esc(education_level) if education_level else ' across the whole school'} — every teacher is scheduled in exactly one place at a time.</div>" if not collisions else f"<div class='bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-xl font-semibold'>⚠️ Found {len(collisions)} collision(s){' in ' + esc(education_level) if education_level else ''} — see below.</div>"}
+
+            {collision_rows_html}
         </div>
     </body>
     </html>
