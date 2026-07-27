@@ -1625,6 +1625,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
                     <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
                     <a href='/admin/reports/subject-analysis/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-amber-600 hover:bg-amber-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Subj. Analysis</a>
+                    <a href='/admin/reports/grade-distribution/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}' target='_blank' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Grade Distribution</a>
                     <a href='/admin/reports/top10/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-rose-600 hover:bg-rose-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Top 10</a>
                     <a href='/admin/reports/top-subject/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-cyan-700 hover:bg-cyan-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Top/Subject</a>
                 </div>
@@ -2412,6 +2413,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
                     <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
                     <a href='/admin/reports/subject-analysis/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-amber-600 hover:bg-amber-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Subj. Analysis</a>
+                    <a href='/admin/reports/grade-distribution/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}' target='_blank' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Grade Distribution</a>
                     <a href='/admin/reports/top10/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-rose-600 hover:bg-rose-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Top 10</a>
                     <a href='/admin/reports/top-subject/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-cyan-700 hover:bg-cyan-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Top/Subject</a>
                 </div>
@@ -2824,7 +2826,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
 
 
 @app.get("/admin/reports/top10/{school_id}", response_class=HTMLResponse)
-def print_top10_per_stream(school_id: int, grade_name: str, education_level: str, stream: str, request: Request):
+def print_top10_per_stream(school_id: int, grade_name: str, education_level: str, stream: str, request: Request, whole_grade: str = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2840,13 +2842,22 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
 
-            cur.execute("""
-                SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name
-                FROM students s
-                JOIN classes c ON s.class_id = c.id
-                WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s AND s.stream = %s
-                  AND (s.status IS NULL OR s.status != 'GRADUATED');
-            """, (school_id, grade_name, education_level, stream))
+            if whole_grade:
+                cur.execute("""
+                    SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name, s.stream
+                    FROM students s
+                    JOIN classes c ON s.class_id = c.id
+                    WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
+                      AND (s.status IS NULL OR s.status != 'GRADUATED');
+                """, (school_id, grade_name, education_level))
+            else:
+                cur.execute("""
+                    SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name, s.stream
+                    FROM students s
+                    JOIN classes c ON s.class_id = c.id
+                    WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s AND s.stream = %s
+                      AND (s.status IS NULL OR s.status != 'GRADUATED');
+                """, (school_id, grade_name, education_level, stream))
             students = cur.fetchall()
 
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
@@ -2889,19 +2900,23 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
         final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
         logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
 
-    class_title = grade_name if stream == "SINGLE STREAM" else f"{grade_name} — Stream {stream}"
+    class_title = (f"{grade_name} — Whole Grade" if whole_grade else (grade_name if stream == "SINGLE STREAM" else f"{grade_name} — Stream {stream}"))
 
     rows_html = "".join(f"""
         <tr>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{i}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;'>{esc(r['student']['admission_number'])}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{esc(full_student_name(r['student']))}</td>
+            {"<td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>" + esc(r['student']['stream']) + "</td>" if whole_grade else ""}
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['total_marks']:.0f}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{r['avg_marks']:.1f}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['total_points']}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['overall_level']}</td>
         </tr>
     """ for i, r in enumerate(top10, start=1))
+
+    stream_header = "<th style='text-align:center;'>Stream</th>" if whole_grade else ""
+    colspan_count = 8 if whole_grade else 7
 
     return f"""
     <!DOCTYPE html>
@@ -2931,12 +2946,12 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
         <table>
             <thead>
                 <tr>
-                    <th style="text-align:center;">Pos.</th><th>Adm No.</th><th>Full Name</th>
+                    <th style="text-align:center;">Pos.</th><th>Adm No.</th><th>Full Name</th>{stream_header}
                     <th style="text-align:center;">Total Marks</th><th style="text-align:center;">Avg Marks</th>
                     <th style="text-align:center;">Total Points</th><th style="text-align:center;">Level</th>
                 </tr>
             </thead>
-            <tbody>{rows_html or "<tr><td colspan='7' style='padding:20px;text-align:center;color:#94a3b8;'>No scores recorded yet for this stream.</td></tr>"}</tbody>
+            <tbody>{rows_html or "<tr><td colspan='" + str(colspan_count) + "' style='padding:20px;text-align:center;color:#94a3b8;'>No scores recorded yet for this stream.</td></tr>"}</tbody>
         </table>
     </body>
     </html>
@@ -2973,12 +2988,14 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
             """, (school_id, grade_name, education_level, stream, st['active_cycle']))
             all_scores = cur.fetchall()
 
-    best_by_subject = {}
+    scores_by_subject = {}
     for row in all_scores:
         lid = row['learning_area_id']
-        score = float(row['raw_score'])
-        if lid not in best_by_subject or score > best_by_subject[lid]['score']:
-            best_by_subject[lid] = {'score': score, 'student': row}
+        scores_by_subject.setdefault(lid, []).append(row)
+    top10_by_subject = {
+        lid: sorted(rows, key=lambda r: float(r['raw_score']), reverse=True)[:10]
+        for lid, rows in scores_by_subject.items()
+    }
 
     logo_src = school.get('logo_url')
     logo_html = ""
@@ -2988,28 +3005,33 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
 
     class_title = grade_name if stream == "SINGLE STREAM" else f"{grade_name} — Stream {stream}"
 
-    rows_html = ""
+    subject_tables_html = ""
     for sub in subjects:
-        best = best_by_subject.get(sub['id'])
-        if best:
-            top_student = best['student']
-            pld = evaluate_performance_metrics(best['score'])['pld']
-            rows_html += f"""
+        top10 = top10_by_subject.get(sub['id'], [])
+        if top10:
+            rows_html = "".join(f"""
             <tr>
-                <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:bold;'>{esc(sub['name'])}</td>
-                <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;'>{esc(full_student_name(top_student))}</td>
-                <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-family:monospace;text-align:center;'>{esc(top_student['admission_number'])}</td>
-                <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{best['score']:.0f}%</td>
-                <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{pld}</td>
+                <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{i}</td>
+                <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;'>{esc(full_student_name(r))}</td>
+                <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;font-family:monospace;text-align:center;'>{esc(r['admission_number'])}</td>
+                <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{float(r['raw_score']):.0f}%</td>
+                <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{evaluate_performance_metrics(float(r['raw_score']))['pld']}</td>
             </tr>
-            """
+            """ for i, r in enumerate(top10, start=1))
         else:
-            rows_html += f"""
-            <tr>
-                <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:bold;'>{esc(sub['name'])}</td>
-                <td colspan='4' style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;color:#94a3b8;font-style:italic;'>No scores recorded yet</td>
-            </tr>
-            """
+            rows_html = "<tr><td colspan='5' style='padding:12px;text-align:center;color:#94a3b8;font-style:italic;'>No scores recorded yet</td></tr>"
+
+        subject_tables_html += f"""
+        <div style="margin-top:20px;">
+            <h3 style="font-size:13px;background:#eef2ff;padding:8px 12px;margin:0;border-radius:6px 6px 0 0;">Best {min(10, len(top10)) or ''} — {esc(sub['name'])}</h3>
+            <table style="margin-top:0;">
+                <thead>
+                    <tr><th style="text-align:center;width:40px;">Pos.</th><th>Student Name</th><th style="text-align:center;">Adm No.</th><th style="text-align:center;">Score</th><th style="text-align:center;">Level</th></tr>
+                </thead>
+                <tbody>{rows_html}</tbody>
+            </table>
+        </div>
+        """
 
     return f"""
     <!DOCTYPE html>
@@ -3032,16 +3054,167 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
             {logo_html}
             <div>
                 <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top Student Per Subject — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top 10 Per Subject — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
             </div>
         </div>
         {"<p class='no-print' style='background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 14px;border-radius:8px;font-size:12px;margin-top:12px;'>⚠️ No scores found for the <b>" + esc(str(st['active_cycle'])) + "</b> cycle for this stream. This report only looks at whichever exam cycle is currently marked active in Settings (Assessment Phase). If scores were entered under a different cycle (e.g. Opener/Midterm), either switch Assessment Phase to match, or enter scores for the currently active cycle.</p>" if not all_scores else ""}
-        <table>
-            <thead>
-                <tr><th>Subject</th><th>Top Student</th><th style="text-align:center;">Adm No.</th><th style="text-align:center;">Score</th><th style="text-align:center;">Level</th></tr>
-            </thead>
-            <tbody>{rows_html or "<tr><td colspan='5' style='padding:20px;text-align:center;color:#94a3b8;'>No subjects configured for this level.</td></tr>"}</tbody>
-        </table>
+        {subject_tables_html or "<p style='padding:20px;text-align:center;color:#94a3b8;'>No subjects configured for this level.</p>"}
+    </body>
+    </html>
+    """
+
+
+@app.get("/admin/reports/grade-distribution/{school_id}", response_class=HTMLResponse)
+def print_grade_distribution(school_id: int, grade_name: str, education_level: str, request: Request):
+    """Per subject, per stream: how many students landed in each CBC
+    performance level (EE1..BE2) — not just an average. Also shows a
+    whole-class overall row per subject, and a class-wide summary at the
+    end. Read-only report; doesn't touch any data."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings = cur.fetchone()
+            st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
+
+            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
+            subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+
+            cur.execute("""
+                SELECT sc.learning_area_id, sc.raw_score, s.stream
+                FROM student_scores sc
+                JOIN students s ON sc.student_id = s.id
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
+                  AND sc.cycle_name = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
+            """, (school_id, grade_name, education_level, st['active_cycle']))
+            all_scores = cur.fetchall()
+
+    PLD_ORDER = ["EE1", "EE2", "ME1", "ME2", "AE1", "AE2", "BE1", "BE2"]
+
+    def _summarize(rows):
+        """Given a list of raw scores, returns entry count, per-level
+        counts, avg marks, avg points, and overall level."""
+        counts = {lvl: 0 for lvl in PLD_ORDER}
+        total_marks, total_points = 0.0, 0
+        for score in rows:
+            metrics = evaluate_performance_metrics(score)
+            counts[metrics['pld']] = counts.get(metrics['pld'], 0) + 1
+            total_marks += score
+            total_points += metrics['points']
+        n = len(rows)
+        avg_marks = (total_marks / n) if n else 0.0
+        avg_points = (total_points / n) if n else 0.0
+        level = POINTS_TO_PLD.get(min(8, max(1, round(avg_points))), "N/A") if n else "N/A"
+        return {'entry': n, 'counts': counts, 'avg_marks': avg_marks, 'avg_points': avg_points, 'level': level}
+
+    logo_src = school.get('logo_url')
+    logo_html = ""
+    if logo_src:
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
+
+    subject_blocks_html = ""
+    class_wide_scores = []
+    for sub in subjects:
+        sub_scores = [float(r['raw_score']) for r in all_scores if r['learning_area_id'] == sub['id']]
+        class_wide_scores.extend(sub_scores)
+
+        streams_present = sorted({r['stream'] for r in all_scores if r['learning_area_id'] == sub['id']})
+        stream_rows_html = ""
+        for stream_name in streams_present:
+            stream_scores = [float(r['raw_score']) for r in all_scores if r['learning_area_id'] == sub['id'] and r['stream'] == stream_name]
+            summary = _summarize(stream_scores)
+            level_cells = "".join(f"<td style='text-align:center;'>{summary['counts'][lvl]}</td>" for lvl in PLD_ORDER)
+            stream_rows_html += f"""
+            <tr>
+                <td style="font-weight:bold;">{esc(stream_name)}</td>
+                <td style="text-align:center;">{summary['entry']}</td>
+                {level_cells}
+                <td style="text-align:center;">{summary['avg_marks']:.1f}</td>
+                <td style="text-align:center;font-weight:bold;">{summary['avg_points']:.2f}</td>
+                <td style="text-align:center;font-weight:bold;">{summary['level']}</td>
+            </tr>
+            """
+        overall_summary = _summarize(sub_scores)
+        overall_level_cells = "".join(f"<td style='text-align:center;'>{overall_summary['counts'][lvl]}</td>" for lvl in PLD_ORDER)
+        overall_row = f"""
+        <tr style="background:#f8fafc;font-weight:bold;">
+            <td>Overall</td>
+            <td style="text-align:center;">{overall_summary['entry']}</td>
+            {overall_level_cells}
+            <td style="text-align:center;">{overall_summary['avg_marks']:.1f}</td>
+            <td style="text-align:center;">{overall_summary['avg_points']:.2f}</td>
+            <td style="text-align:center;">{overall_summary['level']}</td>
+        </tr>
+        """
+
+        level_header_cells = "".join(f"<th style='text-align:center;'>{lvl}</th>" for lvl in PLD_ORDER)
+        subject_blocks_html += f"""
+        <div style="margin-top:22px;">
+            <h3 style="font-size:13px;background:#eef2ff;padding:8px 12px;margin:0;border-radius:6px 6px 0 0;">Performance Level Summary — {esc(sub['name'])}</h3>
+            <table style="margin-top:0;">
+                <thead><tr><th>Stream</th><th style="text-align:center;">Entry</th>{level_header_cells}<th style="text-align:center;">Avg Marks</th><th style="text-align:center;">Avg Points</th><th style="text-align:center;">Level</th></tr></thead>
+                <tbody>{stream_rows_html}{overall_row}</tbody>
+            </table>
+        </div>
+        """
+
+    class_wide_summary = _summarize(class_wide_scores)
+    class_wide_level_cells = "".join(f"<td style='text-align:center;'>{class_wide_summary['counts'][lvl]}</td>" for lvl in PLD_ORDER)
+    level_header_cells = "".join(f"<th style='text-align:center;'>{lvl}</th>" for lvl in PLD_ORDER)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
+        <title>Elimu Hub | Grade Distribution — {esc(grade_name)}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; font-size: 11px; }}
+            @media print {{ .no-print {{ display: none !important; }} }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ padding: 6px 8px; border-bottom: 1px solid #e2e8f0; }}
+            th {{ text-align:left; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
+        </div>
+        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
+            {logo_html}
+            <div>
+                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Subject Grade Distribution — {esc(grade_name)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
+            </div>
+        </div>
+        {"<p class='no-print' style='background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 14px;border-radius:8px;font-size:12px;margin-top:12px;'>⚠️ No scores found for the <b>" + esc(str(st['active_cycle'])) + "</b> cycle. This report only looks at whichever exam cycle is currently marked active in Settings.</p>" if not all_scores else ""}
+        {subject_blocks_html}
+
+        <div style="margin-top:26px;">
+            <h3 style="font-size:13px;background:#e0e7ff;padding:8px 12px;margin:0;border-radius:6px 6px 0 0;">Class-Wide Overall Summary (All Subjects Combined)</h3>
+            <table style="margin-top:0;">
+                <thead><tr><th style="text-align:center;">Entry</th>{level_header_cells}<th style="text-align:center;">Avg Marks</th><th style="text-align:center;">Avg Points</th><th style="text-align:center;">Level</th></tr></thead>
+                <tbody>
+                    <tr style="font-weight:bold;">
+                        <td style="text-align:center;">{class_wide_summary['entry']}</td>
+                        {class_wide_level_cells}
+                        <td style="text-align:center;">{class_wide_summary['avg_marks']:.1f}</td>
+                        <td style="text-align:center;">{class_wide_summary['avg_points']:.2f}</td>
+                        <td style="text-align:center;">{class_wide_summary['level']}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
     </body>
     </html>
     """
