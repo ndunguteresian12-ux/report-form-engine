@@ -589,19 +589,28 @@ def evaluate_performance_metrics(score: float) -> dict:
     except (TypeError, ValueError):
         return {"pld": "N/A", "points": 0, "desc": "No Evaluation"}
 
-    if 0 <= val <= 19:
+    # Exclusive upper bounds (except the final 100) so every tier connects
+    # directly to the next with zero gaps. The previous version used
+    # inclusive bounds on both ends of every tier (e.g. 76<=val<=89 then
+    # 90<=val<=100), which left every boundary — 19/20, 29/30, ..., 89/90 —
+    # with a gap that swallowed any fractional score landing exactly there
+    # (e.g. 89.3), silently misclassifying it as "Out of Range" with 0
+    # points. This became much more likely to actually trigger once scores
+    # started being computed as weighted averages (naturally fractional)
+    # rather than always whole-number exam marks.
+    if 0 <= val < 20:
         return {"pld": "BE2", "points": 1, "desc": "Below Expectations"}
-    elif 20 <= val <= 29:
+    elif 20 <= val < 30:
         return {"pld": "BE1", "points": 2, "desc": "Below Expectations"}
-    elif 30 <= val <= 39:
+    elif 30 <= val < 40:
         return {"pld": "AE2", "points": 3, "desc": "Approaching Expectations"}
-    elif 40 <= val <= 49:
+    elif 40 <= val < 50:
         return {"pld": "AE1", "points": 4, "desc": "Approaching Expectations"}
-    elif 50 <= val <= 59:
+    elif 50 <= val < 60:
         return {"pld": "ME2", "points": 5, "desc": "Meeting Expectations"}
-    elif 60 <= val <= 75:
+    elif 60 <= val < 76:
         return {"pld": "ME1", "points": 6, "desc": "Meeting Expectations"}
-    elif 76 <= val <= 89:
+    elif 76 <= val < 90:
         return {"pld": "EE2", "points": 7, "desc": "Exceeding Expectations"}
     elif 90 <= val <= 100:
         return {"pld": "EE1", "points": 8, "desc": "Exceeding Expectations"}
