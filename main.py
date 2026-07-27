@@ -5,6 +5,7 @@ import random
 import secrets
 import urllib.parse
 import logging
+import functools
 import bcrypt
 import psycopg2
 import requests as http_requests
@@ -297,6 +298,26 @@ from shared import (
 # gunicorn worker processes, which don't share memory.
 LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
 LOGIN_RATE_LIMIT_WINDOW_MINUTES = 15
+
+def retry_on_db_hiccup(func):
+    """Retries a route once if it hits a transient database connection
+    error — specifically the rare case where a pooled connection passes its
+    pre-ping health check but then dies on the very next query (Neon can
+    drop a connection in that split-second window). Only catches
+    psycopg2.OperationalError; any real application error (wrong password,
+    rate-limited, school deactivated, etc.) is a different exception type
+    and passes through immediately, unaffected."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        last_err = None
+        for attempt in range(2):
+            try:
+                return func(*args, **kwargs)
+            except psycopg2.OperationalError as e:
+                last_err = e
+                logger.warning(f"{func.__name__}: transient DB connection error on attempt {attempt + 1}, retrying: {e}")
+        raise last_err
+    return wrapper
 
 def is_login_rate_limited(cur, identifier: str) -> bool:
     """Returns True if this identifier (email, lowercased) has had too many
@@ -724,6 +745,7 @@ def login_portal():
     """
 
 @app.post("/api/v1/auth/login")
+@retry_on_db_hiccup
 def process_login(email: str = Form(...), password: str = Form(...)):
     email = email.strip().lower()
     safe_password = password[:72]
