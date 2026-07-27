@@ -2531,7 +2531,7 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
 
 
 @app.get("/admin/reports/merit-list/{school_id}", response_class=HTMLResponse)
-def print_merit_list(school_id: int, grade_name: str, education_level: str, request: Request):
+def print_merit_list(school_id: int, grade_name: str, education_level: str, request: Request, combined: str = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2565,13 +2565,30 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             score_map = {}
             if students:
                 student_ids = [s['id'] for s in students]
-                cur.execute("""
-                    SELECT student_id, learning_area_id, raw_score
-                    FROM student_scores
-                    WHERE student_id = ANY(%s) AND cycle_name = %s;
-                """, (student_ids, st['active_cycle']))
-                for row in cur.fetchall():
-                    score_map.setdefault(row['student_id'], {})[row['learning_area_id']] = float(row['raw_score'])
+                if combined:
+                    # Combined mode: fetch every cycle's scores so each
+                    # subject can be averaged across whichever of
+                    # Opener/Midterm/End Term actually have data — the same
+                    # methodology report cards already use per subject.
+                    cur.execute("""
+                        SELECT student_id, learning_area_id, cycle_name, raw_score
+                        FROM student_scores
+                        WHERE student_id = ANY(%s);
+                    """, (student_ids,))
+                    raw_by_subject = {}
+                    for row in cur.fetchall():
+                        raw_by_subject.setdefault(row['student_id'], {}).setdefault(row['learning_area_id'], []).append(float(row['raw_score']))
+                    for student_id, subj_map in raw_by_subject.items():
+                        for subj_id, values in subj_map.items():
+                            score_map.setdefault(student_id, {})[subj_id] = sum(values) / len(values)
+                else:
+                    cur.execute("""
+                        SELECT student_id, learning_area_id, raw_score
+                        FROM student_scores
+                        WHERE student_id = ANY(%s) AND cycle_name = %s;
+                    """, (student_ids, st['active_cycle']))
+                    for row in cur.fetchall():
+                        score_map.setdefault(row['student_id'], {})[row['learning_area_id']] = float(row['raw_score'])
 
     total_subjects = len(subjects)
 
@@ -2609,9 +2626,14 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         })
 
     # Rank by total POINTS (not marks) — points reflect performance level
-    # (EE1..BE2) per subject, which is the correct CBC ranking basis.
+    # (EE1..BE2) per subject, which is the correct CBC ranking basis. Total
+    # marks is the tie-breaker: two students tied on points still share the
+    # same official rank (correct CBC convention), but sorting is now
+    # deterministic by marks too, so the higher-marks student is never
+    # displayed below a tied-but-lower-marks student purely because of
+    # incidental admission-number ordering.
     def _rank_by_total_points(rows):
-        ranked = sorted(rows, key=lambda r: r['total_points'], reverse=True)
+        ranked = sorted(rows, key=lambda r: (r['total_points'], r['total_marks']), reverse=True)
         positions = {}
         last_points = None
         last_pos = 0
@@ -2655,9 +2677,12 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
 
     subject_header_cells = "".join(f"<th style='text-align:center;'>{esc(abbreviate_subject(sub['name']))}</th>" for sub in subjects)
 
-    # Display order: by overall position (rank 1 first) — this is a merit
-    # list, so it should read top-to-bottom by performance, not roster order.
-    display_order = sorted(computed, key=lambda r: overall_positions[r['student']['id']])
+    # Display order: by overall position (rank 1 first), then by total
+    # marks descending as the tie-breaker within a tied-points group — this
+    # is the actual fix: previously two students tied on points could print
+    # in either order depending on admission number, making it look like
+    # the lower-marks student was "leading" the higher-marks one.
+    display_order = sorted(computed, key=lambda r: (overall_positions[r['student']['id']], -r['total_marks']))
 
     body_rows = []
     for i, row in enumerate(display_order, start=1):
@@ -2720,13 +2745,14 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            <a href="/admin/reports/merit-list/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}{'&combined=1' if not combined else ''}" style="background:#0d9488;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">{'📄 Switch to Single Cycle (' + str(st['active_cycle']) + ')' if combined else '📊 Switch to Combined Term (Opener + Mid + End)'}</a>
             <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
         </div>
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
             <div>
                 <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:13px;font-weight:bold;">REPORT: STUDENTS' PERFORMANCE MERIT LIST</p>
+                <p style="margin:2px 0 0;font-size:13px;font-weight:bold;">REPORT: STUDENTS' PERFORMANCE MERIT LIST{' — COMBINED TERM (OPENER + MID-TERM + END TERM)' if combined else ''}</p>
             </div>
         </div>
         <table class="header-fields" style="margin-top:8px;">
@@ -2734,7 +2760,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                 <td><b>CLASS:</b> {esc(grade_name)}</td>
                 <td><b>TERM:</b> {esc(str(st['active_term']))}</td>
                 <td><b>YEAR:</b> {esc(str(st.get('active_year', 2026)))}</td>
-                <td><b>EXAM NAME:</b> {esc(str(st['active_cycle']).upper())}</td>
+                <td><b>EXAM NAME:</b> {'COMBINED (ALL CYCLES)' if combined else esc(str(st['active_cycle']).upper())}</td>
             </tr>
             <tr>
                 <td><b>EXAM CODE:</b> {esc(exam_code)}</td>
