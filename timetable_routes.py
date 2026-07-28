@@ -1166,6 +1166,11 @@ def timetable_collision_check(school_id: int, request: Request, education_level:
 
             {f"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl font-semibold'>✅ No collisions found{' for ' + esc(education_level) if education_level else ' across the whole school'} — every teacher is scheduled in exactly one place at a time.</div>" if not collisions else f"<div class='bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-xl font-semibold'>⚠️ Found {len(collisions)} collision(s){' in ' + esc(education_level) if education_level else ''} — see below.</div>"}
 
+            {f'''<form action="/api/v1/timetable/test-and-generate-level/{school_id}" method="post" onsubmit="return confirm('Regenerate every class in {esc(education_level)}? Many of these collisions are likely leftover from timetables generated before whole-level generation existed — regenerating everything together, in order, lets the conflict-avoidance logic see every other class as it goes.');">
+                <input type="hidden" name="education_level" value="{esc(education_level)}">
+                <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🔧 Regenerate {esc(education_level)} to Try Fixing This</button>
+            </form>''' if collisions and education_level else ""}
+
             {collision_rows_html}
         </div>
     </body>
@@ -2626,7 +2631,16 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                     last_subject_id = last_subject_by_day[day]
 
                     chosen_idx, chosen_subject, chosen_teacher = None, None, None
-                    for avoid_conditional in (True, False):
+                    # Priority order: (avoid_conditional, avoid_teacher_conflict) —
+                    # try hardest for a fully clean pick first (no conditional
+                    # clashes, no teacher conflict), and only relax one
+                    # constraint at a time. This matters specifically because
+                    # the previous version accepted the FIRST subject that
+                    # passed the non-teacher rules and only THEN checked for a
+                    # teacher conflict (nulling the teacher if so) — meaning a
+                    # later candidate in the same queue that had no conflict
+                    # at all was never even considered.
+                    for avoid_conditional, avoid_teacher_conflict in ((True, True), (True, False), (False, True), (False, False)):
                         if chosen_subject is not None:
                             break
                         for attempt in range(len(queue)):
@@ -2650,6 +2664,8 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                             if cand_teacher and avoid_conditional and (cand_teacher, day, period['id']) in conditional:
                                 continue
                             if cand_teacher and booked.get((day, period['id'])) == cand_teacher:
+                                if avoid_teacher_conflict:
+                                    continue  # try a different candidate first rather than nulling this one's teacher
                                 cand_teacher = None
 
                             chosen_idx, chosen_subject, chosen_teacher = idx, candidate, cand_teacher
