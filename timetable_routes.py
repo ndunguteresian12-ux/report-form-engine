@@ -430,6 +430,97 @@ def get_periods_for_level(cur, school_id: int, education_level: str):
     return cur.fetchall()
 
 
+def validate_timetable_setup(cur, school_id: int, grade_name: str, education_level: str, stream: str):
+    """Runs every check the generator itself implicitly relies on, but
+    surfaces problems as clear, specific messages *before* generating
+    anything — rather than silently producing a timetable with gaps, or
+    failing deep inside the generator with no indication of why.
+
+    Returns (errors, warnings) — errors are blocking (generation should not
+    proceed), warnings are informational (generation can proceed, but the
+    result may have gaps or a tight schedule)."""
+    errors, warnings = [], []
+
+    days = get_school_days(cur, school_id)
+    all_periods = get_periods_for_level(cur, school_id, education_level)
+    teaching_periods = [p for p in all_periods if p['is_teaching_period']]
+
+    if not all_periods:
+        errors.append(f"No periods are configured for {education_level} at all. Go to Periods & Days and set up the bell schedule first.")
+        return errors, warnings  # nothing else can be meaningfully checked without periods
+    if not teaching_periods:
+        errors.append(f"{education_level} has periods configured, but none of them are marked as teaching periods (they're all breaks/prep/co-curricular). At least one real teaching period is needed.")
+        return errors, warnings
+
+    total_available_slots = len(days) * len(teaching_periods)
+
+    cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
+    subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+    if not subjects:
+        errors.append(f"No subjects exist for {education_level}. This shouldn't normally happen — contact support if you see this.")
+        return errors, warnings
+
+    cur.execute("""
+        SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
+        WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
+    """, (school_id, grade_name, education_level, stream))
+    assignments = {r['learning_area_id']: r for r in cur.fetchall()}
+
+    total_required_slots = 0
+    sorted_teaching = sorted(teaching_periods, key=lambda p: p['period_order'])
+    has_consecutive_pair = any(
+        sorted_teaching[i + 1]['period_order'] - sorted_teaching[i]['period_order'] == 1
+        for i in range(len(sorted_teaching) - 1)
+    )
+
+    for sub in subjects:
+        a = assignments.get(sub['id'])
+        if not a or not a['staff_user_id']:
+            warnings.append(f"'{sub['name']}' has no teacher assigned for this class — it will be left blank in the generated timetable. Assign one under Teaching Assignments if you want it scheduled.")
+            continue
+        lessons = a['lessons_per_week'] or 0
+        if lessons <= 0:
+            warnings.append(f"'{sub['name']}' has a teacher assigned but 0 lessons per week set — it won't be scheduled. Set a lessons-per-week value under Teaching Assignments.")
+            continue
+        total_required_slots += lessons
+        if a['requires_double'] and not has_consecutive_pair:
+            errors.append(f"'{sub['name']}' is set to require a double lesson, but {education_level} has no two consecutive teaching periods anywhere in the day — a double lesson literally cannot be placed. Either add consecutive periods or turn off 'requires double' for this subject.")
+
+    if total_required_slots > total_available_slots:
+        errors.append(
+            f"The subjects for this class need {total_required_slots} lesson-slots per week in total, but only {total_available_slots} teaching periods actually exist "
+            f"({len(days)} days × {len(teaching_periods)} periods). Reduce some subjects' lessons-per-week, or add more teaching periods, before generating."
+        )
+
+    # Cross-class teacher capacity — a teacher already booked elsewhere in
+    # the school for most of the week may not have enough free slots left
+    # to cover everything this class needs from them too.
+    cur.execute("""
+        SELECT staff_user_id, COUNT(*) AS booked_elsewhere
+        FROM timetable_slots
+        WHERE school_id = %s AND staff_user_id IS NOT NULL
+          AND NOT (grade_name = %s AND education_level = %s AND stream = %s)
+        GROUP BY staff_user_id;
+    """, (school_id, grade_name, education_level, stream))
+    booked_elsewhere = {r['staff_user_id']: r['booked_elsewhere'] for r in cur.fetchall()}
+
+    teacher_ids_needed = {r['staff_user_id']: r for r in assignments.values() if r['staff_user_id']}
+    if teacher_ids_needed:
+        cur.execute("SELECT id, full_name, email FROM users WHERE id = ANY(%s);", (list(teacher_ids_needed.keys()),))
+        teacher_names = {r['id']: (r['full_name'] or r['email']) for r in cur.fetchall()}
+        for teacher_id, a in teacher_ids_needed.items():
+            already_booked = booked_elsewhere.get(teacher_id, 0)
+            needed = a['lessons_per_week'] or 0
+            if already_booked + needed > total_available_slots:
+                warnings.append(
+                    f"{teacher_names.get(teacher_id, 'A teacher')} is already booked in {already_booked} slot(s) in other classes this week, "
+                    f"and this class needs {needed} more from them — that's more than the {total_available_slots} periods available in the week. "
+                    f"Some lessons for them here may not find a free slot."
+                )
+
+    return errors, warnings
+
+
 def _section_label(grade_name: str, stream: str) -> str:
     """'Grade 6' for single-stream classes, 'Grade 6 — Stream N' otherwise."""
     if not stream or stream == "SINGLE STREAM":
@@ -1960,7 +2051,7 @@ def delete_subject_constraint(
 
 
 @router.get("/timetable/grade/{school_id}", response_class=HTMLResponse)
-def timetable_grade_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
+def timetable_grade_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str, test_issues: str = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2067,6 +2158,33 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
         </tr>
         """
 
+    test_issues_html = ""
+    if test_issues:
+        try:
+            import base64, json
+            decoded = json.loads(base64.b64decode(test_issues).decode("utf-8"))
+            errors_list = decoded.get("errors", [])
+            warnings_list = decoded.get("warnings", [])
+        except Exception:
+            errors_list, warnings_list = [], []
+
+        if errors_list:
+            error_items = "".join(f"<li>{esc(e)}</li>" for e in errors_list)
+            test_issues_html += f"""
+            <div class="bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4">
+                <p class="font-bold mb-1">🧪 Test found {len(errors_list)} problem(s) — generation was NOT run:</p>
+                <ul class="list-disc list-inside space-y-1 text-xs">{error_items}</ul>
+            </div>
+            """
+        if warnings_list:
+            warning_items = "".join(f"<li>{esc(w)}</li>" for w in warnings_list)
+            test_issues_html += f"""
+            <div class="bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4">
+                <p class="font-bold mb-1">⚠️ {len(warnings_list)} warning(s){' (generation still ran)' if not errors_list else ''}:</p>
+                <ul class="list-disc list-inside space-y-1 text-xs">{warning_items}</ul>
+            </div>
+            """
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -2090,17 +2208,18 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                     <input type="hidden" name="stream" value="{esc(stream)}">
                     <button type="submit" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">＋ New</button>
                 </form>
-                <form action="/api/v1/timetable/generate/{school_id}" method="post" onsubmit="return confirm('Generate a fresh draft timetable for {esc(section_label)}? This replaces any existing entries for this class.');">
+                <form action="/api/v1/timetable/test-and-generate/{school_id}" method="post" onsubmit="return confirm('Test the setup and generate a fresh draft timetable for {esc(section_label)}? This replaces any existing entries for this class.');">
                     <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                     <input type="hidden" name="education_level" value="{esc(education_level)}">
                     <input type="hidden" name="stream" value="{esc(stream)}">
-                    <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🎲 Generate Draft</button>
+                    <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🧪 Test &amp; Generate</button>
                 </form>
                 <a href="/timetable/print/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" target="_blank" class="bg-teal-700 hover:bg-teal-800 text-white px-4 py-2 rounded-xl text-xs font-bold transition">🖨 Print</a>
                 <a href="/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">Teachers</a>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">← Back</a>
             </div>
         </header>
+        {test_issues_html}
         <div class="p-4 sm:p-8 max-w-6xl mx-auto overflow-x-auto">
             <table class="w-full border-collapse bg-white rounded-2xl overflow-hidden border shadow-xs text-xs" style="min-width:700px;">
                 <thead>
@@ -2115,6 +2234,43 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
     </body>
     </html>
     """
+
+
+@router.post("/api/v1/timetable/test-and-generate/{school_id}")
+def test_and_generate_timetable(school_id: int, request: Request, grade_name: str = Form(...), education_level: str = Form(...), stream: str = Form(...)):
+    """The 'Test & Generate' entry point: runs the existing
+    validate_timetable_setup check first. If it finds any hard errors,
+    generation is skipped entirely and the errors are shown, each naming
+    the exact subject/teacher/reason. Only proceeds to actually generate if
+    there are zero hard errors — warnings alone don't block it, but are
+    shown after generating too."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            errors, warnings = validate_timetable_setup(cur, school_id, grade_name, education_level, stream)
+
+    if errors:
+        import base64, json
+        payload = base64.b64encode(json.dumps({"errors": errors, "warnings": warnings}).encode("utf-8")).decode("ascii")
+        return RedirectResponse(
+            url=f"/timetable/grade/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}&stream={urllib.parse.quote(stream)}&test_issues={payload}",
+            status_code=303,
+        )
+
+    # No hard errors — proceed to the actual generator, reusing its route
+    # directly so the real generation logic lives in exactly one place.
+    # Any warnings get passed through as a query param so they still show
+    # up alongside the newly-generated timetable.
+    response = generate_draft_timetable(school_id, request, grade_name, education_level, stream)
+    if warnings and isinstance(response, RedirectResponse):
+        import base64, json
+        warn_payload = base64.b64encode(json.dumps({"errors": [], "warnings": warnings}).encode("utf-8")).decode("ascii")
+        separator = "&" if "?" in response.headers["location"] else "?"
+        response.headers["location"] = response.headers["location"] + f"{separator}test_issues={warn_payload}"
+    return response
 
 
 @router.post("/api/v1/timetable/generate/{school_id}")
