@@ -562,31 +562,49 @@ def timetable_dashboard(school_id: int, request: Request):
             cur.execute("SELECT COUNT(*) AS cnt FROM timetable_periods WHERE school_id = %s;", (school_id,))
             has_periods = cur.fetchone()['cnt'] > 0
 
-    section_cards = ""
-    level_accent = {"Lower Primary": "#0d9488", "Upper Primary": "#0891b2", "Junior School": "#7c3aed"}
+    sections_by_level = {}
     for sec in sections:
-        encoded_grade = urllib.parse.quote(sec['grade_name'])
-        encoded_level = urllib.parse.quote(sec['education_level'])
-        encoded_stream = urllib.parse.quote(sec['stream'])
-        has_timetable = slot_counts.get((sec['grade_name'], sec['education_level'], sec['stream']), 0) > 0
-        status_badge = (
-            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 border border-teal-200'>Timetable set</span>"
-            if has_timetable else
-            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Not yet created</span>"
-        )
-        accent = level_accent.get(sec['education_level'], "#0d9488")
-        section_cards += f"""
-        <div class='bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs hover:shadow-md transition-shadow flex flex-col justify-between gap-3 border-l-4' style='border-left-color:{accent};'>
-            <div>
-                <span class='text-[10px] px-2.5 py-1 rounded-md font-bold uppercase tracking-wider' style='background:{accent}1a;color:{accent};'>{esc(sec['education_level'])}</span>
-                <h3 class='text-base font-black text-slate-800 mt-2.5'>{esc(_section_label(sec['grade_name'], sec['stream']))}</h3>
-                <div class="mt-2">{status_badge}</div>
+        sections_by_level.setdefault(sec['education_level'], []).append(sec)
+
+    level_accent = {"Lower Primary": "#0d9488", "Upper Primary": "#0891b2", "Junior School": "#7c3aed"}
+    level_groups_html = ""
+    for level_name, level_sections in sections_by_level.items():
+        accent = level_accent.get(level_name, "#0d9488")
+        cards_html = ""
+        for sec in level_sections:
+            encoded_grade = urllib.parse.quote(sec['grade_name'])
+            encoded_level = urllib.parse.quote(sec['education_level'])
+            encoded_stream = urllib.parse.quote(sec['stream'])
+            has_timetable = slot_counts.get((sec['grade_name'], sec['education_level'], sec['stream']), 0) > 0
+            status_badge = (
+                "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 border border-teal-200'>Timetable set</span>"
+                if has_timetable else
+                "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Not yet created</span>"
+            )
+            cards_html += f"""
+            <div class='bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs hover:shadow-md transition-shadow flex flex-col justify-between gap-3 border-l-4' style='border-left-color:{accent};'>
+                <div>
+                    <span class='text-[10px] px-2.5 py-1 rounded-md font-bold uppercase tracking-wider' style='background:{accent}1a;color:{accent};'>{esc(sec['education_level'])}</span>
+                    <h3 class='text-base font-black text-slate-800 mt-2.5'>{esc(_section_label(sec['grade_name'], sec['stream']))}</h3>
+                    <div class="mt-2">{status_badge}</div>
+                </div>
+                <div class='grid grid-cols-3 gap-2'>
+                    <a href='/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-100 hover:bg-slate-200 text-slate-700 text-center text-xs py-2 rounded-xl font-semibold transition'>Assign Teachers</a>
+                    <a href='/timetable/constraints/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-100 hover:bg-slate-200 text-slate-700 text-center text-xs py-2 rounded-xl font-semibold transition'>Constraints</a>
+                    <a href='/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition'>Open Timetable</a>
+                </div>
             </div>
-            <div class='grid grid-cols-3 gap-2'>
-                <a href='/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-100 hover:bg-slate-200 text-slate-700 text-center text-xs py-2 rounded-xl font-semibold transition'>Assign Teachers</a>
-                <a href='/timetable/constraints/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-100 hover:bg-slate-200 text-slate-700 text-center text-xs py-2 rounded-xl font-semibold transition'>Constraints</a>
-                <a href='/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition'>Open Timetable</a>
+            """
+        level_groups_html += f"""
+        <div class="mb-6">
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-sm font-black text-slate-700">{esc(level_name)}</h2>
+                <form action="/api/v1/timetable/test-and-generate-level/{school_id}" method="post" onsubmit="return confirm('Test and generate every class in {esc(level_name)}? This replaces existing entries for every class in this level that passes validation.');">
+                    <input type="hidden" name="education_level" value="{esc(level_name)}">
+                    <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🧪 Test &amp; Generate Whole Level</button>
+                </form>
             </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">{cards_html}</div>
         </div>
         """
 
@@ -621,9 +639,7 @@ def timetable_dashboard(school_id: int, request: Request):
         </header>
         <div class="p-6 sm:p-8 max-w-6xl mx-auto">
             {"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-6'>⏱ <b>Set up your periods and bell times first</b> — go to <a href='/timetable/periods/" + str(school_id) + "' class='underline font-bold'>Periods &amp; Days</a> before generating any timetable.</div>" if not has_periods else ""}
-            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
-                {section_cards or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No classes with students yet — add students first.</p>"}
-            </div>
+            {level_groups_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No classes with students yet — add students first.</p>"}
         </div>
     </body>
     </html>
@@ -1048,6 +1064,39 @@ def teacher_timetable_picker(school_id: int, request: Request):
 
 
 @router.get("/timetable/collision-check/{school_id}", response_class=HTMLResponse)
+def _find_timetable_collisions(cur, school_id: int, education_level: str = None):
+    """Returns a list of collision groups — each group is a list of slot
+    rows for the same teacher, same day/period, across 2+ different
+    classes. Pure read, no side effects. Shared by the collision-check
+    display page and the whole-level Test & Generate flow."""
+    query = """
+        SELECT ts.day_of_week, ts.period_id, tp.label AS period_label, tp.start_time, tp.end_time,
+               ts.staff_user_id, u.full_name, u.email,
+               ts.grade_name, ts.stream, ts.education_level,
+               COALESCE(la.name, cs.name, ca.name) AS subject_name
+        FROM timetable_slots ts
+        JOIN timetable_periods tp ON ts.period_id = tp.id
+        LEFT JOIN users u ON ts.staff_user_id = u.id
+        LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+        LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+        LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
+        WHERE ts.school_id = %s AND ts.staff_user_id IS NOT NULL
+    """
+    params = [school_id]
+    if education_level:
+        query += " AND ts.education_level = %s"
+        params.append(education_level)
+    cur.execute(query, tuple(params))
+    all_slots = cur.fetchall()
+
+    groups = {}
+    for slot in all_slots:
+        key = (slot['day_of_week'], slot['period_id'], slot['staff_user_id'])
+        groups.setdefault(key, []).append(slot)
+
+    return [slots for slots in groups.values() if len({(s['grade_name'], s['stream']) for s in slots}) > 1]
+
+
 def timetable_collision_check(school_id: int, request: Request, education_level: str = None):
     """Scans every slot currently in the timetable (optionally scoped to one
     education level) for a teacher booked into two different classes at the
@@ -1065,38 +1114,7 @@ def timetable_collision_check(school_id: int, request: Request, education_level:
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
-            query = """
-                SELECT ts.day_of_week, ts.period_id, tp.label AS period_label, tp.start_time, tp.end_time,
-                       ts.staff_user_id, u.full_name, u.email,
-                       ts.grade_name, ts.stream, ts.education_level,
-                       COALESCE(la.name, cs.name, ca.name) AS subject_name
-                FROM timetable_slots ts
-                JOIN timetable_periods tp ON ts.period_id = tp.id
-                LEFT JOIN users u ON ts.staff_user_id = u.id
-                LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
-                LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
-                LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
-                WHERE ts.school_id = %s AND ts.staff_user_id IS NOT NULL
-            """
-            params = [school_id]
-            if education_level:
-                query += " AND ts.education_level = %s"
-                params.append(education_level)
-            cur.execute(query, tuple(params))
-            all_slots = cur.fetchall()
-
-    # Group every slot by (day, period, teacher) — any group containing
-    # more than one distinct (grade, stream) is a genuine double-booking.
-    groups = {}
-    for slot in all_slots:
-        key = (slot['day_of_week'], slot['period_id'], slot['staff_user_id'])
-        groups.setdefault(key, []).append(slot)
-
-    collisions = []
-    for key, slots in groups.items():
-        distinct_classes = {(s['grade_name'], s['stream']) for s in slots}
-        if len(distinct_classes) > 1:
-            collisions.append(slots)
+            collisions = _find_timetable_collisions(cur, school_id, education_level)
 
     # Sort collisions for a stable, readable report: by day, then period, then teacher.
     day_order = {d: i for i, d in enumerate(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"])}
@@ -2271,6 +2289,151 @@ def test_and_generate_timetable(school_id: int, request: Request, grade_name: st
         separator = "&" if "?" in response.headers["location"] else "?"
         response.headers["location"] = response.headers["location"] + f"{separator}test_issues={warn_payload}"
     return response
+
+
+@router.post("/api/v1/timetable/test-and-generate-level/{school_id}")
+def test_and_generate_whole_level(school_id: int, request: Request, education_level: str = Form(...)):
+    """Runs Test & Generate across EVERY class in one education level, not
+    just a single class — this is the real fix for the cross-class
+    double-booking problem, since generating one class at a time in
+    isolation is exactly what let those collisions slip through before.
+    A class with hard errors is skipped (not generated) but doesn't block
+    the rest of the level from being processed. After every class has been
+    attempted, the collision checker runs automatically as a final safety
+    net, and everything is shown in one combined report."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT DISTINCT c.grade_name, s.stream
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND c.education_level = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                ORDER BY c.grade_name ASC, s.stream ASC;
+            """, (school_id, education_level))
+            sections = cur.fetchall()
+
+    class_results = []
+    for sec in sections:
+        grade_name, stream = sec['grade_name'], sec['stream']
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                errors, warnings = validate_timetable_setup(cur, school_id, grade_name, education_level, stream)
+
+        if errors:
+            class_results.append({'grade_name': grade_name, 'stream': stream, 'status': 'skipped', 'errors': errors, 'warnings': warnings})
+            continue
+
+        generate_draft_timetable(school_id, request, grade_name, education_level, stream)
+        class_results.append({'grade_name': grade_name, 'stream': stream, 'status': 'generated', 'errors': [], 'warnings': warnings})
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            collisions = _find_timetable_collisions(cur, school_id, education_level)
+
+    import base64, json
+    payload = base64.b64encode(json.dumps({
+        'education_level': education_level,
+        'class_results': class_results,
+        'collision_count': len(collisions),
+        'collisions': [
+            {
+                'teacher': (slots[0]['full_name'] or slots[0]['email'] or 'Unknown teacher'),
+                'day': slots[0]['day_of_week'],
+                'period': slots[0]['period_label'],
+                'classes': [f"{s['grade_name']} — {s['stream']} ({s['subject_name'] or 'Unknown subject'})" for s in slots],
+            }
+            for slots in collisions
+        ],
+    }).encode("utf-8")).decode("ascii")
+
+    return RedirectResponse(url=f"/timetable/level-report/{school_id}?report={payload}", status_code=303)
+
+
+@router.get("/timetable/level-report/{school_id}", response_class=HTMLResponse)
+def timetable_level_report(school_id: int, request: Request, report: str):
+    """Displays the combined report from a whole-level Test & Generate run:
+    per-class outcome (generated / skipped with reasons) plus the automatic
+    post-generation collision check across the whole level."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    import base64, json
+    try:
+        data = json.loads(base64.b64decode(report).decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid or expired report data.")
+
+    education_level = data.get('education_level', '')
+    class_results = data.get('class_results', [])
+    collisions = data.get('collisions', [])
+
+    generated_count = sum(1 for r in class_results if r['status'] == 'generated')
+    skipped_count = sum(1 for r in class_results if r['status'] == 'skipped')
+
+    class_rows_html = ""
+    for r in class_results:
+        section_label = r['grade_name'] if r['stream'] == 'SINGLE STREAM' else f"{r['grade_name']} — {r['stream']}"
+        encoded_grade = urllib.parse.quote(r['grade_name'])
+        encoded_stream = urllib.parse.quote(r['stream'])
+        encoded_level = urllib.parse.quote(education_level)
+        if r['status'] == 'generated':
+            status_badge = "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>✅ Generated</span>"
+            detail_html = "".join(f"<li class='text-amber-700'>⚠️ {esc(w)}</li>" for w in r['warnings'])
+        else:
+            status_badge = "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-50 text-rose-700 border border-rose-200'>❌ Skipped</span>"
+            detail_html = "".join(f"<li class='text-rose-700'>{esc(e)}</li>" for e in r['errors'])
+        class_rows_html += f"""
+        <div class="bg-white rounded-2xl border shadow-xs p-4 mb-3">
+            <div class="flex items-center justify-between">
+                <a href="/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" class="text-sm font-bold text-slate-800 hover:underline">{esc(section_label)}</a>
+                {status_badge}
+            </div>
+            {f"<ul class='text-xs mt-2 space-y-1 list-disc list-inside'>{detail_html}</ul>" if detail_html else ""}
+        </div>
+        """
+
+    collision_html = ""
+    if collisions:
+        for c in collisions:
+            classes_html = "".join(f"<li>{esc(cl)}</li>" for cl in c['classes'])
+            collision_html += f"""
+            <div class="bg-white rounded-2xl border border-rose-200 shadow-xs p-4 mb-3">
+                <p class="text-sm font-bold text-rose-700">⚠️ {esc(c['teacher'])} — double-booked</p>
+                <p class="text-xs text-slate-400 mb-2">{esc(c['day'])}, {esc(c['period'])}</p>
+                <ul class="text-xs text-slate-700 list-disc list-inside">{classes_html}</ul>
+            </div>
+            """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Level Test &amp; Generate Report</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">🧪 Test &amp; Generate Report — {esc(education_level)}</h1>
+                <p class="text-xs text-slate-400">{generated_count} class(es) generated, {skipped_count} skipped, {len(collisions)} collision(s) found after generation.</p>
+            </div>
+            <a href="/timetable/dashboard/{school_id}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">← Back to Timetables</a>
+        </header>
+        <div class="p-4 sm:p-8 max-w-3xl mx-auto space-y-6">
+            <div>
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Per-Class Results</h2>
+                {class_rows_html or "<p class='text-slate-400 text-xs italic'>No classes found for this level.</p>"}
+            </div>
+            <div>
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Collision Check (After Generation)</h2>
+                {collision_html or "<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl font-semibold'>✅ No collisions found — every teacher is scheduled in exactly one place at a time across this level.</div>"}
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
 
 @router.post("/api/v1/timetable/generate/{school_id}")
