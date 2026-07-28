@@ -631,6 +631,7 @@ def timetable_dashboard(school_id: int, request: Request):
                 <a href="/timetable/sync-rules/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Same-Time Rules</a>
                 <a href="/timetable/teachers/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🖨 Teacher Timetables</a>
                 <a href="/timetable/collision-check/{school_id}" class="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🔍 Check for Collisions</a>
+                <a href="/timetable/teacher-workload/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">📊 Teacher Workload</a>
                 <a href="/timetable/co-curricular/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🎭 Co-Curricular</a>
                 <a href="/timetable/custom-subjects/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">➕ Custom Subjects</a>
                 <a href="/timetable/master/{school_id}" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🗓 Whole School View</a>
@@ -1057,6 +1058,111 @@ def teacher_timetable_picker(school_id: int, request: Request):
             <div class="pt-4">
                 <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back</a>
             </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/timetable/teacher-workload/{school_id}", response_class=HTMLResponse)
+def teacher_workload_report(school_id: int, request: Request):
+    """For every teacher, shows their total assigned lessons/week — broken
+    down by exactly which class+subject each commitment comes from — versus
+    how many teaching periods actually exist per week for each education
+    level they teach in. A teacher whose total exceeds what's physically
+    possible in the week is flagged clearly, since that's a real staffing
+    fact the software can't invent more hours to solve — only a human
+    decision (reduce lessons/week for a subject, or reassign a class to a
+    different teacher) actually fixes it. Purely read-only."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("""
+                SELECT tsa.staff_user_id, u.full_name, u.email,
+                       tsa.grade_name, tsa.education_level, tsa.stream, tsa.lessons_per_week,
+                       la.name AS subject_name
+                FROM teacher_subject_assignments tsa
+                JOIN users u ON tsa.staff_user_id = u.id
+                JOIN learning_areas la ON tsa.learning_area_id = la.id
+                WHERE tsa.school_id = %s AND tsa.staff_user_id IS NOT NULL
+                ORDER BY u.full_name NULLS LAST, u.email;
+            """, (school_id,))
+            assignment_rows = cur.fetchall()
+
+            days = get_school_days(cur, school_id)
+            capacity_by_level = {}
+            for level in EDUCATION_LEVELS:
+                teaching_periods = [p for p in get_periods_for_level(cur, school_id, level) if p['is_teaching_period']]
+                capacity_by_level[level] = len(teaching_periods) * len(days)
+
+    teachers = {}
+    for r in assignment_rows:
+        tid = r['staff_user_id']
+        teachers.setdefault(tid, {'name': r['full_name'] or r['email'], 'assignments': [], 'by_level': {}})
+        teachers[tid]['assignments'].append(r)
+        teachers[tid]['by_level'].setdefault(r['education_level'], 0)
+        teachers[tid]['by_level'][r['education_level']] += r['lessons_per_week'] or 0
+
+    teacher_cards_html = ""
+    for tid, info in sorted(teachers.items(), key=lambda kv: kv[1]['name'] or ''):
+        is_overloaded = any(info['by_level'].get(lvl, 0) > capacity_by_level.get(lvl, 0) for lvl in info['by_level'])
+
+        level_summary_html = "".join(
+            f"""<span class="text-xs font-bold px-2 py-1 rounded-lg {'bg-rose-50 text-rose-700 border border-rose-200' if load > capacity_by_level.get(lvl, 0) else 'bg-slate-50 text-slate-600 border border-slate-200'}">
+                {esc(lvl)}: {load}/{capacity_by_level.get(lvl, 0)} periods
+            </span>"""
+            for lvl, load in info['by_level'].items()
+        )
+
+        assignment_rows_html = "".join(f"""
+            <tr class="border-b border-slate-50 last:border-0">
+                <td class="p-2 text-xs">{esc(_section_label(a['grade_name'], a['stream']))} <span class="text-slate-400">({esc(a['education_level'])})</span></td>
+                <td class="p-2 text-xs font-semibold">{esc(a['subject_name'])}</td>
+                <td class="p-2 text-xs text-center font-bold">{a['lessons_per_week'] or 0}/wk</td>
+                <td class="p-2 text-right">
+                    <a href="/timetable/assignments/{school_id}?grade_name={urllib.parse.quote(a['grade_name'])}&education_level={urllib.parse.quote(a['education_level'])}&stream={urllib.parse.quote(a['stream'])}" class="text-indigo-700 hover:underline text-xs font-bold">Adjust →</a>
+                </td>
+            </tr>
+        """ for a in info['assignments'])
+
+        teacher_cards_html += f"""
+        <div class="bg-white rounded-2xl border {'border-rose-300' if is_overloaded else 'border-slate-200/80'} shadow-xs p-5 mb-4">
+            <div class="flex items-center justify-between flex-wrap gap-2 mb-3">
+                <h3 class="text-sm font-bold text-slate-800">{'⚠️ ' if is_overloaded else ''}{esc(info['name'])}</h3>
+                <div class="flex gap-2 flex-wrap">{level_summary_html}</div>
+            </div>
+            <table class="w-full">
+                <thead><tr class="text-[10px] uppercase text-slate-400 border-b"><th class="p-2 text-left">Class</th><th class="p-2 text-left">Subject</th><th class="p-2 text-center">Load</th><th class="p-2"></th></tr></thead>
+                <tbody>{assignment_rows_html}</tbody>
+            </table>
+        </div>
+        """
+
+    overloaded_count = sum(1 for info in teachers.values() if any(info['by_level'].get(lvl, 0) > capacity_by_level.get(lvl, 0) for lvl in info['by_level']))
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Teacher Workload</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">📊 Teacher Workload — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">Total lessons/week assigned per teacher, versus periods actually available — {overloaded_count} teacher(s) currently over capacity.</p>
+            </div>
+            <a href="/timetable/dashboard/{school_id}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Timetables</a>
+        </header>
+        <div class="p-4 sm:p-8 max-w-4xl mx-auto">
+            {"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-4'>⚠️ A teacher over capacity means they've been assigned more lessons across all their classes than there are periods in the week to teach them — that's a real staffing fact, not something generation can work around. Reduce lessons/week for one of their subjects below, or reassign one of their classes to a different teacher.</div>" if overloaded_count else ""}
+            {teacher_cards_html or "<p class='text-slate-400 text-xs italic text-center py-8'>No teacher assignments configured yet.</p>"}
         </div>
     </body>
     </html>
