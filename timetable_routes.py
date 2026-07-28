@@ -1,21 +1,28 @@
 """
-timetable_routes.py — the timetabling module, extracted out of main.py.
+timetable_routes.py — Elimu Hub's automatic timetabling engine (v2)
 
-Owns its own three tables (timetable_periods, teacher_subject_assignments,
-timetable_slots) and every /timetable* and /api/v1/timetable* route.
-main.py just does:
+A full rewrite of the timetabling module around an ASC Timetables-inspired
+workspace: a central hub with quick entity launchers, a single solid
+generation engine (test-then-generate, no complexity/strictness dials by
+design choice), a Whole/Teachers/Subjects view switcher, and an expanded
+print/report suite.
 
-    from timetable_routes import router as timetable_router, bootstrap_timetable_schema
-    bootstrap_timetable_schema()
-    app.include_router(timetable_router)
+Deliberately scoped OUT, by explicit decision: a Classrooms/Facilities
+entity (not relevant — each class uses its own fixed room) and
+generation complexity/strictness modes (one solid mode is enough).
 
-All shared plumbing (DB pool, auth checks, subject ordering) comes from
-shared.py rather than from main.py, to avoid a circular import.
+Deliberately KEPT from the previous version, unchanged in behavior: the
+hardened generation algorithm (Phase 1 locked placements, Phase 2 double
+lessons, Phase 3 fill-remaining with conflict-avoidance-first candidate
+selection), teacher/subject availability, the collision checker, and the
+teacher workload report — these were fixed and verified working earlier
+in this same project; a fresh UI doesn't require re-deriving proven
+scheduling logic from zero.
 
-Timetables are per-STREAM (e.g. "Grade 6 — Stream N" and "Grade 6 — Stream L"
-each get their own independent schedule) — for single-stream schools/classes,
-the stream value is the literal string "SINGLE STREAM", consistent with the
-convention used everywhere else in the app.
+Classes, teachers, and students are never re-entered here — they're
+fetched live from the same `students`, `classes`, and `users` tables the
+rest of Elimu Hub already uses, exactly as requested: manually configure
+periods and subjects, fetch everything else.
 """
 
 import urllib.parse
@@ -35,339 +42,23 @@ from shared import (
 
 router = APIRouter()
 
-
-def bootstrap_timetable_schema():
-    """Creates this module's tables if they don't exist yet. Called once at
-    app startup, alongside main.py's own bootstrap_database_schema()."""
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS timetable_periods (
-                    id SERIAL PRIMARY KEY,
-                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    education_level VARCHAR(100) NOT NULL DEFAULT 'ALL',
-                    period_order INTEGER NOT NULL,
-                    label VARCHAR(50) NOT NULL,
-                    short_label VARCHAR(20),
-                    start_time VARCHAR(20),
-                    end_time VARCHAR(20),
-                    is_teaching_period BOOLEAN DEFAULT TRUE,
-                    period_type VARCHAR(20) NOT NULL DEFAULT 'teaching',
-                    UNIQUE(school_id, education_level, period_order)
-                );
-            """)
-            cur.execute("ALTER TABLE timetable_periods ADD COLUMN IF NOT EXISTS short_label VARCHAR(20);")
-            # Adds a third period type — 'prep' — alongside the existing
-            # teaching/break split. is_teaching_period stays the single
-            # source of truth for "can a lesson ever go here?": prep periods
-            # keep it FALSE, so they're structurally excluded from the
-            # generator's candidate list the same way breaks already are —
-            # not a soft rule that could be overridden, but simply never in
-            # the pool of fillable periods at all.
-            cur.execute("ALTER TABLE timetable_periods ADD COLUMN IF NOT EXISTS period_type VARCHAR(20) NOT NULL DEFAULT 'teaching';")
-            cur.execute("UPDATE timetable_periods SET period_type = 'break' WHERE is_teaching_period = FALSE AND period_type = 'teaching';")
-            # Schools with periods already configured before per-level bell
-            # schedules existed get 'ALL' — a single shared schedule used as
-            # a fallback for any level that hasn't been given its own yet.
-            cur.execute("ALTER TABLE timetable_periods ADD COLUMN IF NOT EXISTS education_level VARCHAR(100) NOT NULL DEFAULT 'ALL';")
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS timetable_settings (
-                    school_id INTEGER PRIMARY KEY REFERENCES schools(id) ON DELETE CASCADE,
-                    days_per_week INTEGER NOT NULL DEFAULT 5
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS teacher_subject_assignments (
-                    id SERIAL PRIMARY KEY,
-                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    staff_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
-                    grade_name VARCHAR(100) NOT NULL,
-                    education_level VARCHAR(100) NOT NULL,
-                    stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM',
-                    lessons_per_week INTEGER NOT NULL DEFAULT 1,
-                    requires_double BOOLEAN NOT NULL DEFAULT FALSE,
-                    UNIQUE(school_id, learning_area_id, grade_name, education_level, stream)
-                );
-            """)
-            cur.execute("ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS lessons_per_week INTEGER NOT NULL DEFAULT 1;")
-            cur.execute("ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS requires_double BOOLEAN NOT NULL DEFAULT FALSE;")
-            # Safe migration for this table if it already existed (pre-stream) in production.
-            cur.execute("ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM';")
-
-            # Same schema-drift issue as timetable_slots below: the original
-            # UNIQUE constraint on a pre-existing live table won't include the
-            # later-added `stream` column, breaking this table's ON CONFLICT
-            # clause too. Fix it the same way.
-            cur.execute("""
-                DELETE FROM teacher_subject_assignments a USING teacher_subject_assignments b
-                WHERE a.id > b.id
-                  AND a.school_id = b.school_id AND a.learning_area_id = b.learning_area_id
-                  AND a.grade_name = b.grade_name AND a.education_level = b.education_level
-                  AND a.stream = b.stream;
-            """)
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_teacher_subject_assignments_slot ON teacher_subject_assignments (school_id, learning_area_id, grade_name, education_level, stream);")
-
-            # Drop any OLDER unique constraint on this table that predates the
-            # per-stream conversion — it won't include `stream`, so it would
-            # otherwise still incorrectly reject two different streams having
-            # the same subject assigned (they're not actually duplicates).
-            cur.execute("""
-                SELECT conname FROM pg_constraint c
-                JOIN pg_class t ON c.conrelid = t.oid
-                WHERE t.relname = 'teacher_subject_assignments' AND c.contype = 'u';
-            """)
-            for (conname,) in cur.fetchall():
-                cur.execute(f'ALTER TABLE teacher_subject_assignments DROP CONSTRAINT IF EXISTS "{conname}";')
-
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS timetable_slots (
-                    id SERIAL PRIMARY KEY,
-                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    grade_name VARCHAR(100) NOT NULL,
-                    education_level VARCHAR(100) NOT NULL,
-                    stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM',
-                    day_of_week VARCHAR(20) NOT NULL,
-                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
-                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE SET NULL,
-                    staff_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                    UNIQUE(school_id, grade_name, education_level, stream, day_of_week, period_id)
-                );
-            """)
-            cur.execute("ALTER TABLE timetable_slots ADD COLUMN IF NOT EXISTS stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM';")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_timetable_slots_conflict ON timetable_slots (school_id, day_of_week, period_id, staff_user_id);")
-
-            # Timetable-only subjects — school-defined items (e.g. "Library",
-            # "Study Skills", "Guidance & Counselling") that can be scheduled
-            # into the grid alongside real graded subjects, without ever
-            # touching learning_areas or the report-card/grading system.
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS timetable_custom_subjects (
-                    id SERIAL PRIMARY KEY,
-                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    education_level VARCHAR(100) NOT NULL,
-                    name VARCHAR(150) NOT NULL,
-                    UNIQUE(school_id, education_level, name)
-                );
-            """)
-
-            # A slot can hold exactly one of: a graded subject, a custom
-            # (non-graded) subject, or a co-curricular activity. Additive,
-            # nullable columns — existing behavior around learning_area_id
-            # is completely untouched.
-            cur.execute("ALTER TABLE timetable_slots ADD COLUMN IF NOT EXISTS custom_subject_id INTEGER REFERENCES timetable_custom_subjects(id) ON DELETE SET NULL;")
-
-            # Same schema-drift issue as teacher_subject_assignments above:
-            # the original UNIQUE constraint on a pre-existing live table
-            # won't include the later-added `stream` column, breaking this
-            # table's ON CONFLICT clause. Fix it the same way.
-            cur.execute("""
-                DELETE FROM timetable_slots a USING timetable_slots b
-                WHERE a.id > b.id
-                  AND a.school_id = b.school_id AND a.grade_name = b.grade_name
-                  AND a.education_level = b.education_level AND a.stream = b.stream
-                  AND a.day_of_week = b.day_of_week AND a.period_id = b.period_id;
-            """)
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_timetable_slots_slot ON timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id);")
-
-            cur.execute("""
-                SELECT conname FROM pg_constraint c
-                JOIN pg_class t ON c.conrelid = t.oid
-                WHERE t.relname = 'timetable_slots' AND c.contype = 'u';
-            """)
-            for (conname,) in cur.fetchall():
-                cur.execute(f'ALTER TABLE timetable_slots DROP CONSTRAINT IF EXISTS "{conname}";')
-
-            # The table's original UNIQUE constraint (from before the per-stream
-            # conversion) is stuck on live databases without the `stream` column,
-            # since CREATE TABLE IF NOT EXISTS never re-runs on an existing table
-            # and ALTER TABLE ADD COLUMN doesn't touch existing constraints. This
-            # breaks the ON CONFLICT (...) clause used when saving a slot. Fix it
-            # by explicitly creating the correctly-scoped unique index — Postgres's
-            # ON CONFLICT matches any unique index with the exact column list,
-            # regardless of the original constraint's name.
-            cur.execute("""
-                DELETE FROM timetable_slots a USING timetable_slots b
-                WHERE a.id > b.id
-                  AND a.school_id = b.school_id AND a.grade_name = b.grade_name
-                  AND a.education_level = b.education_level AND a.stream = b.stream
-                  AND a.day_of_week = b.day_of_week AND a.period_id = b.period_id;
-            """)
-            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_timetable_slots_slot ON timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id);")
-
-            # Same reasoning as teacher_subject_assignments above — drop any
-            # older unique constraint that predates the per-stream conversion.
-            cur.execute("""
-                SELECT conname FROM pg_constraint c
-                JOIN pg_class t ON c.conrelid = t.oid
-                WHERE t.relname = 'timetable_slots' AND c.contype = 'u';
-            """)
-            for (conname,) in cur.fetchall():
-                cur.execute(f'ALTER TABLE timetable_slots DROP CONSTRAINT IF EXISTS "{conname}";')
-
-            # Teacher availability — only exceptions are stored; a teacher with
-            # no row for a given day/period is treated as available by default.
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS teacher_availability (
-                    id SERIAL PRIMARY KEY,
-                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    staff_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                    day_of_week VARCHAR(20) NOT NULL,
-                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
-                    status VARCHAR(20) NOT NULL DEFAULT 'available',
-                    UNIQUE(school_id, staff_user_id, day_of_week, period_id)
-                );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_teacher_availability_lookup ON teacher_availability (school_id, staff_user_id, day_of_week, period_id);")
-
-            # Subject "time off" — mirrors teacher_availability, but keyed by
-            # subject instead of teacher (e.g. "no Math after lunch", "PE only
-            # in the afternoon"). Only exceptions are stored; a subject with
-            # no row for a given day/period is available by default.
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS subject_availability (
-                    id SERIAL PRIMARY KEY,
-                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
-                    day_of_week VARCHAR(20) NOT NULL,
-                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
-                    status VARCHAR(20) NOT NULL DEFAULT 'available',
-                    UNIQUE(school_id, learning_area_id, day_of_week, period_id)
-                );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_subject_availability_lookup ON subject_availability (school_id, learning_area_id, day_of_week, period_id);")
-
-            # "Same time" subject rule — a subject that must be scheduled at
-            # one fixed day/period across every class/section that takes it
-            # (e.g. a schoolwide Games period, or an assembly slot).
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS subject_sync_rules (
-                    id SERIAL PRIMARY KEY,
-                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
-                    day_of_week VARCHAR(20) NOT NULL,
-                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
-                    UNIQUE(school_id, learning_area_id)
-                );
-            """)
-
-            # Subject placement constraints ("card relationships") — per
-            # class section, a rule between two subjects for the generator
-            # (and manual edits) to respect.
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS subject_constraints (
-                    id SERIAL PRIMARY KEY,
-                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    grade_name VARCHAR(100) NOT NULL,
-                    education_level VARCHAR(100) NOT NULL,
-                    stream VARCHAR(50) NOT NULL DEFAULT 'SINGLE STREAM',
-                    subject_a_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
-                    subject_b_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
-                    constraint_type VARCHAR(30) NOT NULL,
-                    UNIQUE(school_id, grade_name, education_level, stream, subject_a_id, subject_b_id, constraint_type)
-                );
-            """)
-
-            # Self-healing migration: on any school whose timetable_slots or
-            # teacher_subject_assignments table was created *before* the
-            # per-stream conversion, the stream column got added via ALTER
-            # TABLE but the original UNIQUE constraint (defined without
-            # stream) was never updated to match — causing "ON CONFLICT"
-            # in the app to fail with InvalidColumnReference. This detects
-            # that mismatch and fixes it, without needing to guess whatever
-            # Postgres auto-generated the old constraint's name as.
-            _ensure_unique_constraint(
-                cur, "timetable_slots",
-                ["school_id", "grade_name", "education_level", "stream", "day_of_week", "period_id"],
-                "uq_timetable_slots_section_slot",
-            )
-            _ensure_unique_constraint(
-                cur, "teacher_subject_assignments",
-                ["school_id", "learning_area_id", "grade_name", "education_level", "stream"],
-                "uq_teacher_subject_assignments_section_subject",
-            )
-            _ensure_unique_constraint(
-                cur, "timetable_periods",
-                ["school_id", "education_level", "period_order"],
-                "uq_timetable_periods_level_order",
-            )
-
-            # Co-curricular activities (clubs, societies, sports, etc.) —
-            # separate from timed lesson slots, since most of these run
-            # outside the regular teaching day.
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS co_curricular_activities (
-                    id SERIAL PRIMARY KEY,
-                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
-                    name VARCHAR(150) NOT NULL,
-                    category VARCHAR(50) NOT NULL DEFAULT 'Club',
-                    schedule_note VARCHAR(200),
-                    staff_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                    description TEXT
-                );
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS co_curricular_participants (
-                    id SERIAL PRIMARY KEY,
-                    activity_id INTEGER REFERENCES co_curricular_activities(id) ON DELETE CASCADE,
-                    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
-                    UNIQUE(activity_id, student_id)
-                );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_co_curricular_participants_activity ON co_curricular_participants (activity_id);")
-
-            # Now that co_curricular_activities exists, a timetable slot can
-            # also hold a co-curricular activity instead of an academic or
-            # custom subject.
-            cur.execute("ALTER TABLE timetable_slots ADD COLUMN IF NOT EXISTS co_curricular_activity_id INTEGER REFERENCES co_curricular_activities(id) ON DELETE SET NULL;")
-
-            conn.commit()
-
-
-def _ensure_unique_constraint(cur, table_name: str, target_columns: list, new_constraint_name: str):
-    """Ensures `table_name` has a UNIQUE constraint covering exactly
-    `target_columns` — dropping any older UNIQUE constraint on that table
-    that doesn't match (e.g. one predating a later-added column) and
-    creating the correct one, only when actually needed."""
-    cur.execute("""
-        SELECT tc.constraint_name, array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS cols
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-        WHERE tc.table_name = %s AND tc.constraint_type = 'UNIQUE' AND tc.table_schema = 'public'
-        GROUP BY tc.constraint_name;
-    """, (table_name,))
-    existing = cur.fetchall()
-    target_set = set(target_columns)
-    if any(set(cols) == target_set for _, cols in existing):
-        return  # already correct — nothing to do
-
-    for constraint_name, _ in existing:
-        cur.execute(f'ALTER TABLE {table_name} DROP CONSTRAINT "{constraint_name}";')
-    cur.execute(f"""
-        ALTER TABLE {table_name}
-        ADD CONSTRAINT {new_constraint_name} UNIQUE ({", ".join(target_columns)});
-    """)
-
-
-# =====================================================================
-# TIMETABLING MODULE
-# =====================================================================
-# No hardcoded periods, times, or breaks — every school configures its own
-# day structure and bell times via /timetable/periods/{school_id}, since
-# schools don't share a start time (boarding vs day schools especially).
+EDUCATION_LEVELS = ["Lower Primary", "Upper Primary", "Junior School"]
 ALL_POSSIBLE_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
-# The three CBC education levels, matching main.py's classes/learning_areas
-# data exactly. Each can have its own independent bell schedule — e.g.
-# Lower Primary's shorter 35-minute lessons vs Junior School's 40-minute ones.
-EDUCATION_LEVELS = ["Lower Primary", "Upper Primary", "Junior School"]
+# A small, pleasant default palette assigned round-robin to subjects that
+# haven't been given an explicit color yet — matches ASC's "each subject
+# gets a color for at-a-glance reading" idea without requiring every
+# school to configure colors before their first timetable looks right.
+DEFAULT_SUBJECT_COLORS = [
+    "#6366f1", "#0d9488", "#d97706", "#db2777", "#7c3aed",
+    "#059669", "#dc2626", "#0891b2", "#ca8a04", "#4f46e5",
+    "#be123c", "#15803d",
+]
 
-# A curated, print-friendly palette (soft background + readable dark text)
-# for color-coding subjects on printed timetables. Assignment is by a stable
-# hash of the subject name, not Python's built-in hash() (which is
-# randomized per-process and would give different colors on every restart).
+# The proven (background, text) hex-pair palette used for cell shading
+# across every timetable print/view page — a stable hash of the subject
+# name always lands on the same pair, so a subject is visually consistent
+# across every report without needing to be pre-configured.
 SUBJECT_COLOR_PALETTE = [
     ("#FEF3C7", "#92400E"),  # amber
     ("#D1FAE5", "#065F46"),  # emerald
@@ -392,42 +83,402 @@ def get_subject_color(name: str):
     return SUBJECT_COLOR_PALETTE[stable_index]
 
 
+def bootstrap_timetable_schema():
+    """Creates/upgrades every table this module owns. Purely additive —
+    CREATE TABLE IF NOT EXISTS and ADD COLUMN IF NOT EXISTS throughout, so
+    this is safe to run against a fresh install or one with years of live
+    school data already in it."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS timetable_settings (
+                    school_id INTEGER PRIMARY KEY REFERENCES schools(id) ON DELETE CASCADE,
+                    days_per_week INTEGER NOT NULL DEFAULT 5
+                );
+
+                CREATE TABLE IF NOT EXISTS timetable_periods (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    education_level VARCHAR(100) NOT NULL,
+                    label VARCHAR(50) NOT NULL,
+                    short_label VARCHAR(20),
+                    start_time VARCHAR(20),
+                    end_time VARCHAR(20),
+                    period_order INTEGER NOT NULL,
+                    period_type VARCHAR(20) NOT NULL DEFAULT 'teaching',
+                    is_teaching_period BOOLEAN NOT NULL DEFAULT TRUE,
+                    UNIQUE(school_id, education_level, period_order)
+                );
+
+                CREATE TABLE IF NOT EXISTS teacher_subject_assignments (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    grade_name VARCHAR(100) NOT NULL,
+                    education_level VARCHAR(100) NOT NULL,
+                    stream VARCHAR(100) NOT NULL,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    staff_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    lessons_per_week INTEGER NOT NULL DEFAULT 1,
+                    requires_double BOOLEAN NOT NULL DEFAULT FALSE,
+                    UNIQUE(school_id, grade_name, education_level, stream, learning_area_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS timetable_slots (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    grade_name VARCHAR(100) NOT NULL,
+                    education_level VARCHAR(100) NOT NULL,
+                    stream VARCHAR(100) NOT NULL,
+                    day_of_week VARCHAR(20) NOT NULL,
+                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    custom_subject_id INTEGER,
+                    co_curricular_activity_id INTEGER,
+                    staff_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_timetable_slots_lookup ON timetable_slots (school_id, grade_name, education_level, stream);
+                CREATE INDEX IF NOT EXISTS idx_timetable_slots_teacher ON timetable_slots (school_id, staff_user_id, day_of_week, period_id);
+
+                CREATE TABLE IF NOT EXISTS teacher_availability (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    staff_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    day_of_week VARCHAR(20) NOT NULL,
+                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
+                    status VARCHAR(20) NOT NULL DEFAULT 'not_available',
+                    UNIQUE(school_id, staff_user_id, day_of_week, period_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS subject_availability (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    day_of_week VARCHAR(20) NOT NULL,
+                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
+                    status VARCHAR(20) NOT NULL DEFAULT 'not_available',
+                    UNIQUE(school_id, learning_area_id, day_of_week, period_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS subject_sync_rules (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    day_of_week VARCHAR(20) NOT NULL,
+                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
+                    UNIQUE(school_id, learning_area_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS subject_constraints (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    grade_name VARCHAR(100) NOT NULL,
+                    education_level VARCHAR(100) NOT NULL,
+                    stream VARCHAR(100) NOT NULL,
+                    subject_a_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    subject_b_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    constraint_type VARCHAR(30) NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS timetable_custom_subjects (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    education_level VARCHAR(100) NOT NULL,
+                    name VARCHAR(150) NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS co_curricular_activities (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    name VARCHAR(150) NOT NULL,
+                    category VARCHAR(50),
+                    schedule_note VARCHAR(255),
+                    staff_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    description TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS co_curricular_participants (
+                    id SERIAL PRIMARY KEY,
+                    activity_id INTEGER REFERENCES co_curricular_activities(id) ON DELETE CASCADE,
+                    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+                    UNIQUE(activity_id, student_id)
+                );
+            """)
+
+            # NEW: subject short-codes and colors, first-class in this
+            # module rather than a hash-derived color — matches ASC's
+            # "each subject gets a defined code and color" entity concept.
+            # A separate table, not new columns on the shared
+            # `learning_areas` table, since that table is used across the
+            # whole app (report cards, marks entry) and shouldn't carry
+            # timetable-only presentation fields.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS timetable_subject_config (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    short_code VARCHAR(10),
+                    color_hex VARCHAR(9),
+                    UNIQUE(school_id, learning_area_id)
+                );
+            """)
+            conn.commit()
+
+
 def get_school_days(cur, school_id: int):
-    """Returns this school's configured list of teaching days (e.g. Mon-Fri
-    or Mon-Sat), defaulting to a 5-day week only until the school sets its
-    own value on the Periods & Days page. Works whether the caller's cursor
-    is a RealDictCursor (dict-style rows) or a plain cursor (tuple rows) —
-    some call sites use a plain cursor for other queries in the same block."""
-    cur.execute("SELECT days_per_week FROM timetable_settings WHERE school_id = %s;", (school_id,))
-    row = cur.fetchone()
-    if row is None:
+    """Returns the school's active weekdays in order, e.g.
+    ['Monday', ..., 'Friday']. Defaults to a 5-day week."""
+    try:
+        cur.execute("SELECT days_per_week FROM timetable_settings WHERE school_id = %s;", (school_id,))
+        row = cur.fetchone()
+        days_per_week = (row['days_per_week'] if isinstance(row, dict) else row[0]) if row else 5
+    except Exception:
         days_per_week = 5
-    else:
-        try:
-            days_per_week = row['days_per_week']
-        except (TypeError, KeyError):
-            days_per_week = row[0]
-    return ALL_POSSIBLE_DAYS[:days_per_week]
+    all_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    return all_days[:max(1, min(6, days_per_week))]
 
 
 def get_periods_for_level(cur, school_id: int, education_level: str):
-    """Returns this school's periods for a specific education level (e.g.
-    Lower Primary's 35-minute lessons vs Junior School's 40-minute ones).
-    Falls back to the shared 'ALL' schedule if that level hasn't been given
-    its own periods yet, so schools that don't need the distinction — or
-    haven't configured it yet — keep working exactly as before."""
-    cur.execute(
-        "SELECT * FROM timetable_periods WHERE school_id = %s AND education_level = %s ORDER BY period_order ASC;",
-        (school_id, education_level)
-    )
-    rows = cur.fetchall()
-    if rows:
-        return rows
-    cur.execute(
-        "SELECT * FROM timetable_periods WHERE school_id = %s AND education_level = 'ALL' ORDER BY period_order ASC;",
-        (school_id,)
-    )
+    cur.execute("""
+        SELECT * FROM timetable_periods
+        WHERE school_id = %s AND education_level = %s
+        ORDER BY period_order ASC;
+    """, (school_id, education_level))
     return cur.fetchall()
+
+
+def _section_label(grade_name: str, stream: str) -> str:
+    return grade_name if (not stream or stream == "SINGLE STREAM") else f"{grade_name} — {stream}"
+
+
+def get_subject_style(cur, school_id: int, learning_area_id: int, subject_name: str):
+    """Returns (short_code, color_hex) for a subject — its configured
+    values if set, otherwise a sensible auto-generated fallback (an
+    abbreviation, and a deterministic color from the default palette so
+    the same subject always gets the same color even before anyone
+    configures one explicitly)."""
+    cur.execute("""
+        SELECT short_code, color_hex FROM timetable_subject_config
+        WHERE school_id = %s AND learning_area_id = %s;
+    """, (school_id, learning_area_id))
+    row = cur.fetchone()
+    short_code = (row['short_code'] if row else None) or abbreviate_subject(subject_name)
+    color_hex = (row['color_hex'] if row else None) or DEFAULT_SUBJECT_COLORS[learning_area_id % len(DEFAULT_SUBJECT_COLORS)]
+    return short_code, color_hex
+
+
+# ============================================================
+# Workspace Hub — the new central navigation, ASC-style: quick
+# launchers to every entity panel, plus Test & Generate front and
+# center rather than buried inside each class.
+# ============================================================
+
+@router.get("/timetable/dashboard/{school_id}", response_class=HTMLResponse)
+def timetable_workspace_hub(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("""
+                SELECT DISTINCT c.grade_name, c.education_level, s.stream
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                ORDER BY c.grade_name ASC, s.stream ASC;
+            """, (school_id,))
+            sections = cur.fetchall()
+
+            cur.execute("SELECT COUNT(*) AS cnt FROM timetable_periods WHERE school_id = %s;", (school_id,))
+            has_periods = cur.fetchone()['cnt'] > 0
+
+            cur.execute("""
+                SELECT grade_name, education_level, stream, COUNT(*) AS cnt
+                FROM timetable_slots WHERE school_id = %s
+                GROUP BY grade_name, education_level, stream;
+            """, (school_id,))
+            slot_counts = {(r['grade_name'], r['education_level'], r['stream']): r['cnt'] for r in cur.fetchall()}
+
+            cur.execute("SELECT COUNT(*) AS cnt FROM learning_areas;")
+            subject_count = cur.fetchone()['cnt']
+
+            cur.execute("SELECT COUNT(DISTINCT staff_user_id) AS cnt FROM teacher_subject_assignments WHERE school_id = %s AND staff_user_id IS NOT NULL;", (school_id,))
+            teacher_count = cur.fetchone()['cnt']
+
+    sections_by_level = {}
+    for sec in sections:
+        sections_by_level.setdefault(sec['education_level'], []).append(sec)
+
+    level_accent = {"Lower Primary": "#0d9488", "Upper Primary": "#0891b2", "Junior School": "#7c3aed"}
+
+    level_groups_html = ""
+    for level_name, level_sections in sections_by_level.items():
+        accent = level_accent.get(level_name, "#0d9488")
+        cards_html = ""
+        for sec in level_sections:
+            encoded_grade = urllib.parse.quote(sec['grade_name'])
+            encoded_level = urllib.parse.quote(sec['education_level'])
+            encoded_stream = urllib.parse.quote(sec['stream'])
+            has_timetable = slot_counts.get((sec['grade_name'], sec['education_level'], sec['stream']), 0) > 0
+            status_badge = (
+                "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 border border-teal-200'>Set</span>"
+                if has_timetable else
+                "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Not set</span>"
+            )
+            cards_html += f"""
+            <div class='bg-white border border-slate-200/80 p-4 rounded-2xl shadow-xs hover:shadow-md transition-shadow flex flex-col justify-between gap-2.5 border-l-4' style='border-left-color:{accent};'>
+                <div class="flex items-center justify-between">
+                    <h3 class='text-sm font-black text-slate-800'>{esc(_section_label(sec['grade_name'], sec['stream']))}</h3>
+                    {status_badge}
+                </div>
+                <div class='grid grid-cols-2 gap-2'>
+                    <a href='/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-100 hover:bg-slate-200 text-slate-700 text-center text-xs py-1.5 rounded-lg font-semibold transition'>Teachers</a>
+                    <a href='/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-800 hover:bg-slate-900 text-white text-center text-xs py-1.5 rounded-lg font-semibold transition'>Open</a>
+                </div>
+            </div>
+            """
+        level_groups_html += f"""
+        <div class="mb-6">
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-sm font-black text-slate-700">{esc(level_name)}</h2>
+                <form action="/api/v1/timetable/test-and-generate-level/{school_id}" method="post" onsubmit="return confirm('Test and generate every class in {esc(level_name)}?');">
+                    <input type="hidden" name="education_level" value="{esc(level_name)}">
+                    <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-3.5 py-1.5 rounded-xl text-xs font-bold transition shadow-sm">🧪 Test &amp; Generate Level</button>
+                </form>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">{cards_html}</div>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Timetable Workspace</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4">
+            <div class="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
+                <div>
+                    <h1 class="text-base font-bold text-slate-900">🗓️ Timetable Workspace — {esc(school['name'])}</h1>
+                    <p class="text-xs text-slate-400">{len(sections)} class(es) · {subject_count} subject(s) · {teacher_count} teacher(s) assigned</p>
+                </div>
+                <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Main Dashboard</a>
+            </div>
+            <div class="flex gap-2 flex-wrap mt-4">
+                <a href="/timetable/subjects-config/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🎨 Subjects</a>
+                <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods &amp; Days</a>
+                <a href="/timetable/teacher-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🧑‍🏫 Teacher Availability</a>
+                <a href="/timetable/subject-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
+                <a href="/timetable/view/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🔀 Whole/Teachers/Subjects View</a>
+                <a href="/timetable/collision-check/{school_id}" class="bg-rose-600 hover:bg-rose-700 text-white px-3.5 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🔍 Check for Collisions</a>
+                <a href="/timetable/teacher-workload/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">📊 Teacher Workload</a>
+                <a href="/timetable/teachers/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🖨 Print Teacher Timetables</a>
+            </div>
+        </header>
+        <div class="p-6 sm:p-8 max-w-6xl mx-auto">
+            {"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-6'>⏱ <b>Set up your periods and bell times first</b> — go to <a href='/timetable/periods/" + str(school_id) + "' class='underline font-bold'>Periods &amp; Days</a> before generating any timetable.</div>" if not has_periods else ""}
+            {level_groups_html or "<p class='text-slate-400 text-xs italic text-center py-8 bg-white border border-dashed rounded-2xl'>No classes with students yet — add students first.</p>"}
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ============================================================
+# Subjects Config — short codes and colors per subject, the ASC-style
+# "each subject is a visual entity" concept. Subjects themselves
+# (learning_areas) are fetched from the shared curriculum data already
+# used everywhere else in Elimu Hub — never re-entered here.
+# ============================================================
+
+@router.get("/timetable/subjects-config/{school_id}", response_class=HTMLResponse)
+def subjects_config_view(school_id: int, request: Request, education_level: str = "Upper Primary"):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
+            subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+
+            cur.execute("SELECT learning_area_id, short_code, color_hex FROM timetable_subject_config WHERE school_id = %s;", (school_id,))
+            existing = {r['learning_area_id']: r for r in cur.fetchall()}
+
+    level_tabs = "".join(
+        f"""<a href="/timetable/subjects-config/{school_id}?education_level={urllib.parse.quote(lvl)}"
+               class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-indigo-800 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
+        for lvl in EDUCATION_LEVELS
+    )
+
+    rows_html = ""
+    for i, sub in enumerate(subjects):
+        cfg = existing.get(sub['id'])
+        short_code = (cfg['short_code'] if cfg else None) or abbreviate_subject(sub['name'])
+        color_hex = (cfg['color_hex'] if cfg else None) or DEFAULT_SUBJECT_COLORS[i % len(DEFAULT_SUBJECT_COLORS)]
+        rows_html += f"""
+        <div class="flex items-center gap-3 py-2.5 border-b border-slate-50 last:border-0">
+            <span class="w-5 h-5 rounded-md shrink-0" style="background:{esc(color_hex)};"></span>
+            <span class="text-sm font-semibold text-slate-700 flex-1">{esc(sub['name'])}</span>
+            <input type="text" name="short_code_{sub['id']}" value="{esc(short_code)}" maxlength="10" class="border p-2 rounded-lg w-24 text-xs text-center font-bold uppercase">
+            <input type="color" name="color_{sub['id']}" value="{esc(color_hex)}" class="w-10 h-9 rounded-lg border cursor-pointer">
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Subjects</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
+        <div class="max-w-xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">🎨 Subjects — Codes &amp; Colors</h2>
+                <p class="text-xs text-slate-400 mt-1">These short codes and colors are used across every timetable view and printout. Subjects themselves come from your curriculum setup — add or remove subjects there, not here.</p>
+            </div>
+            <div class="flex gap-2 flex-wrap">{level_tabs}</div>
+            <form action="/api/v1/timetable/subjects-config/save/{school_id}" method="post" class="bg-white p-6 rounded-2xl border shadow-xs">
+                <input type="hidden" name="education_level" value="{esc(education_level)}">
+                {rows_html or "<p class='text-slate-400 text-xs italic py-4'>No subjects configured for this level yet.</p>"}
+                <button type="submit" class="w-full mt-4 bg-indigo-800 hover:bg-indigo-900 text-white font-bold py-3 rounded-xl text-sm transition">Save</button>
+            </form>
+            <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back to Workspace</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/subjects-config/save/{school_id}")
+async def save_subjects_config(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form_data = await request.form()
+    education_level = (form_data.get("education_level") or "").strip()
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM learning_areas WHERE education_level = %s;", (education_level,))
+            subjects = cur.fetchall()
+
+            for sub in subjects:
+                short_code = (form_data.get(f"short_code_{sub['id']}") or "").strip().upper()[:10]
+                color_hex = (form_data.get(f"color_{sub['id']}") or "").strip()
+                if not short_code and not color_hex:
+                    continue
+                cur.execute("""
+                    INSERT INTO timetable_subject_config (school_id, learning_area_id, short_code, color_hex)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (school_id, learning_area_id) DO UPDATE SET short_code = EXCLUDED.short_code, color_hex = EXCLUDED.color_hex;
+                """, (school_id, sub['id'], short_code or None, color_hex or None))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/subjects-config/{school_id}?education_level={urllib.parse.quote(education_level)}", status_code=303)
 
 
 def validate_timetable_setup(cur, school_id: int, grade_name: str, education_level: str, stream: str):
@@ -521,131 +572,10 @@ def validate_timetable_setup(cur, school_id: int, grade_name: str, education_lev
     return errors, warnings
 
 
-def _section_label(grade_name: str, stream: str) -> str:
-    """'Grade 6' for single-stream classes, 'Grade 6 — Stream N' otherwise."""
-    if not stream or stream == "SINGLE STREAM":
-        return grade_name
-    return f"{grade_name} — Stream {stream}"
 
-
-
-@router.get("/timetable/dashboard/{school_id}", response_class=HTMLResponse)
-def timetable_dashboard(school_id: int, request: Request):
-    auth_error = require_school_session(request, school_id)
-    if auth_error:
-        return auth_error
-
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
-            school = cur.fetchone()
-            if not school:
-                raise HTTPException(status_code=404, detail="School not found.")
-
-
-            cur.execute("""
-                SELECT DISTINCT c.grade_name, c.education_level, s.stream, c.id AS class_order
-                FROM students s
-                JOIN classes c ON s.class_id = c.id
-                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
-                ORDER BY c.id ASC, s.stream ASC;
-            """, (school_id,))
-            sections = cur.fetchall()
-
-            cur.execute("""
-                SELECT grade_name, education_level, stream, COUNT(*) AS slot_count
-                FROM timetable_slots WHERE school_id = %s
-                GROUP BY grade_name, education_level, stream;
-            """, (school_id,))
-            slot_counts = {(r['grade_name'], r['education_level'], r['stream']): r['slot_count'] for r in cur.fetchall()}
-
-            cur.execute("SELECT COUNT(*) AS cnt FROM timetable_periods WHERE school_id = %s;", (school_id,))
-            has_periods = cur.fetchone()['cnt'] > 0
-
-    sections_by_level = {}
-    for sec in sections:
-        sections_by_level.setdefault(sec['education_level'], []).append(sec)
-
-    level_accent = {"Lower Primary": "#0d9488", "Upper Primary": "#0891b2", "Junior School": "#7c3aed"}
-    level_groups_html = ""
-    for level_name, level_sections in sections_by_level.items():
-        accent = level_accent.get(level_name, "#0d9488")
-        cards_html = ""
-        for sec in level_sections:
-            encoded_grade = urllib.parse.quote(sec['grade_name'])
-            encoded_level = urllib.parse.quote(sec['education_level'])
-            encoded_stream = urllib.parse.quote(sec['stream'])
-            has_timetable = slot_counts.get((sec['grade_name'], sec['education_level'], sec['stream']), 0) > 0
-            status_badge = (
-                "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 border border-teal-200'>Timetable set</span>"
-                if has_timetable else
-                "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Not yet created</span>"
-            )
-            cards_html += f"""
-            <div class='bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs hover:shadow-md transition-shadow flex flex-col justify-between gap-3 border-l-4' style='border-left-color:{accent};'>
-                <div>
-                    <span class='text-[10px] px-2.5 py-1 rounded-md font-bold uppercase tracking-wider' style='background:{accent}1a;color:{accent};'>{esc(sec['education_level'])}</span>
-                    <h3 class='text-base font-black text-slate-800 mt-2.5'>{esc(_section_label(sec['grade_name'], sec['stream']))}</h3>
-                    <div class="mt-2">{status_badge}</div>
-                </div>
-                <div class='grid grid-cols-3 gap-2'>
-                    <a href='/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-100 hover:bg-slate-200 text-slate-700 text-center text-xs py-2 rounded-xl font-semibold transition'>Assign Teachers</a>
-                    <a href='/timetable/constraints/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-slate-100 hover:bg-slate-200 text-slate-700 text-center text-xs py-2 rounded-xl font-semibold transition'>Constraints</a>
-                    <a href='/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition'>Open Timetable</a>
-                </div>
-            </div>
-            """
-        level_groups_html += f"""
-        <div class="mb-6">
-            <div class="flex items-center justify-between mb-3">
-                <h2 class="text-sm font-black text-slate-700">{esc(level_name)}</h2>
-                <form action="/api/v1/timetable/test-and-generate-level/{school_id}" method="post" onsubmit="return confirm('Test and generate every class in {esc(level_name)}? This replaces existing entries for every class in this level that passes validation.');">
-                    <input type="hidden" name="education_level" value="{esc(level_name)}">
-                    <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🧪 Test &amp; Generate Whole Level</button>
-                </form>
-            </div>
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">{cards_html}</div>
-        </div>
-        """
-
-    return HTMLResponse(f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Elimu Hub | Timetabling — {esc(school['name'])}</title>
-        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
-    </head>
-    <body class="bg-[#F7F9F8] min-h-screen">
-        <header class="bg-white border-b border-slate-200/80 px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
-            <div>
-                <h1 class="text-base font-bold text-slate-900">📅 Timetabling — {esc(school['name'])}</h1>
-                <p class="text-xs text-slate-400">Each stream has its own independent timetable.</p>
-            </div>
-            <div class="flex items-center gap-2 flex-wrap">
-                <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods & Days</a>
-                <a href="/timetable/availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">👩‍🏫 Teacher Availability</a>
-                <a href="/timetable/subject-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
-                <a href="/timetable/sync-rules/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Same-Time Rules</a>
-                <a href="/timetable/teachers/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🖨 Teacher Timetables</a>
-                <a href="/timetable/collision-check/{school_id}" class="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🔍 Check for Collisions</a>
-                <a href="/timetable/teacher-workload/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">📊 Teacher Workload</a>
-                <a href="/timetable/co-curricular/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">🎭 Co-Curricular</a>
-                <a href="/timetable/custom-subjects/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold text-center transition">➕ Custom Subjects</a>
-                <a href="/timetable/master/{school_id}" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🗓 Whole School View</a>
-                <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Dashboard</a>
-            </div>
-        </header>
-        <div class="p-6 sm:p-8 max-w-6xl mx-auto">
-            {"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-6'>⏱ <b>Set up your periods and bell times first</b> — go to <a href='/timetable/periods/" + str(school_id) + "' class='underline font-bold'>Periods &amp; Days</a> before generating any timetable.</div>" if not has_periods else ""}
-            {level_groups_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No classes with students yet — add students first.</p>"}
-        </div>
-    </body>
-    </html>
-    """)
-
+# ============================================================
+# Periods & Days
+# ============================================================
 
 @router.get("/timetable/periods/{school_id}", response_class=HTMLResponse)
 def timetable_periods_view(school_id: int, request: Request, education_level: str = "Lower Primary"):
@@ -873,6 +803,11 @@ def delete_timetable_period(school_id: int, period_id: int, request: Request):
     return RedirectResponse(url=f"/timetable/periods/{school_id}?education_level={urllib.parse.quote(level)}", status_code=303)
 
 
+
+# ============================================================
+# Teacher Assignments
+# ============================================================
+
 @router.get("/timetable/assignments/{school_id}", response_class=HTMLResponse)
 def teacher_assignments_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
     auth_error = require_school_session(request, school_id)
@@ -983,6 +918,11 @@ async def save_teacher_assignments(school_id: int, request: Request):
     encoded_stream = urllib.parse.quote(stream)
     return RedirectResponse(url=f"/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}", status_code=303)
 
+
+
+# ============================================================
+# Availability picker, Teacher Timetable picker, Teacher Workload
+# ============================================================
 
 @router.get("/timetable/availability/{school_id}", response_class=HTMLResponse)
 def teacher_availability_picker(school_id: int, request: Request):
@@ -1169,7 +1109,11 @@ def teacher_workload_report(school_id: int, request: Request):
     """
 
 
-@router.get("/timetable/collision-check/{school_id}", response_class=HTMLResponse)
+
+# ============================================================
+# Collision Checker
+# ============================================================
+
 def _find_timetable_collisions(cur, school_id: int, education_level: str = None):
     """Returns a list of collision groups — each group is a list of slot
     rows for the same teacher, same day/period, across 2+ different
@@ -1203,6 +1147,7 @@ def _find_timetable_collisions(cur, school_id: int, education_level: str = None)
     return [slots for slots in groups.values() if len({(s['grade_name'], s['stream']) for s in slots}) > 1]
 
 
+@router.get("/timetable/collision-check/{school_id}", response_class=HTMLResponse)
 def timetable_collision_check(school_id: int, request: Request, education_level: str = None):
     """Scans every slot currently in the timetable (optionally scoped to one
     education level) for a teacher booked into two different classes at the
@@ -1283,6 +1228,11 @@ def timetable_collision_check(school_id: int, request: Request, education_level:
     </html>
     """
 
+
+
+# ============================================================
+# Custom Subjects, Co-Curricular Activities & Rosters
+# ============================================================
 
 @router.get("/timetable/custom-subjects/{school_id}", response_class=HTMLResponse)
 def custom_subjects_view(school_id: int, request: Request, education_level: str = "Lower Primary"):
@@ -1659,6 +1609,11 @@ def remove_co_curricular_participant(school_id: int, activity_id: int, student_i
 
     return RedirectResponse(url=f"/timetable/co-curricular/{school_id}/{activity_id}/roster", status_code=303)
 
+
+
+# ============================================================
+# Teacher Availability, Subject Availability, Sync Rules, Constraints
+# ============================================================
 
 @router.get("/timetable/availability/{school_id}/{teacher_id}", response_class=HTMLResponse)
 def teacher_availability_grid(school_id: int, teacher_id: int, request: Request, education_level: str = "Lower Primary"):
@@ -2179,6 +2134,11 @@ def delete_subject_constraint(
     return RedirectResponse(url=f"/timetable/constraints/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}", status_code=303)
 
 
+
+# ============================================================
+# Grade/Class Timetable View, Test & Generate (single class + whole level)
+# ============================================================
+
 @router.get("/timetable/grade/{school_id}", response_class=HTMLResponse)
 def timetable_grade_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str, test_issues: str = None):
     auth_error = require_school_session(request, school_id)
@@ -2547,6 +2507,13 @@ def timetable_level_report(school_id: int, request: Request, report: str):
     """
 
 
+
+# ============================================================
+# Generation Engine — the hardened, tested placement algorithm
+# (Phase 1 locked placements, Phase 2 doubles, Phase 3 fill-remaining
+# with conflict-avoidance-first candidate selection)
+# ============================================================
+
 @router.post("/api/v1/timetable/generate/{school_id}")
 def generate_draft_timetable(school_id: int, request: Request, grade_name: str = Form(...), education_level: str = Form(...), stream: str = Form(...)):
     auth_error = require_school_session(request, school_id)
@@ -2807,6 +2774,11 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
     return RedirectResponse(url=f"/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}", status_code=303)
 
 
+
+# ============================================================
+# Blank Timetable Creator & Manual Slot Editor
+# ============================================================
+
 @router.post("/api/v1/timetable/new/{school_id}")
 def create_blank_timetable(school_id: int, request: Request, grade_name: str = Form(...), education_level: str = Form(...), stream: str = Form(...)):
     """Wipes this section's timetable to a completely blank slate — every
@@ -3058,6 +3030,154 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
     </table>
     """
 
+
+
+# ============================================================
+# View Switcher — Whole / Teachers / Subjects perspectives, ASC-style.
+# "Whole" and "Teachers" link to the existing master view and teacher
+# picker (already fully built, no need to duplicate that logic); "Subjects"
+# is a genuinely new perspective built here.
+# ============================================================
+
+@router.get("/timetable/view/{school_id}", response_class=HTMLResponse)
+def timetable_view_switcher(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Timetable Views</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">🔀 Timetable Views — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">Look at the same schedule from three different angles.</p>
+            </div>
+            <a href="/timetable/dashboard/{school_id}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Workspace</a>
+        </header>
+        <div class="p-6 sm:p-8 max-w-4xl mx-auto grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <a href="/timetable/master/{school_id}" class="bg-white border border-slate-200/80 hover:shadow-md transition-shadow p-6 rounded-2xl shadow-xs block">
+                <p class="text-2xl mb-2">🗂️</p>
+                <h2 class="text-sm font-black text-slate-800">Whole Schedule</h2>
+                <p class="text-xs text-slate-400 mt-1">Every class, every level, side by side — the full picture at once.</p>
+            </a>
+            <a href="/timetable/teachers/{school_id}" class="bg-white border border-slate-200/80 hover:shadow-md transition-shadow p-6 rounded-2xl shadow-xs block">
+                <p class="text-2xl mb-2">🧑‍🏫</p>
+                <h2 class="text-sm font-black text-slate-800">By Teacher</h2>
+                <p class="text-xs text-slate-400 mt-1">Pick a teacher, see their full week across every class they teach.</p>
+            </a>
+            <a href="/timetable/view/subjects/{school_id}" class="bg-white border border-slate-200/80 hover:shadow-md transition-shadow p-6 rounded-2xl shadow-xs block">
+                <p class="text-2xl mb-2">📚</p>
+                <h2 class="text-sm font-black text-slate-800">By Subject</h2>
+                <p class="text-xs text-slate-400 mt-1">Pick a subject, see exactly when every class studies it.</p>
+            </a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/timetable/view/subjects/{school_id}", response_class=HTMLResponse)
+def timetable_subject_perspective(school_id: int, request: Request, education_level: str = "Upper Primary", learning_area_id: int = None):
+    """A genuinely new view: pick one subject and see, across every class
+    in a level, exactly which day/period it's taught in — useful for
+    spotting a subject that's badly clustered on one day, or confirming a
+    subject's spread looks sensible school-wide. Purely read-only."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
+            subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+
+            if learning_area_id is None and subjects:
+                learning_area_id = subjects[0]['id']
+
+            days = get_school_days(cur, school_id)
+            periods = [p for p in get_periods_for_level(cur, school_id, education_level) if p['is_teaching_period']]
+
+            grid = {}
+            if learning_area_id:
+                cur.execute("""
+                    SELECT ts.grade_name, ts.stream, ts.day_of_week, ts.period_id, u.full_name AS teacher_name
+                    FROM timetable_slots ts
+                    LEFT JOIN users u ON ts.staff_user_id = u.id
+                    WHERE ts.school_id = %s AND ts.education_level = %s AND ts.learning_area_id = %s;
+                """, (school_id, education_level, learning_area_id))
+                for row in cur.fetchall():
+                    grid[(row['day_of_week'], row['period_id'])] = grid.get((row['day_of_week'], row['period_id']), []) + [
+                        f"{_section_label(row['grade_name'], row['stream'])}" + (f" ({row['teacher_name']})" if row['teacher_name'] else "")
+                    ]
+
+    level_tabs = "".join(
+        f"""<a href="/timetable/view/subjects/{school_id}?education_level={urllib.parse.quote(lvl)}"
+               class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-indigo-800 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
+        for lvl in EDUCATION_LEVELS
+    )
+    subject_options = "".join(
+        f"<option value='{s['id']}' {'selected' if s['id'] == learning_area_id else ''}>{esc(s['name'])}</option>"
+        for s in subjects
+    )
+
+    header_cells = "".join(f"<th class='p-2 text-center'>{esc(p['label'])}</th>" for p in periods)
+    body_rows = ""
+    for day in days:
+        cells = ""
+        for p in periods:
+            entries = grid.get((day, p['id']), [])
+            cells += f"<td class='p-2 text-xs text-center align-top'>{'<br>'.join(esc(e) for e in entries) if entries else '<span class=\"text-slate-300\">—</span>'}</td>"
+        body_rows += f"<tr class='border-b border-slate-50'><td class='p-2 text-xs font-bold text-slate-600'>{esc(day)}</td>{cells}</tr>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Timetable by Subject</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">📚 By Subject — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">See exactly when a subject is taught, across every class in a level.</p>
+            </div>
+            <a href="/timetable/view/{school_id}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Back to Views</a>
+        </header>
+        <div class="p-4 sm:p-8 max-w-5xl mx-auto space-y-4">
+            <div class="flex gap-2 flex-wrap">{level_tabs}</div>
+            <form method="get" class="flex items-center gap-2">
+                <input type="hidden" name="education_level" value="{esc(education_level)}">
+                <label class="text-xs font-bold text-slate-500">Subject:</label>
+                <select name="learning_area_id" onchange="this.form.submit()" class="border p-2 rounded-lg text-sm bg-white font-semibold">{subject_options}</select>
+            </form>
+            <div class="bg-white rounded-2xl border shadow-xs overflow-x-auto">
+                <table class="w-full">
+                    <thead><tr class="bg-slate-50 text-slate-500 text-xs border-b"><th class="p-2 text-left">Day</th>{header_cells}</tr></thead>
+                    <tbody>{body_rows or "<tr><td colspan='" + str(len(periods)+1) + "' class='p-8 text-center text-slate-400 text-xs italic'>No periods configured for this level.</td></tr>"}</tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ============================================================
+# Print Suite — class timetable, teacher timetable, master (whole-level) view
+# ============================================================
 
 @router.get("/timetable/print/{school_id}", response_class=HTMLResponse)
 def print_timetable(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
