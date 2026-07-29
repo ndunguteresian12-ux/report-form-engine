@@ -2592,7 +2592,9 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 WHERE school_id = %s AND staff_user_id IS NOT NULL
                   AND NOT (grade_name = %s AND education_level = %s AND stream = %s);
             """, (school_id, grade_name, education_level, stream))
-            booked = {(r['day_of_week'], r['period_id']): r['staff_user_id'] for r in cur.fetchall()}
+            booked = {}
+            for r in cur.fetchall():
+                booked.setdefault((r['day_of_week'], r['period_id']), set()).add(r['staff_user_id'])
 
             # Teachers' explicit unavailability — a slot they're marked
             # "not_available" for is a hard block; "conditional" is a soft
@@ -2635,7 +2637,7 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 """, (school_id, grade_name, education_level, stream, day, period_id, subject['id'], teacher))
                 filled[(day, period_id)] = subject
                 if teacher:
-                    booked[(day, period_id)] = teacher
+                    booked.setdefault((day, period_id), set()).add(teacher)
                 used_today_by_day[day].add(subject['id'])
                 remaining[subject['id']] -= 1
 
@@ -2646,7 +2648,7 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                     continue
                 lcid = locked_subject['id']
                 chosen_teacher = teacher_for_subject.get(lcid)
-                if chosen_teacher and booked.get((day, period_id)) == chosen_teacher:
+                if chosen_teacher and chosen_teacher in booked.get((day, period_id), set()):
                     chosen_teacher = None  # conflict — place subject anyway, flagged for manual fix
                 _place(day, period_id, locked_subject, chosen_teacher)
                 last_subject_by_day[day] = lcid
@@ -2674,7 +2676,7 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                             continue
                         if cand_teacher and (
                             (cand_teacher, day, p1['id']) in unavailable or (cand_teacher, day, p2['id']) in unavailable
-                            or booked.get((day, p1['id'])) == cand_teacher or booked.get((day, p2['id'])) == cand_teacher
+                            or cand_teacher in booked.get((day, p1['id']), set()) or cand_teacher in booked.get((day, p2['id']), set())
                         ):
                             continue
                         _place(day, p1['id'], subj, cand_teacher)
@@ -2736,7 +2738,7 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                                 continue
                             if cand_teacher and avoid_conditional and (cand_teacher, day, period['id']) in conditional:
                                 continue
-                            if cand_teacher and booked.get((day, period['id'])) == cand_teacher:
+                            if cand_teacher and cand_teacher in booked.get((day, period['id']), set()):
                                 if avoid_teacher_conflict:
                                     continue  # try a different candidate first rather than nulling this one's teacher
                                 cand_teacher = None
@@ -2752,7 +2754,7 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                         chosen_subject = queue[chosen_idx]
                         chosen_teacher = teacher_for_subject.get(chosen_subject['id'])
                         if chosen_teacher and (
-                            booked.get((day, period['id'])) == chosen_teacher
+                            chosen_teacher in booked.get((day, period['id']), set())
                             or (chosen_teacher, day, period['id']) in unavailable
                         ):
                             chosen_teacher = None
