@@ -3203,6 +3203,13 @@ def update_timetable_slot(
                 """, (school_id, learning_area_id, grade_name, education_level, stream))
                 assignment = cur.fetchone()
                 teacher_id = assignment['staff_user_id'] if assignment else None
+            elif kind == "custom":
+                cur.execute("""
+                    SELECT staff_user_id FROM teacher_subject_assignments
+                    WHERE school_id = %s AND custom_subject_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
+                """, (school_id, custom_subject_id, grade_name, education_level, stream))
+                assignment = cur.fetchone()
+                teacher_id = assignment['staff_user_id'] if assignment else None
             elif kind == "activity":
                 # A co-curricular activity's supervisor doubles as the
                 # "teacher" for this slot, for conflict-checking purposes.
@@ -3282,10 +3289,22 @@ def update_timetable_slot(
 
                 # Subject "time off" — this subject marked unavailable at this
                 # exact slot is a hard block, mirroring the teacher check above.
-                cur.execute("""
-                    SELECT status FROM subject_availability
-                    WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s;
-                """, (school_id, learning_area_id, day_of_week, period_id))
+                # Checks whichever id actually applies (a custom subject has
+                # no learning_area_id at all, and vice versa) — querying with
+                # the wrong one always NULL means "no row found", silently
+                # bypassing this check entirely for whichever type wasn't handled.
+                if learning_area_id is not None:
+                    cur.execute("""
+                        SELECT status FROM subject_availability
+                        WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s;
+                    """, (school_id, learning_area_id, day_of_week, period_id))
+                elif custom_subject_id is not None:
+                    cur.execute("""
+                        SELECT status FROM subject_availability
+                        WHERE school_id = %s AND custom_subject_id = %s AND day_of_week = %s AND period_id = %s;
+                    """, (school_id, custom_subject_id, day_of_week, period_id))
+                else:
+                    cur.execute("SELECT NULL AS status WHERE FALSE;")  # co-curricular activities have no subject time-off concept
                 subj_availability = cur.fetchone()
                 if subj_availability and subj_availability['status'] == 'not_available':
                     raise HTTPException(
