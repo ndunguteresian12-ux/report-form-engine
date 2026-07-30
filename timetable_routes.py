@@ -204,6 +204,16 @@ def bootstrap_timetable_schema():
                 );
             """)
 
+            # Lets a teacher+lessons/week be assigned to a CUSTOM subject
+            # (e.g. a school-specific split of "Creative Arts and Sports"
+            # into Music/Art/PE, or a non-examinable subject like PPI) —
+            # exactly the same as a normal learning_area assignment, so the
+            # auto-generator schedules these with full conflict-avoidance
+            # too, not just via manual placement.
+            cur.execute("ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS custom_subject_id INTEGER REFERENCES timetable_custom_subjects(id) ON DELETE CASCADE;")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tsa_custom_subject ON teacher_subject_assignments (school_id, grade_name, education_level, stream, custom_subject_id) WHERE custom_subject_id IS NOT NULL;")
+            conn.commit()
+
             # NEW: subject short-codes and colors, first-class in this
             # module rather than a hash-derived color — matches ASC's
             # "each subject gets a defined code and color" entity concept.
@@ -819,18 +829,21 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
+            cur.execute("SELECT id, name FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s ORDER BY name ASC;", (school_id, education_level))
+            custom_subjects = cur.fetchall()
+
             cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'staff' AND is_verified = TRUE ORDER BY full_name NULLS LAST, email ASC;", (school_id,))
             staff_members = cur.fetchall()
 
             cur.execute("""
-                SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
+                SELECT learning_area_id, custom_subject_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
                 WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
             """, (school_id, grade_name, education_level, stream))
-            current_assignments = {r['learning_area_id']: r for r in cur.fetchall()}
+            all_assignments = cur.fetchall()
+            current_assignments = {r['learning_area_id']: r for r in all_assignments if r['learning_area_id'] is not None}
+            current_custom_assignments = {r['custom_subject_id']: r for r in all_assignments if r['custom_subject_id'] is not None}
 
-    rows_html = ""
-    for sub in subjects:
-        existing = current_assignments.get(sub['id'], {})
+    def _assignment_row(field_prefix, item_id, item_name, existing):
         assigned_id = existing.get('staff_user_id')
         lessons_per_week = existing.get('lessons_per_week', 1)
         requires_double = existing.get('requires_double', False)
@@ -838,19 +851,22 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
             f"<option value='{m['id']}' {'selected' if m['id'] == assigned_id else ''}>{esc(m['full_name'] or m['email'])}</option>"
             for m in staff_members
         )
-        rows_html += f"""
+        return f"""
         <div class="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 py-2.5 border-b border-slate-50 last:border-0">
-            <span class="text-sm font-semibold text-slate-700 sm:w-40 shrink-0">{esc(sub['name'])}</span>
-            <select name="teacher_{sub['id']}" class="border p-2 rounded-lg text-xs font-semibold bg-white flex-1 min-w-0">{options}</select>
+            <span class="text-sm font-semibold text-slate-700 sm:w-40 shrink-0">{esc(item_name)}</span>
+            <select name="{field_prefix}_{item_id}" class="border p-2 rounded-lg text-xs font-semibold bg-white flex-1 min-w-0">{options}</select>
             <div class="flex items-center gap-2 shrink-0">
                 <label class="text-[10px] font-bold text-slate-500">Lessons/wk</label>
-                <input type="number" name="lessons_{sub['id']}" value="{lessons_per_week}" min="0" max="20" class="border p-1.5 rounded-lg text-xs w-14 text-center">
+                <input type="number" name="lessons_{field_prefix}_{item_id}" value="{lessons_per_week}" min="0" max="20" class="border p-1.5 rounded-lg text-xs w-14 text-center">
                 <label class="text-[10px] font-bold text-slate-500 flex items-center gap-1">
-                    <input type="checkbox" name="double_{sub['id']}" value="1" {'checked' if requires_double else ''} class="w-3.5 h-3.5"> Needs double
+                    <input type="checkbox" name="double_{field_prefix}_{item_id}" value="1" {'checked' if requires_double else ''} class="w-3.5 h-3.5"> Needs double
                 </label>
             </div>
         </div>
         """
+
+    rows_html = "".join(_assignment_row("teacher", sub['id'], sub['name'], current_assignments.get(sub['id'], {})) for sub in subjects)
+    custom_rows_html = "".join(_assignment_row("teachercustom", cs['id'], cs['name'], current_custom_assignments.get(cs['id'], {})) for cs in custom_subjects)
 
     section_label = _section_label(grade_name, stream)
     return f"""
@@ -867,6 +883,8 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
                 <input type="hidden" name="education_level" value="{esc(education_level)}">
                 <input type="hidden" name="stream" value="{esc(stream)}">
                 {rows_html or "<p class='text-slate-400 text-xs italic'>No subjects configured for this education level.</p>"}
+                {f'''<p class="text-[10px] font-bold uppercase tracking-wider text-slate-400 pt-4 pb-1">Custom Subjects (non-examinable / split subjects)</p>{custom_rows_html}''' if custom_subjects else ""}
+                <p class="text-[11px] text-slate-400 pt-3">Need a subject that isn't listed — like splitting Creative Arts into Music/Art/PE, or adding a non-graded subject like PPI? <a href="/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(education_level)}" class="text-indigo-700 font-bold hover:underline">Add a Custom Subject →</a></p>
                 <div class="pt-4 flex gap-3">
                     <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 px-5 rounded-xl text-sm transition">Save Assignments</button>
                     <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition">← Back</a>
@@ -894,16 +912,53 @@ async def save_teacher_assignments(school_id: int, request: Request):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             for key, value in form.items():
+                # Regular subjects: "teacher_{learning_area_id}". Custom
+                # subjects use a distinct "teachercustom_{id}" prefix so the
+                # two never collide even though both are plain integer ids.
+                if key.startswith("teachercustom_"):
+                    custom_subject_id = int(key.replace("teachercustom_", ""))
+                    staff_user_id = int(value) if value else None
+                    try:
+                        lessons_per_week = max(0, min(20, int(form.get(f"lessons_teachercustom_{custom_subject_id}", 1) or 1)))
+                    except ValueError:
+                        lessons_per_week = 1
+                    requires_double = form.get(f"double_teachercustom_{custom_subject_id}") is not None
+
+                    # Check-then-update-or-insert rather than ON CONFLICT —
+                    # this targets a partial unique index (only enforced
+                    # when custom_subject_id IS NOT NULL), and matching
+                    # ON CONFLICT against a partial index correctly requires
+                    # repeating its WHERE clause exactly; simpler and just
+                    # as safe to avoid that entirely, the same lesson
+                    # learned earlier with the finance module's fee
+                    # structures.
+                    cur.execute("""
+                        SELECT id FROM teacher_subject_assignments
+                        WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND custom_subject_id = %s;
+                    """, (school_id, grade_name, education_level, stream, custom_subject_id))
+                    existing_row = cur.fetchone()
+                    if existing_row:
+                        cur.execute("""
+                            UPDATE teacher_subject_assignments SET staff_user_id = %s, lessons_per_week = %s, requires_double = %s
+                            WHERE id = %s;
+                        """, (staff_user_id, lessons_per_week, requires_double, existing_row[0]))
+                    else:
+                        cur.execute("""
+                            INSERT INTO teacher_subject_assignments (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double))
+                    continue
+
                 if not key.startswith("teacher_"):
                     continue
                 learning_area_id = int(key.replace("teacher_", ""))
                 staff_user_id = int(value) if value else None
 
                 try:
-                    lessons_per_week = max(0, min(20, int(form.get(f"lessons_{learning_area_id}", 1) or 1)))
+                    lessons_per_week = max(0, min(20, int(form.get(f"lessons_teacher_{learning_area_id}", 1) or 1)))
                 except ValueError:
                     lessons_per_week = 1
-                requires_double = form.get(f"double_{learning_area_id}") is not None
+                requires_double = form.get(f"double_teacher_{learning_area_id}") is not None
 
                 cur.execute("""
                     INSERT INTO teacher_subject_assignments (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double)
@@ -2530,14 +2585,39 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
+            # Custom subjects (a school-specific split like Music/Art/PE out
+            # of "Creative Arts and Sports", or a non-examinable subject
+            # like PPI) are folded into the SAME scheduling queue as regular
+            # subjects, using a large id offset — this guarantees zero
+            # collision with real learning_area ids (a school will never
+            # have a million subjects), so every existing dict/set keyed by
+            # subject id keeps working completely unchanged. Only _place()
+            # needs to know about the offset, to route the INSERT to
+            # custom_subject_id instead of learning_area_id.
+            CUSTOM_SUBJECT_ID_OFFSET = 1_000_000
+            cur.execute("SELECT id, name FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s ORDER BY name ASC;", (school_id, education_level))
+            custom_subjects_raw = cur.fetchall()
+            custom_subjects = [{'id': cs['id'] + CUSTOM_SUBJECT_ID_OFFSET, 'name': cs['name']} for cs in custom_subjects_raw]
+            subjects = subjects + custom_subjects
+
             cur.execute("""
                 SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
-                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
+                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND learning_area_id IS NOT NULL;
             """, (school_id, grade_name, education_level, stream))
             assignment_rows = cur.fetchall()
             teacher_for_subject = {r['learning_area_id']: r['staff_user_id'] for r in assignment_rows}
             lessons_per_week_for_subject = {r['learning_area_id']: r['lessons_per_week'] for r in assignment_rows}
             requires_double_for_subject = {r['learning_area_id']: r['requires_double'] for r in assignment_rows}
+
+            cur.execute("""
+                SELECT custom_subject_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
+                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND custom_subject_id IS NOT NULL;
+            """, (school_id, grade_name, education_level, stream))
+            for r in cur.fetchall():
+                offset_id = r['custom_subject_id'] + CUSTOM_SUBJECT_ID_OFFSET
+                teacher_for_subject[offset_id] = r['staff_user_id']
+                lessons_per_week_for_subject[offset_id] = r['lessons_per_week']
+                requires_double_for_subject[offset_id] = r['requires_double']
 
             if not subjects or not teaching_periods:
                 raise HTTPException(status_code=400, detail="No subjects or teaching periods configured — nothing to generate.")
@@ -2631,10 +2711,13 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             last_subject_by_day = {day: None for day in days}
 
             def _place(day, period_id, subject, teacher):
+                is_custom = subject['id'] >= CUSTOM_SUBJECT_ID_OFFSET
+                real_learning_area_id = None if is_custom else subject['id']
+                real_custom_subject_id = (subject['id'] - CUSTOM_SUBJECT_ID_OFFSET) if is_custom else None
                 cur.execute("""
-                    INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, staff_user_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-                """, (school_id, grade_name, education_level, stream, day, period_id, subject['id'], teacher))
+                    INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, custom_subject_id, staff_user_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                """, (school_id, grade_name, education_level, stream, day, period_id, real_learning_area_id, real_custom_subject_id, teacher))
                 filled[(day, period_id)] = subject
                 if teacher:
                     booked.setdefault((day, period_id), set()).add(teacher)
