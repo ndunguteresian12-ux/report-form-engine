@@ -43,6 +43,15 @@ from shared import (
 router = APIRouter()
 
 EDUCATION_LEVELS = ["Lower Primary", "Upper Primary", "Junior School"]
+
+# Custom subjects (Music/Art/PE splits, PPI, etc.) share the scheduling
+# engine, teacher assignments, and time-off logic with regular subjects by
+# using this large offset on their id — guarantees zero collision with a
+# real learning_area id (a school will never have a million subjects), so
+# every dict/set keyed by subject id works unchanged for both. Defined
+# once here rather than locally in each function that needs it, so it
+# can never drift out of sync between them.
+CUSTOM_SUBJECT_ID_OFFSET = 1_000_000
 ALL_POSSIBLE_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
 # A small, pleasant default palette assigned round-robin to subjects that
@@ -212,6 +221,12 @@ def bootstrap_timetable_schema():
             # too, not just via manual placement.
             cur.execute("ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS custom_subject_id INTEGER REFERENCES timetable_custom_subjects(id) ON DELETE CASCADE;")
             cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tsa_custom_subject ON teacher_subject_assignments (school_id, grade_name, education_level, stream, custom_subject_id) WHERE custom_subject_id IS NOT NULL;")
+            conn.commit()
+
+            # Lets a custom subject (Music/Art/PE split, PPI, etc.) also have
+            # time-off marked, exactly like a regular subject.
+            cur.execute("ALTER TABLE subject_availability ADD COLUMN IF NOT EXISTS custom_subject_id INTEGER REFERENCES timetable_custom_subjects(id) ON DELETE CASCADE;")
+            cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sa_custom_subject ON subject_availability (school_id, custom_subject_id, day_of_week, period_id) WHERE custom_subject_id IS NOT NULL;")
             conn.commit()
 
             # NEW: subject short-codes and colors, first-class in this
@@ -1851,12 +1866,22 @@ def subject_availability_picker(school_id: int, request: Request):
             cur.execute("SELECT id, name, education_level FROM learning_areas ORDER BY education_level ASC, name ASC;")
             subjects = cur.fetchall()
 
+            cur.execute("SELECT id, name, education_level FROM timetable_custom_subjects WHERE school_id = %s ORDER BY education_level ASC, name ASC;", (school_id,))
+            custom_subjects = cur.fetchall()
+
     rows_html = "".join(f"""
         <a href="/timetable/subject-availability/{school_id}/{s['id']}" class="flex items-center justify-between p-4 border-b last:border-0 hover:bg-slate-50 transition">
             <span class="text-sm font-bold text-slate-800">{esc(s['name'])} <span class="text-[10px] text-slate-400 font-normal">({esc(s['education_level'])})</span></span>
             <span class="text-xs text-indigo-700 font-bold">Set Time Off →</span>
         </a>
     """ for s in subjects)
+
+    custom_rows_html = "".join(f"""
+        <a href="/timetable/subject-availability/{school_id}/{cs['id'] + CUSTOM_SUBJECT_ID_OFFSET}" class="flex items-center justify-between p-4 border-b last:border-0 hover:bg-slate-50 transition">
+            <span class="text-sm font-bold text-slate-800">{esc(cs['name'])} <span class="text-[10px] text-slate-400 font-normal">({esc(cs['education_level'])} — custom)</span></span>
+            <span class="text-xs text-indigo-700 font-bold">Set Time Off →</span>
+        </a>
+    """ for cs in custom_subjects)
 
     return f"""
     <!DOCTYPE html>
@@ -1867,6 +1892,7 @@ def subject_availability_picker(school_id: int, request: Request):
             <h2 class="text-lg font-black text-slate-800">📚 Subject Time Off</h2>
             <p class="text-xs text-slate-400 mb-4">Pick a subject to mark days/periods it can't (or preferably shouldn't) be scheduled in — e.g. no Math last period, PE unavailable when the field is in use.</p>
             <div>{rows_html or "<p class='text-slate-400 text-xs italic p-4'>No subjects configured yet.</p>"}</div>
+            {f'''<p class="text-[10px] font-bold uppercase tracking-wider text-slate-400 pt-4 pb-1 px-1">Custom Subjects</p><div>{custom_rows_html}</div>''' if custom_subjects else ""}
             <div class="pt-4">
                 <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back</a>
             </div>
@@ -1882,9 +1908,15 @@ def subject_availability_grid(school_id: int, learning_area_id: int, request: Re
     if auth_error:
         return auth_error
 
+    is_custom = learning_area_id >= CUSTOM_SUBJECT_ID_OFFSET
+    real_custom_id = (learning_area_id - CUSTOM_SUBJECT_ID_OFFSET) if is_custom else None
+
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, name, education_level FROM learning_areas WHERE id = %s;", (learning_area_id,))
+            if is_custom:
+                cur.execute("SELECT id, name, education_level FROM timetable_custom_subjects WHERE id = %s AND school_id = %s;", (real_custom_id, school_id))
+            else:
+                cur.execute("SELECT id, name, education_level FROM learning_areas WHERE id = %s;", (learning_area_id,))
             subject = cur.fetchone()
             if not subject:
                 raise HTTPException(status_code=404, detail="Subject not found.")
@@ -1894,10 +1926,16 @@ def subject_availability_grid(school_id: int, learning_area_id: int, request: Re
 
             periods = [p for p in get_periods_for_level(cur, school_id, subject['education_level']) if p['is_teaching_period']]
 
-            cur.execute("""
-                SELECT day_of_week, period_id, status FROM subject_availability
-                WHERE school_id = %s AND learning_area_id = %s;
-            """, (school_id, learning_area_id))
+            if is_custom:
+                cur.execute("""
+                    SELECT day_of_week, period_id, status FROM subject_availability
+                    WHERE school_id = %s AND custom_subject_id = %s;
+                """, (school_id, real_custom_id))
+            else:
+                cur.execute("""
+                    SELECT day_of_week, period_id, status FROM subject_availability
+                    WHERE school_id = %s AND learning_area_id = %s;
+                """, (school_id, learning_area_id))
             current = {(r['day_of_week'], r['period_id']): r['status'] for r in cur.fetchall()}
 
     status_options = [("available", "✅ Available"), ("conditional", "❔ Conditional"), ("not_available", "❌ Not Available")]
@@ -1944,11 +1982,17 @@ async def save_subject_availability(school_id: int, learning_area_id: int, reque
     if auth_error:
         return auth_error
 
+    is_custom = learning_area_id >= CUSTOM_SUBJECT_ID_OFFSET
+    real_custom_id = (learning_area_id - CUSTOM_SUBJECT_ID_OFFSET) if is_custom else None
+
     form = await request.form()
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT education_level FROM learning_areas WHERE id = %s;", (learning_area_id,))
+            if is_custom:
+                cur.execute("SELECT education_level FROM timetable_custom_subjects WHERE id = %s AND school_id = %s;", (real_custom_id, school_id))
+            else:
+                cur.execute("SELECT education_level FROM learning_areas WHERE id = %s;", (learning_area_id,))
             subject_row = cur.fetchone()
             if not subject_row:
                 raise HTTPException(status_code=404, detail="Subject not found.")
@@ -1968,18 +2012,46 @@ async def save_subject_availability(school_id: int, learning_area_id: int, reque
                 for period_id in period_ids:
                     field_name = f"status_{day}_{period_id}"
                     status = form.get(field_name, "available")
-                    if status == "available":
-                        cur.execute("""
-                            DELETE FROM subject_availability
-                            WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s;
-                        """, (school_id, learning_area_id, day, period_id))
+
+                    if is_custom:
+                        if status == "available":
+                            cur.execute("""
+                                DELETE FROM subject_availability
+                                WHERE school_id = %s AND custom_subject_id = %s AND day_of_week = %s AND period_id = %s;
+                            """, (school_id, real_custom_id, day, period_id))
+                        else:
+                            # Check-then-update-or-insert rather than
+                            # ON CONFLICT — this targets a partial unique
+                            # index (only enforced when custom_subject_id
+                            # IS NOT NULL), and matching ON CONFLICT against
+                            # a partial index correctly requires repeating
+                            # its WHERE clause exactly; simpler and just as
+                            # safe to avoid entirely.
+                            cur.execute("""
+                                SELECT id FROM subject_availability
+                                WHERE school_id = %s AND custom_subject_id = %s AND day_of_week = %s AND period_id = %s;
+                            """, (school_id, real_custom_id, day, period_id))
+                            existing_row = cur.fetchone()
+                            if existing_row:
+                                cur.execute("UPDATE subject_availability SET status = %s WHERE id = %s;", (status, existing_row[0]))
+                            else:
+                                cur.execute("""
+                                    INSERT INTO subject_availability (school_id, custom_subject_id, day_of_week, period_id, status)
+                                    VALUES (%s, %s, %s, %s, %s);
+                                """, (school_id, real_custom_id, day, period_id, status))
                     else:
-                        cur.execute("""
-                            INSERT INTO subject_availability (school_id, learning_area_id, day_of_week, period_id, status)
-                            VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (school_id, learning_area_id, day_of_week, period_id)
-                            DO UPDATE SET status = EXCLUDED.status;
-                        """, (school_id, learning_area_id, day, period_id, status))
+                        if status == "available":
+                            cur.execute("""
+                                DELETE FROM subject_availability
+                                WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s;
+                            """, (school_id, learning_area_id, day, period_id))
+                        else:
+                            cur.execute("""
+                                INSERT INTO subject_availability (school_id, learning_area_id, day_of_week, period_id, status)
+                                VALUES (%s, %s, %s, %s, %s)
+                                ON CONFLICT (school_id, learning_area_id, day_of_week, period_id)
+                                DO UPDATE SET status = EXCLUDED.status;
+                            """, (school_id, learning_area_id, day, period_id, status))
             conn.commit()
 
     return RedirectResponse(url=f"/timetable/subject-availability/{school_id}/{learning_area_id}", status_code=303)
@@ -2711,13 +2783,13 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             # Custom subjects (a school-specific split like Music/Art/PE out
             # of "Creative Arts and Sports", or a non-examinable subject
             # like PPI) are folded into the SAME scheduling queue as regular
-            # subjects, using a large id offset — this guarantees zero
+            # subjects, using a large id offset (CUSTOM_SUBJECT_ID_OFFSET,
+            # defined once at module level) — this guarantees zero
             # collision with real learning_area ids (a school will never
             # have a million subjects), so every existing dict/set keyed by
             # subject id keeps working completely unchanged. Only _place()
             # needs to know about the offset, to route the INSERT to
             # custom_subject_id instead of learning_area_id.
-            CUSTOM_SUBJECT_ID_OFFSET = 1_000_000
             cur.execute("SELECT id, name FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s ORDER BY name ASC;", (school_id, education_level))
             custom_subjects_raw = cur.fetchall()
             custom_subjects = [{'id': cs['id'] + CUSTOM_SUBJECT_ID_OFFSET, 'name': cs['name']} for cs in custom_subjects_raw]
@@ -2768,23 +2840,41 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             locked_placements = {}
             free_subjects = []
             for subj in subjects:
+                # A subject explicitly configured with 0 lessons/week must
+                # never be scheduled at all, in any phase — including via a
+                # "same time every week" sync rule, which otherwise ignores
+                # lessons_per_week entirely.
+                if lessons_per_week_for_subject.get(subj['id']) == 0:
+                    continue
                 rule = sync_rules.get(subj['id'])
                 if rule and rule[0] in days and rule[1] in teaching_period_ids:
                     locked_placements[(rule[0], rule[1])] = subj
                 else:
                     free_subjects.append(subj)
             if not free_subjects:
-                free_subjects = subjects  # safety net: never leave the queue empty
+                # Safety net: never leave the queue completely empty (e.g.
+                # if every subject happens to have a sync rule) — but still
+                # never includes a subject explicitly set to 0 lessons/week.
+                free_subjects = [s for s in subjects if lessons_per_week_for_subject.get(s['id']) != 0]
 
             # Subject "time off" — a subject marked "not_available" at a slot
             # is a hard block; "conditional" is a soft preference to avoid.
+            # Covers both regular subjects and custom ones (offset id).
             cur.execute("""
                 SELECT learning_area_id, day_of_week, period_id, status FROM subject_availability
-                WHERE school_id = %s AND status IN ('not_available', 'conditional');
+                WHERE school_id = %s AND status IN ('not_available', 'conditional') AND learning_area_id IS NOT NULL;
             """, (school_id,))
             subject_unavailable, subject_conditional = set(), set()
             for r in cur.fetchall():
                 key = (r['learning_area_id'], r['day_of_week'], r['period_id'])
+                (subject_unavailable if r['status'] == 'not_available' else subject_conditional).add(key)
+
+            cur.execute("""
+                SELECT custom_subject_id, day_of_week, period_id, status FROM subject_availability
+                WHERE school_id = %s AND status IN ('not_available', 'conditional') AND custom_subject_id IS NOT NULL;
+            """, (school_id,))
+            for r in cur.fetchall():
+                key = (r['custom_subject_id'] + CUSTOM_SUBJECT_ID_OFFSET, r['day_of_week'], r['period_id'])
                 (subject_unavailable if r['status'] == 'not_available' else subject_conditional).add(key)
 
             # Track which teacher is already booked at each (day, period) —
@@ -2870,7 +2960,15 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
 
             # How many lessons each subject still needs this week — defaults
             # to 1 for any subject without an explicit assignment configured.
-            remaining = {subj['id']: max(1, lessons_per_week_for_subject.get(subj['id'], 1)) for subj in free_subjects}
+            # A subject the admin never configured at all defaults to 1
+            # lesson/week (a reasonable assumption for something nobody's
+            # touched yet) — but a subject explicitly set to 0 lessons/week
+            # means "don't schedule this for this class" and must be
+            # respected exactly as 0, not silently forced back up to 1.
+            remaining = {}
+            for subj in free_subjects:
+                configured = lessons_per_week_for_subject.get(subj['id'])
+                remaining[subj['id']] = 1 if configured is None else max(0, configured)
             filled = {}       # (day, period_id) -> subject already placed there
             used_today_by_day = {day: set() for day in days}
             last_subject_by_day = {day: None for day in days}
