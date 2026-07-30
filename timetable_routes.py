@@ -380,6 +380,7 @@ def timetable_workspace_hub(school_id: int, request: Request):
             </div>
             <div class="flex gap-2 flex-wrap mt-4">
                 <a href="/timetable/subjects-config/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🎨 Subjects</a>
+                <a href="/timetable/custom-subjects/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">➕ Custom Subjects</a>
                 <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods &amp; Days</a>
                 <a href="/timetable/teacher-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🧑‍🏫 Teacher Availability</a>
                 <a href="/timetable/subject-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
@@ -447,7 +448,8 @@ def subjects_config_view(school_id: int, request: Request, education_level: str 
         <div class="max-w-xl mx-auto space-y-4">
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">🎨 Subjects — Codes &amp; Colors</h2>
-                <p class="text-xs text-slate-400 mt-1">These short codes and colors are used across every timetable view and printout. Subjects themselves come from your curriculum setup — add or remove subjects there, not here.</p>
+                <p class="text-xs text-slate-400 mt-1">These short codes and colors are used across every timetable view and printout. This list is your curriculum's graded subjects (English, Math, etc.) — add or remove those in your main Subjects setup, not here.</p>
+                <p class="text-xs text-slate-500 mt-2 bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-2">Need to add, edit, or delete a subject that's <b>only for scheduling</b> — like splitting Creative Arts into Music/Art/PE, or a non-examinable subject like PPI? That's done on the <a href="/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(education_level)}" class="text-indigo-700 font-bold hover:underline">Custom Subjects page →</a></p>
             </div>
             <div class="flex gap-2 flex-wrap">{level_tabs}</div>
             <form action="/api/v1/timetable/subjects-config/save/{school_id}" method="post" class="bg-white p-6 rounded-2xl border shadow-xs">
