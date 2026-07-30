@@ -3044,6 +3044,22 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             # subject's quota is used up it drops out, and once every
             # subject's quota is used up, any leftover slots simply stay
             # free rather than being force-filled. ---
+
+            # How many slots in the WHOLE week is each subject actually
+            # allowed in, given its own Subject Time-Off? A subject with
+            # very few valid slots (like PPI, allowed in exactly one) must
+            # be prioritized over a flexible subject that's ALSO valid at
+            # that same slot but has plenty of other opportunities —
+            # otherwise the flexible one can "steal" the one slot the
+            # restricted subject actually needs, and the restricted one
+            # never gets scheduled anywhere at all. This is the standard
+            # "most constrained first" scheduling heuristic.
+            total_week_slots = [(d, p['id']) for d in days for p in teaching_periods]
+            valid_slot_count = {
+                subj['id']: sum(1 for (d, pid) in total_week_slots if (subj['id'], d, pid) not in subject_unavailable)
+                for subj in free_subjects
+            }
+
             queue = [subj for subj in free_subjects for _ in range(remaining.get(subj['id'], 0))]
             qi = 0
             for day in days:
@@ -3069,8 +3085,11 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                     for avoid_conditional, avoid_teacher_conflict in ((True, True), (True, False), (False, True), (False, False)):
                         if chosen_subject is not None:
                             break
-                        for attempt in range(len(queue)):
-                            idx = (qi + attempt) % len(queue)
+                        priority_order = sorted(
+                            range(len(queue)),
+                            key=lambda idx: (valid_slot_count.get(queue[idx]['id'], 999), (idx - qi) % len(queue))
+                        )
+                        for idx in priority_order:
                             candidate = queue[idx]
                             cid = candidate['id']
                             if cid in used_today:
@@ -3107,8 +3126,11 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                         # relaxed here; if genuinely every subject in the
                         # queue is hard-blocked at this exact slot, it's
                         # left empty rather than violating one of them.
-                        for attempt in range(len(queue)):
-                            idx = (qi + attempt) % len(queue)
+                        priority_order = sorted(
+                            range(len(queue)),
+                            key=lambda idx: (valid_slot_count.get(queue[idx]['id'], 999), (idx - qi) % len(queue))
+                        )
+                        for idx in priority_order:
                             candidate = queue[idx]
                             cid = candidate['id']
                             if cid in used_today:
