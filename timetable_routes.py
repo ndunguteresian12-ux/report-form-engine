@@ -2837,29 +2837,14 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             cur.execute("SELECT learning_area_id, day_of_week, period_id FROM subject_sync_rules WHERE school_id = %s;", (school_id,))
             sync_rules = {r['learning_area_id']: (r['day_of_week'], r['period_id']) for r in cur.fetchall()}
 
-            locked_placements = {}
-            free_subjects = []
-            for subj in subjects:
-                # A subject explicitly configured with 0 lessons/week must
-                # never be scheduled at all, in any phase — including via a
-                # "same time every week" sync rule, which otherwise ignores
-                # lessons_per_week entirely.
-                if lessons_per_week_for_subject.get(subj['id']) == 0:
-                    continue
-                rule = sync_rules.get(subj['id'])
-                if rule and rule[0] in days and rule[1] in teaching_period_ids:
-                    locked_placements[(rule[0], rule[1])] = subj
-                else:
-                    free_subjects.append(subj)
-            if not free_subjects:
-                # Safety net: never leave the queue completely empty (e.g.
-                # if every subject happens to have a sync rule) — but still
-                # never includes a subject explicitly set to 0 lessons/week.
-                free_subjects = [s for s in subjects if lessons_per_week_for_subject.get(s['id']) != 0]
-
             # Subject "time off" — a subject marked "not_available" at a slot
             # is a hard block; "conditional" is a soft preference to avoid.
             # Covers both regular subjects and custom ones (offset id).
+            # Computed BEFORE locked placements below, specifically so a
+            # sync rule can be checked against it — a "same time every
+            # week" rule must never override an explicit "Not Available"
+            # for that exact subject/slot; the page itself promises this
+            # is a hard block in every phase, not just the fill-remaining one.
             cur.execute("""
                 SELECT learning_area_id, day_of_week, period_id, status FROM subject_availability
                 WHERE school_id = %s AND status IN ('not_available', 'conditional') AND learning_area_id IS NOT NULL;
@@ -2876,6 +2861,26 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             for r in cur.fetchall():
                 key = (r['custom_subject_id'] + CUSTOM_SUBJECT_ID_OFFSET, r['day_of_week'], r['period_id'])
                 (subject_unavailable if r['status'] == 'not_available' else subject_conditional).add(key)
+
+            locked_placements = {}
+            free_subjects = []
+            for subj in subjects:
+                # A subject explicitly configured with 0 lessons/week must
+                # never be scheduled at all, in any phase — including via a
+                # "same time every week" sync rule, which otherwise ignores
+                # lessons_per_week entirely.
+                if lessons_per_week_for_subject.get(subj['id']) == 0:
+                    continue
+                rule = sync_rules.get(subj['id'])
+                if rule and rule[0] in days and rule[1] in teaching_period_ids and (subj['id'], rule[0], rule[1]) not in subject_unavailable:
+                    locked_placements[(rule[0], rule[1])] = subj
+                else:
+                    free_subjects.append(subj)
+            if not free_subjects:
+                # Safety net: never leave the queue completely empty (e.g.
+                # if every subject happens to have a sync rule) — but still
+                # never includes a subject explicitly set to 0 lessons/week.
+                free_subjects = [s for s in subjects if lessons_per_week_for_subject.get(s['id']) != 0]
 
             # Track which teacher is already booked at each (day, period) —
             # compared by ACTUAL CLOCK TIME OVERLAP, not raw period_id.
@@ -3093,17 +3098,39 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                             break
 
                     if chosen_subject is None:
-                        # Nothing satisfied every rule — fall back to the
-                        # plain round-robin pick rather than leave a gap,
-                        # as long as some subject still has quota left.
-                        chosen_idx = qi % len(queue)
-                        chosen_subject = queue[chosen_idx]
-                        chosen_teacher = teacher_for_subject.get(chosen_subject['id'])
-                        if chosen_teacher and (
-                            chosen_teacher in booked.get((day, period['id']), set())
-                            or (chosen_teacher, day, period['id']) in unavailable
-                        ):
-                            chosen_teacher = None
+                        # Nothing satisfied every rule — fall back to a
+                        # round-robin pick, but this must NEVER mean
+                        # ignoring a subject's own "Not Available" time-off
+                        # or the same-day/consecutive-day rules — those are
+                        # hard, non-negotiable blocks, not preferences to
+                        # relax. Only teacher-related soft conflicts get
+                        # relaxed here; if genuinely every subject in the
+                        # queue is hard-blocked at this exact slot, it's
+                        # left empty rather than violating one of them.
+                        for attempt in range(len(queue)):
+                            idx = (qi + attempt) % len(queue)
+                            candidate = queue[idx]
+                            cid = candidate['id']
+                            if cid in used_today:
+                                continue
+                            if any((cid, other) in same_day_forbidden for other in used_today):
+                                continue
+                            if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
+                                continue
+                            if (cid, day, period['id']) in subject_unavailable:
+                                continue
+                            chosen_idx, chosen_subject = idx, candidate
+                            break
+
+                    if chosen_subject is None:
+                        continue  # every remaining subject is hard-blocked at this exact slot — leave it empty
+
+                    chosen_teacher = teacher_for_subject.get(chosen_subject['id'])
+                    if chosen_teacher and (
+                        chosen_teacher in booked.get((day, period['id']), set())
+                        or (chosen_teacher, day, period['id']) in unavailable
+                    ):
+                        chosen_teacher = None
 
                     qi = chosen_idx + 1
                     _place(day, period['id'], chosen_subject, chosen_teacher)
