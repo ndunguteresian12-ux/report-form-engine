@@ -2992,6 +2992,46 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 used_today_by_day[day].add(subject['id'])
                 remaining[subject['id']] -= 1
 
+            # How many slots in the WHOLE week is each subject actually
+            # allowed in, given its own Subject Time-Off? Needed here
+            # (earlier than before) specifically for Phase 0 below.
+            total_week_slots = [(d, p['id']) for d in days for p in teaching_periods]
+            valid_slot_count = {
+                subj['id']: sum(1 for (d, pid) in total_week_slots if (subj['id'], d, pid) not in subject_unavailable)
+                for subj in free_subjects
+            }
+
+            # --- Phase 0: a subject with ZERO SLACK — exactly as many valid
+            # slots in the whole week as lessons it still needs, like PPI
+            # allowed in only one slot and needing exactly one lesson —
+            # must claim every one of its valid slots FIRST, before Phase 1
+            # (sync-rule locks) or Phase 2 (double lessons) can accidentally
+            # claim that same slot for a completely different, more
+            # flexible subject. Those later phases have no awareness of
+            # any other subject's constraints when grabbing their slots;
+            # this is what stops a zero-slack subject from silently losing
+            # its only chance and ending up unscheduled for the whole week. ---
+            for subj in free_subjects:
+                sid = subj['id']
+                needed = remaining.get(sid, 0)
+                if needed <= 0 or valid_slot_count.get(sid, 999) > needed:
+                    continue
+                for day in days:
+                    if remaining.get(sid, 0) <= 0:
+                        break
+                    for period in teaching_periods:
+                        if remaining.get(sid, 0) <= 0:
+                            break
+                        if (day, period['id']) in filled:
+                            continue
+                        if (sid, day, period['id']) in subject_unavailable:
+                            continue
+                        chosen_teacher = teacher_for_subject.get(sid)
+                        if chosen_teacher and chosen_teacher in booked.get((day, period['id']), set()):
+                            chosen_teacher = None
+                        _place(day, period['id'], subj, chosen_teacher)
+                        last_subject_by_day[day] = sid
+
             # --- Phase 1: place locked "same time" subjects first — these
             # always win their slot outright, not drawn from the queue. ---
             for (day, period_id), locked_subject in locked_placements.items():
@@ -3044,21 +3084,7 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             # subject's quota is used up it drops out, and once every
             # subject's quota is used up, any leftover slots simply stay
             # free rather than being force-filled. ---
-
-            # How many slots in the WHOLE week is each subject actually
-            # allowed in, given its own Subject Time-Off? A subject with
-            # very few valid slots (like PPI, allowed in exactly one) must
-            # be prioritized over a flexible subject that's ALSO valid at
-            # that same slot but has plenty of other opportunities —
-            # otherwise the flexible one can "steal" the one slot the
-            # restricted subject actually needs, and the restricted one
-            # never gets scheduled anywhere at all. This is the standard
-            # "most constrained first" scheduling heuristic.
-            total_week_slots = [(d, p['id']) for d in days for p in teaching_periods]
-            valid_slot_count = {
-                subj['id']: sum(1 for (d, pid) in total_week_slots if (subj['id'], d, pid) not in subject_unavailable)
-                for subj in free_subjects
-            }
+            # (valid_slot_count already computed earlier, for Phase 0.)
 
             queue = [subj for subj in free_subjects for _ in range(remaining.get(subj['id'], 0))]
             qi = 0
