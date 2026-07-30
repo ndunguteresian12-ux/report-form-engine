@@ -378,6 +378,12 @@ def timetable_workspace_hub(school_id: int, request: Request):
                 </div>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 px-4 py-2 rounded-xl text-xs font-bold text-center transition">← Main Dashboard</a>
             </div>
+            <div class="mt-3">
+                <form action="/api/v1/timetable/test-and-generate-school/{school_id}" method="post" onsubmit="return confirm('Test and generate EVERY class across the WHOLE school? This is the safest option if any teacher teaches across more than one education level, since it checks conflicts across all of them together. This replaces existing entries for every class that passes validation.');">
+                    <button type="submit" class="w-full sm:w-auto bg-amber-600 hover:bg-amber-700 text-white px-5 py-2.5 rounded-xl text-xs font-bold transition shadow-sm">🧪🏫 Test &amp; Generate WHOLE SCHOOL</button>
+                </form>
+                <p class="text-[11px] text-slate-400 mt-1">Use this instead of a single level's button if any teacher teaches across more than one education level (e.g. Lower and Upper Primary) — it checks for conflicts across all levels together, not just within one.</p>
+            </div>
             <div class="flex gap-2 flex-wrap mt-4">
                 <a href="/timetable/subjects-config/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🎨 Subjects</a>
                 <a href="/timetable/custom-subjects/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">➕ Custom Subjects</a>
@@ -1196,12 +1202,57 @@ def _find_timetable_collisions(cur, school_id: int, education_level: str = None)
     cur.execute(query, tuple(params))
     all_slots = cur.fetchall()
 
-    groups = {}
-    for slot in all_slots:
-        key = (slot['day_of_week'], slot['period_id'], slot['staff_user_id'])
-        groups.setdefault(key, []).append(slot)
+    def _parse_time_to_minutes(time_str):
+        if not time_str:
+            return None
+        cleaned = time_str.strip().upper().replace(".", "")
+        is_pm = "PM" in cleaned
+        is_am = "AM" in cleaned
+        cleaned = cleaned.replace("AM", "").replace("PM", "").strip()
+        parts = cleaned.replace(".", ":").split(":")
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1]) if len(parts) > 1 else 0
+        except (ValueError, IndexError):
+            return None
+        if is_pm and hour < 12:
+            hour += 12
+        if is_am and hour == 12:
+            hour = 0
+        return hour * 60 + minute
 
-    return [slots for slots in groups.values() if len({(s['grade_name'], s['stream']) for s in slots}) > 1]
+    # Group by (day, teacher) first, then within each group find every
+    # slot whose actual clock time overlaps another — this is what catches
+    # a teacher double-booked across two different education levels at the
+    # same real time, since each level's periods are separate rows with
+    # different ids even when the times match exactly.
+    by_day_teacher = {}
+    for slot in all_slots:
+        key = (slot['day_of_week'], slot['staff_user_id'])
+        by_day_teacher.setdefault(key, []).append(slot)
+
+    collision_groups = []
+    for (day, teacher_id), slots in by_day_teacher.items():
+        timed_slots = [(s, _parse_time_to_minutes(s['start_time']), _parse_time_to_minutes(s['end_time'])) for s in slots]
+        timed_slots = [t for t in timed_slots if t[1] is not None and t[2] is not None]
+        used = set()
+        for i, (slot_a, a_start, a_end) in enumerate(timed_slots):
+            if i in used:
+                continue
+            overlapping = [slot_a]
+            for j, (slot_b, b_start, b_end) in enumerate(timed_slots):
+                if j <= i or j in used:
+                    continue
+                if a_start < b_end and b_start < a_end:
+                    overlapping.append(slot_b)
+                    used.add(j)
+            if len(overlapping) > 1:
+                distinct_classes = {(s['grade_name'], s['stream']) for s in overlapping}
+                if len(distinct_classes) > 1:
+                    collision_groups.append(overlapping)
+                used.add(i)
+
+    return collision_groups
 
 
 @router.get("/timetable/collision-check/{school_id}", response_class=HTMLResponse)
@@ -2481,6 +2532,75 @@ def test_and_generate_whole_level(school_id: int, request: Request, education_le
     return RedirectResponse(url=f"/timetable/level-report/{school_id}?report={payload}", status_code=303)
 
 
+@router.post("/api/v1/timetable/test-and-generate-school/{school_id}")
+def test_and_generate_whole_school(school_id: int, request: Request):
+    """Runs Test & Generate across EVERY class in EVERY education level,
+    one level after another — specifically for a teacher who teaches
+    across multiple levels (e.g. Lower Primary and Upper Primary). Doing
+    each level in isolation would only ever check conflicts within that
+    one level's own generated slots at the time; running the whole school
+    in one pass, level by level in sequence, means a teacher's Lower
+    Primary bookings are already committed and visible by the time Upper
+    Primary is generated — and the final collision check now compares by
+    real clock-time overlap, not raw period_id, so a cross-level conflict
+    at the same actual time is caught even though each level has its own
+    separate period rows."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    all_class_results = []
+    for education_level in EDUCATION_LEVELS:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT DISTINCT c.grade_name, s.stream
+                    FROM students s
+                    JOIN classes c ON s.class_id = c.id
+                    WHERE s.school_id = %s AND c.education_level = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                    ORDER BY c.grade_name ASC, s.stream ASC;
+                """, (school_id, education_level))
+                sections = cur.fetchall()
+
+        for sec in sections:
+            grade_name, stream = sec['grade_name'], sec['stream']
+            with get_db_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    errors, warnings = validate_timetable_setup(cur, school_id, grade_name, education_level, stream)
+
+            if errors:
+                all_class_results.append({'grade_name': grade_name, 'stream': stream, 'education_level': education_level, 'status': 'skipped', 'errors': errors, 'warnings': warnings})
+                continue
+
+            generate_draft_timetable(school_id, request, grade_name, education_level, stream)
+            all_class_results.append({'grade_name': grade_name, 'stream': stream, 'education_level': education_level, 'status': 'generated', 'errors': [], 'warnings': warnings})
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # No education_level filter — scans across the WHOLE school,
+            # which is exactly what catches a teacher double-booked between
+            # two different levels at the same real time.
+            collisions = _find_timetable_collisions(cur, school_id, None)
+
+    import base64, json
+    payload = base64.b64encode(json.dumps({
+        'education_level': 'Whole School',
+        'class_results': all_class_results,
+        'collision_count': len(collisions),
+        'collisions': [
+            {
+                'teacher': (slots[0]['full_name'] or slots[0]['email'] or 'Unknown teacher'),
+                'day': slots[0]['day_of_week'],
+                'period': slots[0]['period_label'],
+                'classes': [f"{s['grade_name']} — {s['stream']} ({s['education_level']}) — {s['subject_name'] or 'Unknown subject'}" for s in slots],
+            }
+            for slots in collisions
+        ],
+    }).encode("utf-8")).decode("ascii")
+
+    return RedirectResponse(url=f"/timetable/level-report/{school_id}?report={payload}", status_code=303)
+
+
 @router.get("/timetable/level-report/{school_id}", response_class=HTMLResponse)
 def timetable_level_report(school_id: int, request: Request, report: str):
     """Displays the combined report from a whole-level Test & Generate run:
@@ -2506,9 +2626,10 @@ def timetable_level_report(school_id: int, request: Request, report: str):
     class_rows_html = ""
     for r in class_results:
         section_label = r['grade_name'] if r['stream'] == 'SINGLE STREAM' else f"{r['grade_name']} — {r['stream']}"
+        row_level = r.get('education_level', education_level)
         encoded_grade = urllib.parse.quote(r['grade_name'])
         encoded_stream = urllib.parse.quote(r['stream'])
-        encoded_level = urllib.parse.quote(education_level)
+        encoded_level = urllib.parse.quote(row_level)
         if r['status'] == 'generated':
             status_badge = "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>✅ Generated</span>"
             detail_html = "".join(f"<li class='text-amber-700'>⚠️ {esc(w)}</li>" for w in r['warnings'])
@@ -2518,7 +2639,7 @@ def timetable_level_report(school_id: int, request: Request, report: str):
         class_rows_html += f"""
         <div class="bg-white rounded-2xl border shadow-xs p-4 mb-3">
             <div class="flex items-center justify-between">
-                <a href="/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" class="text-sm font-bold text-slate-800 hover:underline">{esc(section_label)}</a>
+                <a href="/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" class="text-sm font-bold text-slate-800 hover:underline">{esc(section_label)}{' <span class=\"text-slate-400 font-normal\">(' + esc(row_level) + ')</span>' if education_level == 'Whole School' else ''}</a>
                 {status_badge}
             </div>
             {f"<ul class='text-xs mt-2 space-y-1 list-disc list-inside'>{detail_html}</ul>" if detail_html else ""}
@@ -2666,17 +2787,59 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 key = (r['learning_area_id'], r['day_of_week'], r['period_id'])
                 (subject_unavailable if r['status'] == 'not_available' else subject_conditional).add(key)
 
-            # Track which teacher is already booked at each (day, period) across
-            # the WHOLE school (every other grade+stream) to avoid double-booking —
-            # includes existing slots for other sections already saved.
+            # Track which teacher is already booked at each (day, period) —
+            # compared by ACTUAL CLOCK TIME OVERLAP, not raw period_id.
+            # This matters specifically for a teacher who teaches across
+            # multiple education levels: Lower Primary's "Period 1" and
+            # Upper Primary's "Period 1" are separate database rows with
+            # different ids, even when they run the exact same real-world
+            # time — so comparing by period_id alone would miss a teacher
+            # genuinely double-booked across two levels at the same clock
+            # time. Comparing by parsed start/end time catches this
+            # correctly regardless of which level either booking is in.
+            def _parse_time_to_minutes(time_str):
+                if not time_str:
+                    return None
+                cleaned = time_str.strip().upper().replace(".", "")
+                is_pm = "PM" in cleaned
+                is_am = "AM" in cleaned
+                cleaned = cleaned.replace("AM", "").replace("PM", "").strip()
+                parts = cleaned.replace(".", ":").split(":")
+                try:
+                    hour = int(parts[0])
+                    minute = int(parts[1]) if len(parts) > 1 else 0
+                except (ValueError, IndexError):
+                    return None
+                if is_pm and hour < 12:
+                    hour += 12
+                if is_am and hour == 12:
+                    hour = 0
+                return hour * 60 + minute
+
+            def _time_ranges_overlap(a_start, a_end, b_start, b_end):
+                if None in (a_start, a_end, b_start, b_end):
+                    return False
+                return a_start < b_end and b_start < a_end
+
+            this_level_period_times = {
+                p['id']: (_parse_time_to_minutes(p['start_time']), _parse_time_to_minutes(p['end_time']))
+                for p in teaching_periods
+            }
+
             cur.execute("""
-                SELECT day_of_week, period_id, staff_user_id FROM timetable_slots
-                WHERE school_id = %s AND staff_user_id IS NOT NULL
-                  AND NOT (grade_name = %s AND education_level = %s AND stream = %s);
+                SELECT ts.day_of_week, ts.staff_user_id, tp.start_time, tp.end_time
+                FROM timetable_slots ts
+                JOIN timetable_periods tp ON ts.period_id = tp.id
+                WHERE ts.school_id = %s AND ts.staff_user_id IS NOT NULL
+                  AND NOT (ts.grade_name = %s AND ts.education_level = %s AND ts.stream = %s);
             """, (school_id, grade_name, education_level, stream))
             booked = {}
             for r in cur.fetchall():
-                booked.setdefault((r['day_of_week'], r['period_id']), set()).add(r['staff_user_id'])
+                other_start = _parse_time_to_minutes(r['start_time'])
+                other_end = _parse_time_to_minutes(r['end_time'])
+                for this_period_id, (this_start, this_end) in this_level_period_times.items():
+                    if _time_ranges_overlap(this_start, this_end, other_start, other_end):
+                        booked.setdefault((r['day_of_week'], this_period_id), set()).add(r['staff_user_id'])
 
             # Teachers' explicit unavailability — a slot they're marked
             # "not_available" for is a hard block; "conditional" is a soft
