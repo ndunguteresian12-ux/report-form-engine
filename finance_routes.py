@@ -175,6 +175,30 @@ def bootstrap_finance_schema():
             cur.execute("ALTER TABLE fee_payments ADD COLUMN IF NOT EXISTS import_batch_id INTEGER REFERENCES fee_payment_imports(id) ON DELETE CASCADE;")
             conn.commit()
 
+            # Manually-entered "brought forward" balance — for arrears that
+            # predate the school's use of this system (e.g. a student who
+            # already owed money before Elimu Hub's finance module existed,
+            # tracked on paper or in an old spreadsheet). This amount is
+            # ADDED to what the student owes for that category/term, on top
+            # of the normal fee structure amount — it is not a payment, it's
+            # additional debt.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS fee_opening_balances (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+                    fee_category_id INTEGER REFERENCES fee_categories(id) ON DELETE CASCADE,
+                    term VARCHAR(20) NOT NULL,
+                    year INTEGER NOT NULL,
+                    amount NUMERIC(10, 2) NOT NULL DEFAULT 0,
+                    note VARCHAR(255),
+                    recorded_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(school_id, student_id, fee_category_id, term, year)
+                );
+            """)
+            conn.commit()
+
 
 def _ensure_default_category(cur, school_id: int) -> int:
     """Every school always has a 'School Fees' category, created lazily the
@@ -622,13 +646,14 @@ def finance_class_list(school_id: int, request: Request, grade_name: str, educat
 
             cur.execute("""
                 SELECT s.id, s.first_name, s.middle_name, s.last_name, s.admission_number,
-                       COALESCE((SELECT SUM(fp.amount) FROM fee_payments fp WHERE fp.student_id = s.id AND fp.fee_category_id = %s AND fp.term = %s AND fp.year = %s), 0) AS paid
+                       COALESCE((SELECT SUM(fp.amount) FROM fee_payments fp WHERE fp.student_id = s.id AND fp.fee_category_id = %s AND fp.term = %s AND fp.year = %s), 0) AS paid,
+                       COALESCE((SELECT amount FROM fee_opening_balances fob WHERE fob.student_id = s.id AND fob.fee_category_id = %s AND fob.term = %s AND fob.year = %s), 0) AS opening_balance
                 FROM students s
                 JOIN classes c ON s.class_id = c.id
                 WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s AND s.stream = %s
                   AND (s.status IS NULL OR s.status != 'GRADUATED')
                 ORDER BY s.admission_number ASC;
-            """, (category_id, term, year, school_id, grade_name, education_level, stream))
+            """, (category_id, term, year, category_id, term, year, school_id, grade_name, education_level, stream))
             students = cur.fetchall()
 
     section_label = grade_name if stream == 'SINGLE STREAM' else f"{grade_name} — {stream}"
@@ -643,7 +668,8 @@ def finance_class_list(school_id: int, request: Request, grade_name: str, educat
     rows_html = ""
     for s in students:
         paid = float(s['paid'])
-        balance = fee_amount - paid
+        opening = float(s['opening_balance'])
+        balance = fee_amount + opening - paid
         status_badge = (
             "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>Paid in full</span>" if balance <= 0 and fee_amount > 0 else
             "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Balance owing</span>" if balance > 0 else
@@ -670,7 +696,10 @@ def finance_class_list(school_id: int, request: Request, grade_name: str, educat
                 <h1 class="text-base font-bold text-slate-900">💰 {esc(section_label)} — Fees</h1>
                 <p class="text-xs text-slate-400">{esc(term)} {year} — {esc(current_category['name']) if current_category else ''}: KSh {fee_amount:,.0f} per student</p>
             </div>
-            <a href="/finance/dashboard/{school_id}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">← Back to Finance</a>
+            <div class="flex items-center gap-2">
+                <a href="/finance/class-statement-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}&category_id={category_id}&term={urllib.parse.quote(term)}&year={year}" target="_blank" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">🖨 Print Statement</a>
+                <a href="/finance/dashboard/{school_id}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">← Back to Finance</a>
+            </div>
         </header>
         <div class="p-4 sm:p-8 max-w-4xl mx-auto space-y-4">
             <div class="flex gap-2 flex-wrap">{category_tabs}</div>
@@ -681,6 +710,122 @@ def finance_class_list(school_id: int, request: Request, grade_name: str, educat
                 </table>
             </div>
         </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/finance/class-statement-print/{school_id}", response_class=HTMLResponse)
+def class_statement_print(school_id: int, request: Request, grade_name: str, education_level: str, stream: str, category_id: int = None, term: str = None, year: int = None):
+    """A printable fee statement for a whole class, for one fee category —
+    lists every student's fee, brought-forward balance, paid, and balance,
+    formatted for handing out or filing rather than for on-screen browsing.
+    Purely read-only."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            school, active_term, active_year = _get_school_and_settings(cur, school_id)
+            default_category_id = _ensure_default_category(cur, school_id)
+            conn.commit()
+            term = term or active_term
+            year = year or active_year
+            category_id = category_id or default_category_id
+
+            cur.execute("SELECT * FROM fee_categories WHERE id = %s AND school_id = %s;", (category_id, school_id))
+            category = cur.fetchone()
+
+            cur.execute("""
+                SELECT amount FROM fee_structures
+                WHERE school_id = %s AND fee_category_id = %s AND grade_name = %s AND term = %s AND year = %s;
+            """, (school_id, category_id, grade_name, term, year))
+            fee_row = cur.fetchone()
+            fee_amount = float(fee_row['amount']) if fee_row else 0
+
+            cur.execute("""
+                SELECT s.id, s.first_name, s.middle_name, s.last_name, s.admission_number,
+                       COALESCE((SELECT SUM(fp.amount) FROM fee_payments fp WHERE fp.student_id = s.id AND fp.fee_category_id = %s AND fp.term = %s AND fp.year = %s), 0) AS paid,
+                       COALESCE((SELECT amount FROM fee_opening_balances fob WHERE fob.student_id = s.id AND fob.fee_category_id = %s AND fob.term = %s AND fob.year = %s), 0) AS opening_balance
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s AND s.stream = %s
+                  AND (s.status IS NULL OR s.status != 'GRADUATED')
+                ORDER BY s.admission_number ASC;
+            """, (category_id, term, year, category_id, term, year, school_id, grade_name, education_level, stream))
+            students = cur.fetchall()
+
+    section_label = grade_name if stream == 'SINGLE STREAM' else f"{grade_name} — {stream}"
+    logo_src = school.get('logo_url')
+    logo_html = ""
+    if logo_src:
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
+
+    total_expected = fee_amount * len(students)
+    total_paid = sum(float(s['paid']) for s in students)
+    total_balance = sum(fee_amount + float(s['opening_balance']) - float(s['paid']) for s in students)
+
+    rows_html = ""
+    for i, s in enumerate(students, start=1):
+        paid = float(s['paid'])
+        opening = float(s['opening_balance'])
+        balance = fee_amount + opening - paid
+        rows_html += f"""
+        <tr>
+            <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:center;">{i}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;font-family:monospace;">{esc(s['admission_number'])}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;">{esc(full_student_name(s))}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;">{fee_amount:,.0f}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;">{opening:,.0f}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;">{paid:,.0f}</td>
+            <td style="padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:right;font-weight:bold;color:{'#be123c' if balance > 0 else '#047857'};">{balance:,.0f}</td>
+        </tr>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Elimu Hub | Fee Statement — {esc(section_label)}</title>
+        <style>
+            @page {{ size: A4 portrait; margin: 14mm; }}
+            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; }}
+            @media print {{ .no-print {{ display: none !important; }} body {{ padding: 0; }} }}
+            table {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
+            th {{ text-align: left; background: #f8fafc; border-bottom: 2px solid #cbd5e1; padding: 6px 8px; font-size: 10px; text-transform: uppercase; color: #64748b; }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
+            {logo_html}
+            <div>
+                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Fee Statement — {esc(section_label)} — {esc(category['name']) if category else 'School Fees'} — {esc(term)} {year}</p>
+            </div>
+        </div>
+        <table style="margin-top:16px;">
+            <thead>
+                <tr><th style="text-align:center;">#</th><th>Adm No.</th><th>Full Name</th><th style="text-align:right;">Fee (KSh)</th><th style="text-align:right;">Brought Fwd</th><th style="text-align:right;">Paid</th><th style="text-align:right;">Balance</th></tr>
+            </thead>
+            <tbody>{rows_html or "<tr><td colspan='7' style='padding:20px;text-align:center;color:#94a3b8;'>No students in this class.</td></tr>"}</tbody>
+            <tfoot>
+                <tr style="font-weight:bold;background:#f8fafc;">
+                    <td colspan="5" style="padding:8px;text-align:right;border-top:2px solid #cbd5e1;">Totals</td>
+                    <td style="padding:8px;text-align:right;border-top:2px solid #cbd5e1;">{total_paid:,.0f}</td>
+                    <td style="padding:8px;text-align:right;border-top:2px solid #cbd5e1;color:{'#be123c' if total_balance > 0 else '#047857'};">{total_balance:,.0f}</td>
+                </tr>
+            </tfoot>
+        </table>
+        <p style="margin-top:8px;font-size:10px;color:#94a3b8;">Expected total for this class/category: KSh {total_expected:,.0f}</p>
+        <p style="margin-top:24px;font-size:10px;color:#94a3b8;text-align:center;">Generated by Elimu Hub Finance — {esc(school['name'])}</p>
     </body>
     </html>
     """
@@ -725,6 +870,12 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
             fee_by_category = {r['fee_category_id']: float(r['amount']) for r in cur.fetchall()}
 
             cur.execute("""
+                SELECT fee_category_id, amount, note FROM fee_opening_balances
+                WHERE school_id = %s AND student_id = %s AND term = %s AND year = %s;
+            """, (school_id, student_id, term, year))
+            opening_by_category = {r['fee_category_id']: {'amount': float(r['amount']), 'note': r['note']} for r in cur.fetchall()}
+
+            cur.execute("""
                 SELECT fee_category_id, COALESCE(SUM(amount), 0) AS paid FROM fee_payments
                 WHERE student_id = %s AND term = %s AND year = %s GROUP BY fee_category_id;
             """, (student_id, term, year))
@@ -756,8 +907,9 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
             available_periods = cur.fetchall()
 
     total_fee = sum(fee_by_category.values())
+    total_opening = sum(v['amount'] for v in opening_by_category.values())
     total_paid = sum(paid_by_category.values())
-    total_balance = total_fee - total_paid
+    total_balance = total_fee + total_opening - total_paid
 
     category_options = "".join(f"<option value='{c['id']}'>{esc(c['name'])}</option>" for c in categories)
 
@@ -769,14 +921,16 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
     breakdown_html = ""
     for c in categories:
         fee = fee_by_category.get(c['id'], 0)
+        opening = opening_by_category.get(c['id'], {}).get('amount', 0)
         paid = paid_by_category.get(c['id'], 0)
-        bal = fee - paid
-        if fee == 0 and paid == 0:
+        bal = fee + opening - paid
+        if fee == 0 and paid == 0 and opening == 0:
             continue  # skip categories entirely irrelevant to this student
         breakdown_html += f"""
-        <div class="flex items-center justify-between py-2 border-b border-slate-50 last:border-0 text-sm">
+        <div class="flex items-center justify-between py-2 border-b border-slate-50 last:border-0 text-sm flex-wrap gap-1">
             <span class="font-semibold text-slate-700">{esc(c['name'])}</span>
             <span class="text-slate-400">Fee: KSh {fee:,.0f}</span>
+            {f"<span class='text-amber-600'>+ Brought forward: KSh {opening:,.0f}</span>" if opening else ""}
             <span class="text-emerald-700">Paid: KSh {paid:,.0f}</span>
             <span class="font-bold {'text-rose-700' if bal > 0 else 'text-emerald-700'}">Bal: KSh {bal:,.0f}</span>
         </div>
@@ -817,7 +971,7 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
                     </form>
                 </div>
                 <div class="grid grid-cols-3 gap-3 mt-4">
-                    <div class="bg-slate-50 rounded-xl p-3 text-center"><p class="text-[10px] font-bold text-slate-400 uppercase">Fees ({esc(term)} {year})</p><p class="font-black text-slate-800">KSh {total_fee:,.0f}</p></div>
+                    <div class="bg-slate-50 rounded-xl p-3 text-center"><p class="text-[10px] font-bold text-slate-400 uppercase">Fees ({esc(term)} {year})</p><p class="font-black text-slate-800">KSh {(total_fee + total_opening):,.0f}</p></div>
                     <div class="bg-emerald-50 rounded-xl p-3 text-center"><p class="text-[10px] font-bold text-emerald-600 uppercase">Paid ({esc(term)} {year})</p><p class="font-black text-emerald-800">KSh {total_paid:,.0f}</p></div>
                     <div class="bg-rose-50 rounded-xl p-3 text-center"><p class="text-[10px] font-bold text-rose-600 uppercase">Balance</p><p class="font-black text-rose-800">KSh {total_balance:,.0f}</p></div>
                 </div>
@@ -825,6 +979,26 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
             </div>
 
             {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl'>✅ Payment recorded successfully.</div>" if saved else ""}
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl'>✅ Brought-forward balance saved.</div>" if request.query_params.get('balance_saved') else ""}
+
+            <details class="bg-white rounded-2xl border shadow-xs">
+                <summary class="p-4 cursor-pointer text-sm font-bold text-slate-700 select-none">⚙️ Set Brought-Forward Balance (arrears from before this system)</summary>
+                <div class="p-4 pt-0">
+                    <p class="text-xs text-slate-400 mb-3">For a student who already owed money before this school started using Elimu Hub — enter it here so their true total balance is accurate. This is added on top of the normal fee, not a payment.</p>
+                    <form action="/api/v1/finance/opening-balance/save/{school_id}/{student_id}" method="post" class="space-y-2">
+                        <input type="hidden" name="term" value="{esc(term)}"><input type="hidden" name="year" value="{year}">
+                        {"".join(f'''
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <span class="text-xs font-semibold text-slate-600 w-32 shrink-0">{esc(c["name"])}</span>
+                            <span class="text-slate-400 text-xs">KSh</span>
+                            <input type="number" name="opening_{c['id']}" value="{opening_by_category.get(c['id'], {}).get('amount', '') or ''}" min="0" step="0.01" placeholder="0" class="border p-2 rounded-lg w-32 text-right text-sm">
+                            <input type="text" name="note_{c['id']}" value="{esc(opening_by_category.get(c['id'], {}).get('note') or '')}" placeholder="Note (optional)" class="border p-2 rounded-lg flex-1 min-w-[140px] text-xs">
+                        </div>
+                        ''' for c in categories)}
+                        <button type="submit" class="bg-amber-600 hover:bg-amber-700 text-white font-bold py-2.5 px-5 rounded-xl text-sm transition mt-2">Save Brought-Forward Balance</button>
+                    </form>
+                </div>
+            </details>
 
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h3 class="text-sm font-bold text-slate-800 mb-3">Record a Payment</h3>
@@ -908,6 +1082,77 @@ def add_fee_payment(
     return RedirectResponse(url=f"/finance/student/{school_id}/{student_id}?term={urllib.parse.quote(term)}&year={year}&saved=1", status_code=303)
 
 
+@router.post("/api/v1/finance/opening-balance/save/{school_id}/{student_id}")
+async def save_opening_balance(school_id: int, student_id: int, request: Request):
+    """Admin-only: records a student's brought-forward balance per fee
+    category — arrears from before this system was in use. Deliberately
+    admin-only, since this directly changes how much a student is
+    considered to owe, unlike recording a payment which only reduces it."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    form = await request.form()
+    term = (form.get("term") or "").strip()
+    try:
+        year = int(form.get("year"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid year.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Student not found.")
+
+            cur.execute("SELECT id FROM fee_categories WHERE school_id = %s;", (school_id,))
+            category_ids = [r[0] for r in cur.fetchall()]
+
+            recorded_by = request.cookies.get("session_user_id")
+            for cat_id in category_ids:
+                raw_amount = (form.get(f"opening_{cat_id}") or "").strip()
+                note = (form.get(f"note_{cat_id}") or "").strip() or None
+                if raw_amount == "":
+                    # Blank means "no brought-forward balance for this
+                    # category" — remove any existing row rather than
+                    # leaving a stale amount behind.
+                    cur.execute("""
+                        DELETE FROM fee_opening_balances
+                        WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+                    """, (school_id, student_id, cat_id, term, year))
+                    continue
+                try:
+                    amount = float(raw_amount)
+                except ValueError:
+                    continue
+                if amount < 0:
+                    continue
+
+                # Check-then-update-or-insert rather than ON CONFLICT — same
+                # lesson learned earlier with fee_structures: safer than
+                # relying on a named constraint that might not exist.
+                cur.execute("""
+                    SELECT id FROM fee_opening_balances
+                    WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+                """, (school_id, student_id, cat_id, term, year))
+                existing_row = cur.fetchone()
+                if existing_row:
+                    cur.execute("""
+                        UPDATE fee_opening_balances SET amount = %s, note = %s, recorded_by_user_id = %s, updated_at = NOW()
+                        WHERE id = %s;
+                    """, (amount, note, recorded_by, existing_row[0]))
+                else:
+                    cur.execute("""
+                        INSERT INTO fee_opening_balances (school_id, student_id, fee_category_id, term, year, amount, note, recorded_by_user_id)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                    """, (school_id, student_id, cat_id, term, year, amount, note, recorded_by))
+            conn.commit()
+
+    return RedirectResponse(url=f"/finance/student/{school_id}/{student_id}?term={urllib.parse.quote(term)}&year={year}&balance_saved=1", status_code=303)
+
+
 @router.post("/api/v1/finance/payment/delete/{school_id}/{payment_id}")
 def delete_fee_payment(school_id: int, payment_id: int, request: Request, term: str = Form(...), year: int = Form(...), student_id: int = Form(...)):
     auth_error = require_admin_session(request, school_id)
@@ -954,6 +1199,34 @@ def view_receipt(school_id: int, payment_id: int, request: Request):
             payment = cur.fetchone()
             if not payment:
                 raise HTTPException(status_code=404, detail="Receipt not found.")
+
+            # Balance remaining AFTER this payment, for this category/term —
+            # computed from the same fee + brought-forward - paid formula
+            # used everywhere else in the module, so it always agrees with
+            # the student's statement page.
+            cur.execute("""
+                SELECT amount FROM fee_structures
+                WHERE school_id = %s AND grade_name = %s AND term = %s AND year = %s
+                  AND fee_category_id = %s;
+            """, (school_id, payment['grade_name'], payment['term'], payment['year'], payment['fee_category_id']))
+            fee_row = cur.fetchone()
+            fee_amount = float(fee_row['amount']) if fee_row else 0
+
+            cur.execute("""
+                SELECT amount FROM fee_opening_balances
+                WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+            """, (school_id, payment['student_id'], payment['fee_category_id'], payment['term'], payment['year']))
+            opening_row = cur.fetchone()
+            opening_amount = float(opening_row['amount']) if opening_row else 0
+
+            cur.execute("""
+                SELECT COALESCE(SUM(amount), 0) AS total_paid FROM fee_payments
+                WHERE student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+            """, (payment['student_id'], payment['fee_category_id'], payment['term'], payment['year']))
+            total_paid_row = cur.fetchone()
+            total_paid_to_date = float(total_paid_row['total_paid']) if total_paid_row else 0
+
+            balance_after = fee_amount + opening_amount - total_paid_to_date
 
     logo_src = school.get('logo_url')
     logo_html = ""
@@ -1004,8 +1277,281 @@ def view_receipt(school_id: int, payment_id: int, request: Request):
                 <span style="font-weight:bold; font-size:13px;">Amount Paid</span>
                 <span style="font-weight:900; font-size:22px; color:#047857;">KSh {float(payment['amount']):,.2f}</span>
             </div>
+            <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-weight:bold; font-size:12px; color:#64748b;">Balance Remaining ({esc(payment['category_name'] or 'School Fees')})</span>
+                <span style="font-weight:800; font-size:15px; color:{'#be123c' if balance_after > 0 else '#047857'};">KSh {balance_after:,.2f}</span>
+            </div>
 
             <p style="margin-top:20px; font-size:10px; color:#94a3b8; text-align:center;">Recorded by {esc(payment['recorded_by_name'] or 'Staff')} — Elimu Hub Finance</p>
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ============================================================
+# Staff fee collection — a deliberately SCOPED-DOWN view for teachers who
+# collect fees. They can search for a student and record a payment, and
+# see only what THEY personally have collected — never the full finance
+# module (fee structure, categories, other staff's collections, or any
+# delete/edit ability, which stays admin-only via require_admin_session
+# on the existing delete and opening-balance routes).
+# ============================================================
+
+@router.get("/finance/staff/collect/{school_id}", response_class=HTMLResponse)
+def staff_collect_search(school_id: int, request: Request, search: str = None):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    students = []
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            school, _, _ = _get_school_and_settings(cur, school_id)
+            if search and search.strip():
+                like = f"%{search.strip()}%"
+                cur.execute("""
+                    SELECT s.id, s.first_name, s.middle_name, s.last_name, s.admission_number, c.grade_name, s.stream
+                    FROM students s JOIN classes c ON s.class_id = c.id
+                    WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                      AND (s.first_name ILIKE %s OR s.last_name ILIKE %s OR s.admission_number ILIKE %s)
+                    ORDER BY s.first_name ASC LIMIT 25;
+                """, (school_id, like, like, like))
+                students = cur.fetchall()
+
+    results_html = "".join(f"""
+        <a href="/finance/staff/collect/{school_id}/{s['id']}" class="flex items-center justify-between p-3 border-b last:border-0 hover:bg-slate-50 transition">
+            <span class="text-sm font-semibold text-slate-800">{esc(full_student_name(s))} <span class="text-slate-400 font-normal text-xs">#{esc(s['admission_number'])} — {esc(s['grade_name'])} {esc(s['stream'])}</span></span>
+            <span class="text-xs text-emerald-700 font-bold">Collect Fee →</span>
+        </a>
+    """ for s in students)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Collect Fees</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
+        <div class="max-w-lg mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">💰 Collect Fees</h2>
+                <p class="text-xs text-slate-400 mt-1">Search for a student to record a fee payment.</p>
+                <form method="get" class="mt-3">
+                    <input type="text" name="search" value="{esc(search or '')}" placeholder="Search by name or admission number..." class="w-full border p-3 rounded-xl text-sm" autofocus>
+                </form>
+            </div>
+            {f'''<div class="bg-white rounded-2xl border shadow-xs overflow-hidden">{results_html or "<p class='p-4 text-slate-400 text-xs italic'>No students found.</p>"}</div>''' if search else ""}
+            <a href="/finance/staff/my-collections/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">📋 View My Collections</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/finance/staff/collect/{school_id}/{student_id}", response_class=HTMLResponse)
+def staff_collect_form(school_id: int, student_id: int, request: Request, saved: str = None):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            school, active_term, active_year = _get_school_and_settings(cur, school_id)
+            _ensure_default_category(cur, school_id)
+            conn.commit()
+
+            cur.execute("""
+                SELECT s.*, c.grade_name FROM students s JOIN classes c ON s.class_id = c.id
+                WHERE s.id = %s AND s.school_id = %s;
+            """, (student_id, school_id))
+            student = cur.fetchone()
+            if not student:
+                raise HTTPException(status_code=404, detail="Student not found.")
+
+            cur.execute("SELECT * FROM fee_categories WHERE school_id = %s ORDER BY is_default DESC, name ASC;", (school_id,))
+            categories = cur.fetchall()
+
+            # Only THIS staff member's own collections for this student —
+            # never anyone else's, and no delete/edit link, matching the
+            # "must not be able to delete/edit" requirement exactly.
+            recorded_by = request.cookies.get("session_user_id")
+            cur.execute("""
+                SELECT fp.*, fc.name AS category_name FROM fee_payments fp
+                LEFT JOIN fee_categories fc ON fp.fee_category_id = fc.id
+                WHERE fp.student_id = %s AND fp.recorded_by_user_id = %s
+                ORDER BY fp.paid_at DESC LIMIT 10;
+            """, (student_id, recorded_by))
+            my_payments_for_student = cur.fetchall()
+
+    category_options = "".join(f"<option value='{c['id']}'>{esc(c['name'])}</option>" for c in categories)
+
+    history_html = "".join(f"""
+        <tr class="border-b border-slate-50">
+            <td class="p-2 text-xs text-slate-400">{p['paid_at'].strftime('%d %b %Y') if p['paid_at'] else ''}</td>
+            <td class="p-2 text-xs font-semibold text-indigo-700">{esc(p['category_name'] or 'School Fees')}</td>
+            <td class="p-2 text-xs capitalize">{esc(p['payment_method'])}</td>
+            <td class="p-2 text-right text-xs font-bold text-emerald-700">KSh {float(p['amount']):,.0f}</td>
+            <td class="p-2 text-right"><a href="/finance/receipt/{school_id}/{p['id']}" target="_blank" class="text-indigo-700 hover:underline text-xs font-bold">Receipt</a></td>
+        </tr>
+    """ for p in my_payments_for_student)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Collect Fee — {esc(full_student_name(student))}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
+        <div class="max-w-lg mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">{esc(full_student_name(student))}</h2>
+                <p class="text-xs text-slate-400">#{esc(student['admission_number'])} — {esc(student['grade_name'])}</p>
+            </div>
+
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl'>✅ Payment recorded successfully.</div>" if saved else ""}
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-bold text-slate-800 mb-3">Record a Payment</h3>
+                <form action="/api/v1/finance/staff/collect/{school_id}/{student_id}" method="post" class="grid grid-cols-2 gap-3">
+                    <input type="hidden" name="term" value="{esc(active_term)}"><input type="hidden" name="year" value="{active_year}">
+                    <div class="col-span-2">
+                        <label class="text-xs font-bold text-slate-600 block mb-1">Fee Category</label>
+                        <select name="fee_category_id" class="w-full border p-2.5 rounded-xl text-sm bg-white" required>{category_options}</select>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-600 block mb-1">Amount (KSh)</label>
+                        <input type="number" name="amount" min="0.01" step="0.01" class="w-full border p-2.5 rounded-xl text-sm" required>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-600 block mb-1">Method</label>
+                        <select name="payment_method" class="w-full border p-2.5 rounded-xl text-sm bg-white">
+                            <option value="cash">Cash</option>
+                            <option value="bank">Bank Deposit</option>
+                            <option value="mpesa">M-Pesa</option>
+                            <option value="other">Other</option>
+                        </select>
+                    </div>
+                    <div class="col-span-2">
+                        <label class="text-xs font-bold text-slate-600 block mb-1">Reference / Note (optional)</label>
+                        <input type="text" name="reference_note" placeholder="e.g. M-Pesa code" class="w-full border p-2.5 rounded-xl text-sm">
+                    </div>
+                    <button type="submit" class="col-span-2 bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-3 rounded-xl text-sm transition">+ Record Payment</button>
+                </form>
+            </div>
+
+            {f'''<div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+                <div class="px-5 py-3 border-b bg-slate-50/60"><h3 class="text-sm font-bold text-slate-800">Your Recent Collections for This Student</h3></div>
+                <table class="w-full"><tbody>{history_html}</tbody></table>
+            </div>''' if my_payments_for_student else ""}
+
+            <a href="/finance/staff/collect/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Search Another Student</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/finance/staff/collect/{school_id}/{student_id}")
+def staff_collect_payment(
+    school_id: int, student_id: int, request: Request,
+    amount: float = Form(...), payment_method: str = Form("cash"),
+    reference_note: str = Form(""), term: str = Form(...), year: int = Form(...),
+    fee_category_id: int = Form(None),
+):
+    """Records a payment via the staff-scoped collection flow — same
+    underlying insert as the admin payment form, just redirects back to
+    the staff view instead of the full admin finance module."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Payment amount must be greater than zero.")
+    if payment_method not in ("cash", "bank", "mpesa", "other"):
+        payment_method = "other"
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Student not found.")
+
+            category_id = fee_category_id or _ensure_default_category(cur, school_id)
+            recorded_by = request.cookies.get("session_user_id")
+
+            cur.execute("""
+                INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, term, year, recorded_by_user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+            """, (student_id, school_id, category_id, amount, payment_method, reference_note.strip() or None, term, year, recorded_by))
+            new_payment_id = cur.fetchone()[0]
+            cur.execute("UPDATE fee_payments SET receipt_number = %s WHERE id = %s;", (_receipt_number_from_id(school_id, new_payment_id), new_payment_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/finance/staff/collect/{school_id}/{student_id}?saved=1", status_code=303)
+
+
+@router.get("/finance/staff/my-collections/{school_id}", response_class=HTMLResponse)
+def staff_my_collections(school_id: int, request: Request):
+    """Every payment THIS staff member has personally recorded — read-only,
+    no delete/edit links anywhere on this page. That's a deliberate
+    admin-only capability, enforced by require_admin_session on the
+    existing delete route regardless of what's shown here."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    recorded_by = request.cookies.get("session_user_id")
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            school, _, _ = _get_school_and_settings(cur, school_id)
+
+            cur.execute("""
+                SELECT fp.*, fc.name AS category_name, s.first_name, s.middle_name, s.last_name, s.admission_number
+                FROM fee_payments fp
+                JOIN students s ON fp.student_id = s.id
+                LEFT JOIN fee_categories fc ON fp.fee_category_id = fc.id
+                WHERE fp.school_id = %s AND fp.recorded_by_user_id = %s
+                ORDER BY fp.paid_at DESC LIMIT 200;
+            """, (school_id, recorded_by))
+            payments = cur.fetchall()
+
+    total_collected = sum(float(p['amount']) for p in payments)
+
+    rows_html = "".join(f"""
+        <tr class="border-b border-slate-50">
+            <td class="p-3 text-xs text-slate-400">{p['paid_at'].strftime('%d %b %Y, %H:%M') if p['paid_at'] else ''}</td>
+            <td class="p-3 text-sm font-semibold text-slate-700">{esc(full_student_name(p))} <span class="text-slate-400 font-normal">#{esc(p['admission_number'])}</span></td>
+            <td class="p-3 text-xs font-semibold text-indigo-700">{esc(p['category_name'] or 'School Fees')}</td>
+            <td class="p-3 text-xs capitalize">{esc(p['payment_method'])}</td>
+            <td class="p-3 text-right font-bold text-emerald-700">KSh {float(p['amount']):,.0f}</td>
+            <td class="p-3 text-right"><a href="/finance/receipt/{school_id}/{p['id']}" target="_blank" class="text-indigo-700 hover:underline text-xs font-bold">Receipt</a></td>
+        </tr>
+    """ for p in payments)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | My Fee Collections</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">📋 My Fee Collections — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">{len(payments)} payment(s) recorded by you, totalling KSh {total_collected:,.0f}.</p>
+            </div>
+            <a href="/finance/staff/collect/{school_id}" class="bg-emerald-700 hover:bg-emerald-800 text-white px-4 py-2 rounded-xl text-xs font-bold transition">+ Collect a Fee</a>
+        </header>
+        <div class="p-4 sm:p-8 max-w-4xl mx-auto">
+            <div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+                <table class="w-full text-sm">
+                    <thead><tr class="bg-slate-50 text-slate-500 text-xs border-b"><th class="p-3 text-left">Date</th><th class="p-3 text-left">Student</th><th class="p-3 text-left">Category</th><th class="p-3 text-left">Method</th><th class="p-3 text-right">Amount</th><th class="p-3"></th></tr></thead>
+                    <tbody>{rows_html or "<tr><td colspan='6' class='p-8 text-center text-slate-400 text-xs italic'>You haven't recorded any fee collections yet.</td></tr>"}</tbody>
+                </table>
+            </div>
         </div>
     </body>
     </html>
