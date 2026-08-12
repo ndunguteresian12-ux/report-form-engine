@@ -581,6 +581,11 @@ from finance_routes import router as finance_router, bootstrap_finance_schema
 bootstrap_finance_schema()
 app.include_router(finance_router)
 
+# --- Schemes of Work module (extracted to its own file — see schemes_routes.py) ---
+from schemes_routes import router as schemes_router, bootstrap_schemes_schema
+bootstrap_schemes_schema()
+app.include_router(schemes_router)
+
 # --- Core Business & CBE Analytics Helper Logic ---
 def log_audit_action(cur, request: Request, school_id: int, action: str, details: str = ""):
     """Records an entry in the audit log, using the same cursor/transaction
