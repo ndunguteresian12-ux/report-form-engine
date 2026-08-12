@@ -30,6 +30,7 @@ import logging
 import urllib.parse
 from fastapi import APIRouter, Request, HTTPException, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
+from starlette.concurrency import run_in_threadpool
 
 from shared import (
     esc,
@@ -208,6 +209,8 @@ def parse_scheme_pdf(filepath: str):
     since this parse should never be silently trusted."""
     import pdfplumber
 
+    MAX_PAGES = 40  # a real scheme of work is realistically well under this; this is a safety cap, not an expected limit
+
     rows = []
     warnings = []
 
@@ -216,8 +219,14 @@ def parse_scheme_pdf(filepath: str):
             if not pdf.pages:
                 return [], ["The PDF has no pages."]
 
+            if len(pdf.pages) > MAX_PAGES:
+                warnings.append(
+                    f"This PDF has {len(pdf.pages)} pages — only the first {MAX_PAGES} were scanned "
+                    f"to keep processing time reasonable. Add any remaining lessons manually below."
+                )
+
             column_field_map = None  # resolved once, from the first table's header row
-            for page_num, page in enumerate(pdf.pages, start=1):
+            for page_num, page in enumerate(pdf.pages[:MAX_PAGES], start=1):
                 tables = page.extract_tables()
                 if not tables:
                     continue
@@ -342,7 +351,13 @@ async def schemes_upload_process(
         f.write(contents)
 
     try:
-        parsed_rows, parse_warnings = parse_scheme_pdf(tmp_path)
+        # Run in a background thread, not directly on the event loop —
+        # PDF table detection is genuinely CPU-intensive and can take a
+        # while on a complex document. Calling it directly here would
+        # freeze the entire worker (including its ability to respond to
+        # gunicorn's own health checks) for the whole duration, which is
+        # exactly what caused a WORKER TIMEOUT / SIGABRT in production.
+        parsed_rows, parse_warnings = await run_in_threadpool(parse_scheme_pdf, tmp_path)
     finally:
         try:
             os.remove(tmp_path)
