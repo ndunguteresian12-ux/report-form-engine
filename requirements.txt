@@ -13,3 +13,4 @@ xhtml2pdf
 supabase
 markupsafe
 requests
+pdfplumber
