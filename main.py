@@ -1687,6 +1687,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <a href="/admin/audit-log/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📋 Activity Log</a>
                 <a href="/admin/school/profile/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🏫 School Profile</a>
                 <a href="/finance/dashboard/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-3 py-2 rounded-xl transition">💰 Finance</a>
+                <a href="/schemes/manage/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📘 Schemes of Work</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
@@ -1958,6 +1959,7 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
         <header class="bg-slate-900 text-white px-8 py-4 flex justify-between items-center">
             <h1 class="text-base font-bold tracking-tight">🛡️ Super Admin Portal</h1>
             <div class="flex items-center gap-2">
+                <a href="/superadmin/schemes/list" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">📘 Schemes of Work</a>
                 <form action="/api/v1/superadmin/backup-now" method="post" onsubmit="return confirm('Trigger an on-demand database backup now? This runs in the background via GitHub Actions and does not affect any school\\'s live data.');">
                     <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded-xl text-xs font-bold transition">💾 Backup Now</button>
                 </form>
@@ -2457,6 +2459,8 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                 <span class="bg-indigo-50 text-indigo-700 border border-indigo-100 px-3 py-2 rounded-xl">Staff Portal</span>
                 <span class="bg-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 Timetable</a>
+                <a href="/finance/staff/collect/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-3 py-2 rounded-xl transition">💰 Collect Fees</a>
+                <a href="/schemes/my-schemes/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📘 My Schemes of Work</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
