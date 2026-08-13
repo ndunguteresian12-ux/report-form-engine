@@ -1299,7 +1299,7 @@ def view_receipt(school_id: int, payment_id: int, request: Request):
 # ============================================================
 
 @router.get("/finance/staff/collect/{school_id}", response_class=HTMLResponse)
-def staff_collect_search(school_id: int, request: Request, search: str = None):
+def staff_collect_search(school_id: int, request: Request, search: str = None, grade_name: str = None, education_level: str = None, stream: str = None, category_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -1307,9 +1307,27 @@ def staff_collect_search(school_id: int, request: Request, search: str = None):
         return _coming_soon_page(school_id, request)
 
     students = []
+    class_list_students = []
+    fee_amount = 0
+    current_category = None
+
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            school, _, _ = _get_school_and_settings(cur, school_id)
+            school, active_term, active_year = _get_school_and_settings(cur, school_id)
+            default_category_id = _ensure_default_category(cur, school_id)
+            conn.commit()
+
+            cur.execute("SELECT * FROM fee_categories WHERE school_id = %s ORDER BY is_default DESC, name ASC;", (school_id,))
+            categories = cur.fetchall()
+
+            cur.execute("""
+                SELECT DISTINCT c.grade_name, c.education_level, s.stream
+                FROM students s JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                ORDER BY c.grade_name ASC, s.stream ASC;
+            """, (school_id,))
+            classes = cur.fetchall()
+
             if search and search.strip():
                 like = f"%{search.strip()}%"
                 cur.execute("""
@@ -1321,12 +1339,72 @@ def staff_collect_search(school_id: int, request: Request, search: str = None):
                 """, (school_id, like, like, like))
                 students = cur.fetchall()
 
+            # Browse mode — a full list of every learner in a class, with
+            # their fee status for one category, exactly like the admin's
+            # Class Fee List. This is what actually lets staff see who
+            # still owes what per category, rather than only being able
+            # to look up one student they already have in mind by name.
+            if grade_name and education_level and stream:
+                category_id = category_id or default_category_id
+                current_category = next((c for c in categories if c['id'] == category_id), categories[0] if categories else None)
+
+                cur.execute("""
+                    SELECT amount FROM fee_structures
+                    WHERE school_id = %s AND fee_category_id = %s AND grade_name = %s AND term = %s AND year = %s;
+                """, (school_id, category_id, grade_name, active_term, active_year))
+                fee_row = cur.fetchone()
+                fee_amount = float(fee_row['amount']) if fee_row else 0
+
+                cur.execute("""
+                    SELECT s.id, s.first_name, s.middle_name, s.last_name, s.admission_number,
+                           COALESCE((SELECT SUM(fp.amount) FROM fee_payments fp WHERE fp.student_id = s.id AND fp.fee_category_id = %s AND fp.term = %s AND fp.year = %s), 0) AS paid,
+                           COALESCE((SELECT amount FROM fee_opening_balances fob WHERE fob.student_id = s.id AND fob.fee_category_id = %s AND fob.term = %s AND fob.year = %s), 0) AS opening_balance
+                    FROM students s
+                    JOIN classes c ON s.class_id = c.id
+                    WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s AND s.stream = %s
+                      AND (s.status IS NULL OR s.status != 'GRADUATED')
+                    ORDER BY s.admission_number ASC;
+                """, (category_id, active_term, active_year, category_id, active_term, active_year, school_id, grade_name, education_level, stream))
+                class_list_students = cur.fetchall()
+
     results_html = "".join(f"""
         <a href="/finance/staff/collect/{school_id}/{s['id']}" class="flex items-center justify-between p-3 border-b last:border-0 hover:bg-slate-50 transition">
             <span class="text-sm font-semibold text-slate-800">{esc(full_student_name(s))} <span class="text-slate-400 font-normal text-xs">#{esc(s['admission_number'])} — {esc(s['grade_name'])} {esc(s['stream'])}</span></span>
             <span class="text-xs text-emerald-700 font-bold">Collect Fee →</span>
         </a>
     """ for s in students)
+
+    class_options = "".join(
+        f"""<option value="{esc(c['grade_name'])}|{esc(c['education_level'])}|{esc(c['stream'])}" {'selected' if grade_name == c['grade_name'] and stream == c['stream'] else ''}>{esc(c['grade_name'])}{' — ' + esc(c['stream']) if c['stream'] != 'SINGLE STREAM' else ''}</option>"""
+        for c in classes
+    )
+    category_options = "".join(
+        f"<option value='{c['id']}' {'selected' if c['id'] == category_id else ''}>{esc(c['name'])}</option>"
+        for c in categories
+    )
+
+    class_list_rows_html = ""
+    for s in class_list_students:
+        paid = float(s['paid'])
+        opening = float(s['opening_balance'])
+        balance = fee_amount + opening - paid
+        status_badge = (
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>Paid in full</span>" if balance <= 0 and fee_amount > 0 else
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Balance owing</span>" if balance > 0 else
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200'>No fee set</span>"
+        )
+        class_list_rows_html += f"""
+        <a href="/finance/staff/collect/{school_id}/{s['id']}" class="flex items-center justify-between p-3 border-b last:border-0 hover:bg-slate-50 transition flex-wrap gap-1">
+            <div>
+                <span class="text-sm font-semibold text-slate-800">{esc(full_student_name(s))}</span>
+                <span class="text-slate-400 font-normal text-xs block">#{esc(s['admission_number'])} — Balance: KSh {balance:,.0f}</span>
+            </div>
+            <div class="flex items-center gap-2">
+                {status_badge}
+                <span class="text-xs text-emerald-700 font-bold">Collect →</span>
+            </div>
+        </a>
+        """
 
     return f"""
     <!DOCTYPE html>
@@ -1336,12 +1414,35 @@ def staff_collect_search(school_id: int, request: Request, search: str = None):
         <div class="max-w-lg mx-auto space-y-4">
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">💰 Collect Fees</h2>
-                <p class="text-xs text-slate-400 mt-1">Search for a student to record a fee payment.</p>
+                <p class="text-xs text-slate-400 mt-1">Search for a student by name, or browse a full class list by fee category below.</p>
                 <form method="get" class="mt-3">
                     <input type="text" name="search" value="{esc(search or '')}" placeholder="Search by name or admission number..." class="w-full border p-3 rounded-xl text-sm" autofocus>
                 </form>
             </div>
+
             {f'''<div class="bg-white rounded-2xl border shadow-xs overflow-hidden">{results_html or "<p class='p-4 text-slate-400 text-xs italic'>No students found.</p>"}</div>''' if search else ""}
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-bold text-slate-800 mb-3">📋 Browse by Class &amp; Category</h3>
+                <form method="get" class="grid grid-cols-2 gap-2">
+                    <select name="class_pick" onchange="const [g,l,s]=this.value.split('|'); document.getElementById('gn').value=g; document.getElementById('el').value=l; document.getElementById('st').value=s; this.form.submit();" class="col-span-2 border p-2.5 rounded-xl text-sm bg-white">
+                        <option value="">— Select a class —</option>{class_options}
+                    </select>
+                    <input type="hidden" id="gn" name="grade_name" value="{esc(grade_name or '')}">
+                    <input type="hidden" id="el" name="education_level" value="{esc(education_level or '')}">
+                    <input type="hidden" id="st" name="stream" value="{esc(stream or '')}">
+                    <select name="category_id" onchange="this.form.submit()" class="col-span-2 border p-2.5 rounded-xl text-sm bg-white">{category_options}</select>
+                </form>
+            </div>
+
+            {f'''<div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+                <div class="px-4 py-3 border-b bg-slate-50/60 flex items-center justify-between">
+                    <h3 class="text-sm font-bold text-slate-800">{esc(grade_name)}{" — " + esc(stream) if stream != "SINGLE STREAM" else ""} — {esc(current_category["name"]) if current_category else ""}</h3>
+                    <span class="text-xs text-slate-400">Fee: KSh {fee_amount:,.0f}</span>
+                </div>
+                {class_list_rows_html or "<p class='p-4 text-slate-400 text-xs italic'>No students in this class.</p>"}
+            </div>''' if grade_name else ""}
+
             <a href="/finance/staff/my-collections/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">📋 View My Collections</a>
         </div>
     </body>
