@@ -139,7 +139,7 @@ SCHEME_ROW_FIELDS = [
 ]
 
 SCHEME_ROW_LABELS = {
-    "week_number": "Week", "lesson_number": "Lesson",
+    "week_number": "Week", "lesson_number": "Lesson No.",
     "strand": "Strand", "sub_strand": "Sub-Strand",
     "learning_outcomes": "Learning Outcomes", "learning_experiences": "Learning Experiences",
     "key_inquiry_questions": "Key Inquiry Question(s)", "learning_resources": "Learning Resources",
@@ -162,10 +162,10 @@ SCHEME_ROW_LABELS = {
 # actually use (e.g. "S/NO" vs "WK", "SUB STRAND" vs "SUB-STRAND").
 HEADER_MATCH_PATTERNS = {
     "week_number": ["wk", "week", "wks"],
-    "lesson_number": ["lsn", "lesson", "lssn"],
+    "lesson_number": ["lsn", "lssn"],
     "strand": ["strand", "mada kuu", "theme"],
     "sub_strand": ["substrand", "sub strand", "mada ndogo"],
-    "learning_outcomes": ["learningoutcomes", "specificlearningoutcomes", "objectives", "shabaha"],
+    "learning_outcomes": ["learningoutcomes", "specificlearningoutcomes", "objectives", "shabaha", "lessonlearningoutcomes"],
     "learning_experiences": ["learningexperiences", "coreactivities", "shughuli"],
     "key_inquiry_questions": ["keyinquiryquestion", "keyinquiryquestions", "kiq", "maswalidadisi"],
     "learning_resources": ["learningresources", "resources", "nyenzo"],
@@ -176,6 +176,25 @@ HEADER_MATCH_PATTERNS = {
 
 def _normalize_header(text):
     return re.sub(r"[^a-z]", "", (text or "").lower())
+
+
+_LETTER_SPACING_PATTERN = re.compile(r"\b(?:[A-Za-z](?:\s(?=[A-Za-z]\b))){2,}[A-Za-z]\b")
+
+
+def _fix_letter_spacing(text):
+    """Some PDF exports render one specific wrapped line within a cell
+    with each character individually positioned (a justification
+    artifact) rather than as one continuous text run — pdfplumber then
+    extracts it as separate single-letter 'words' no matter which
+    extraction method is used (confirmed against a real scheme PDF: this
+    persisted through extract_words, cropped extract_text, and table cell
+    extraction alike). Real English essentially never has a genuine run
+    of 3+ standalone single letters, so detecting that pattern and
+    rejoining it is a safe, reliable repair — and it never touches a
+    real short word like "a" or "I" appearing on its own."""
+    if not text:
+        return text
+    return _LETTER_SPACING_PATTERN.sub(lambda m: m.group(0).replace(" ", ""), text)
 
 
 def _match_column_to_field(header_text):
@@ -225,35 +244,68 @@ def parse_scheme_pdf(filepath: str):
                     f"to keep processing time reasonable. Add any remaining lessons manually below."
                 )
 
-            column_field_map = None  # resolved once, from the first table's header row
+            # A row must confidently match at least this many of our known
+            # fields to be treated as a genuine header row — otherwise a
+            # small, unrelated table elsewhere (e.g. a title block that
+            # pdfplumber mistakes for a tiny table) gets treated as the
+            # column structure for every row that follows, silently
+            # wiping out all the real content. This was a real, confirmed
+            # bug against an actual scheme PDF.
+            MIN_CONFIDENT_HEADER_MATCHES = 4
+
+            # Deliberately checks EVERY row for header-likeness, not just
+            # each table's first row — this is what correctly handles a
+            # real multi-page scheme: the true header might not be on
+            # page 1 at all (a title/cover block there can get detected as
+            # its own small "table" first), and later pages' tables don't
+            # necessarily repeat the header, so their first row is real
+            # data that must not be mistaken for one. Rows encountered
+            # before the real header is ever found (like a title page) are
+            # correctly skipped rather than guessed at.
+            column_field_map = None
             for page_num, page in enumerate(pdf.pages[:MAX_PAGES], start=1):
                 tables = page.extract_tables()
                 if not tables:
                     continue
                 for table in tables:
-                    if not table or len(table) < 2:
+                    if not table:
                         continue
-                    header_row = table[0]
+                    for row in table:
+                        candidate_map = [_match_column_to_field(cell) for cell in row]
+                        matched_count = sum(1 for f in candidate_map if f)
 
-                    if column_field_map is None:
-                        column_field_map = [_match_column_to_field(cell) for cell in header_row]
-                        matched_count = sum(1 for f in column_field_map if f)
-                        if matched_count < 3:
-                            warnings.append(
-                                f"Page {page_num}: could only confidently match {matched_count} of "
-                                f"{len(header_row)} column headers — review every row carefully."
-                            )
+                        if matched_count >= MIN_CONFIDENT_HEADER_MATCHES:
+                            # A genuine header row — establishes (or
+                            # re-confirms, on a later page) the column
+                            # structure. Never treated as data itself.
+                            column_field_map = candidate_map
+                            continue
 
-                    for data_row in table[1:]:
-                        if not any((cell or "").strip() for cell in data_row):
+                        if column_field_map is None:
+                            # Haven't found the real header yet — this is
+                            # pre-header content (e.g. a title page) and
+                            # can't be meaningfully mapped to fields.
+                            continue
+
+                        if not any((cell or "").strip() for cell in row):
                             continue  # skip fully blank rows
+
                         row_dict = {field: "" for field in SCHEME_ROW_FIELDS}
-                        for col_idx, cell_value in enumerate(data_row):
+                        for col_idx, cell_value in enumerate(row):
                             if col_idx >= len(column_field_map):
                                 break
                             field = column_field_map[col_idx]
                             if field:
-                                row_dict[field] = (cell_value or "").strip()
+                                row_dict[field] = _fix_letter_spacing((cell_value or "").strip())
+                        # A row whose only content is a stray "Page N"
+                        # watermark (picked up as if it were real cell
+                        # content) isn't a real lesson — safe to drop
+                        # automatically rather than leaving it for manual
+                        # cleanup, since this pattern is unambiguous.
+                        non_empty_values = [v for v in row_dict.values() if v]
+                        if len(non_empty_values) == 1 and re.fullmatch(r"Page \d+", non_empty_values[0].strip()):
+                            continue
+
                         rows.append(row_dict)
 
             if not rows:
