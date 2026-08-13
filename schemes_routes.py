@@ -582,6 +582,29 @@ async def schemes_publish(master_id: int, request: Request):
     return RedirectResponse(url="/superadmin/schemes/list", status_code=303)
 
 
+@router.post("/api/v1/superadmin/schemes/delete/{master_id}")
+def schemes_delete_master(master_id: int, request: Request):
+    """Deletes a master template and its own rows (via CASCADE on
+    scheme_master_rows). Deliberately does NOT touch any school's
+    already-imported copy — scheme_copies.master_id is ON DELETE SET
+    NULL, not CASCADE, specifically so a school's own (possibly
+    customized) scheme never disappears just because the master template
+    it originally came from was removed."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM scheme_masters WHERE id = %s;", (master_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Scheme not found.")
+            cur.execute("DELETE FROM scheme_masters WHERE id = %s;", (master_id,))
+            conn.commit()
+
+    return RedirectResponse(url="/superadmin/schemes/list", status_code=303)
+
+
 @router.get("/superadmin/schemes/list", response_class=HTMLResponse)
 def schemes_master_list(request: Request):
     auth_error = require_superadmin_session(request)
@@ -599,18 +622,38 @@ def schemes_master_list(request: Request):
             """)
             masters = cur.fetchall()
 
-    rows_html = "".join(f"""
+    rows_html = ""
+    for m in masters:
+        if m['import_count'] > 0:
+            confirm_msg = (
+                f"Remove this master template ({m['subject_name']} — {m['grade_name']})? "
+                f"Note: {m['import_count']} school(s) already imported it \\u2014 their own copies are "
+                f"completely unaffected and will keep working exactly as they are, but this master "
+                f"will no longer be available for new imports. This cannot be undone."
+            )
+        else:
+            confirm_msg = (
+                f"Remove this master template ({m['subject_name']} — {m['grade_name']})? "
+                f"No school has imported it yet, so nothing else is affected. This cannot be undone."
+            )
+        # Single quotes inside the message are escaped for the JS string
+        # literal; esc() then handles the surrounding HTML attribute.
+        confirm_msg_js_safe = confirm_msg.replace("'", "\\'")
+        rows_html += f"""
         <div class="bg-white rounded-2xl border shadow-xs p-4 flex items-center justify-between flex-wrap gap-2">
             <div>
                 <h3 class="text-sm font-bold text-slate-800">{esc(m['subject_name'])} — {esc(m['grade_name'])} <span class="text-slate-400 font-normal">({esc(m['education_level'])})</span></h3>
                 <p class="text-xs text-slate-400">{esc(m['term'])} {m['year']} — {m['row_count']} row(s) — imported by {m['import_count']} school(s)</p>
             </div>
-            <div class="flex gap-2">
+            <div class="flex gap-2 items-center">
                 <span class="text-[10px] font-bold px-2 py-1 rounded-full {'bg-emerald-50 text-emerald-700 border border-emerald-200' if m['parse_review_status'] == 'published' else 'bg-amber-50 text-amber-700 border border-amber-200'}">{esc(m['parse_review_status'])}</span>
                 <a href="/superadmin/schemes/review/{m['id']}" class="text-indigo-700 hover:underline text-xs font-bold">Edit →</a>
+                <form action="/api/v1/superadmin/schemes/delete/{m['id']}" method="post" onsubmit="return confirm('{esc(confirm_msg_js_safe)}');">
+                    <button type="submit" class="text-rose-500 hover:text-rose-700 text-xs font-bold">Remove</button>
+                </form>
             </div>
         </div>
-    """ for m in masters)
+        """
 
     return f"""
     <!DOCTYPE html>
