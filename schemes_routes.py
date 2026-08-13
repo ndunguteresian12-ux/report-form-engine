@@ -162,11 +162,11 @@ SCHEME_ROW_LABELS = {
 # actually use (e.g. "S/NO" vs "WK", "SUB STRAND" vs "SUB-STRAND").
 HEADER_MATCH_PATTERNS = {
     "week_number": ["wk", "week", "wks"],
-    "lesson_number": ["lsn", "lssn"],
-    "strand": ["strand", "mada kuu", "theme"],
-    "sub_strand": ["substrand", "sub strand", "mada ndogo"],
+    "lesson_number": ["lsn", "lssn", "kipindi"],
+    "strand": ["strand", "madakuu", "theme"],
+    "sub_strand": ["substrand", "madandogo"],
     "learning_outcomes": ["learningoutcomes", "specificlearningoutcomes", "objectives", "shabaha", "lessonlearningoutcomes"],
-    "learning_experiences": ["learningexperiences", "coreactivities", "shughuli"],
+    "learning_experiences": ["learningexperiences", "coreactivities", "shughuli", "shughulizaufunzaji"],
     "key_inquiry_questions": ["keyinquiryquestion", "keyinquiryquestions", "kiq", "maswalidadisi"],
     "learning_resources": ["learningresources", "resources", "nyenzo"],
     "assessment_methods": ["assessmentmethods", "assessment", "tathmini"],
@@ -176,6 +176,18 @@ HEADER_MATCH_PATTERNS = {
 
 def _normalize_header(text):
     return re.sub(r"[^a-z]", "", (text or "").lower())
+
+
+# Patterns normalized once here, the same way header text gets normalized
+# at match time — this is what makes the exact bug found against a real
+# Kiswahili scheme structurally impossible to reintroduce: a pattern like
+# "mada kuu" written with a space would otherwise never match normalized
+# header text (which never contains spaces) via exact OR substring
+# matching, silently leaving that column unmapped.
+NORMALIZED_HEADER_MATCH_PATTERNS = {
+    field: [_normalize_header(p) for p in patterns]
+    for field, patterns in HEADER_MATCH_PATTERNS.items()
+}
 
 
 _LETTER_SPACING_PATTERN = re.compile(r"\b(?:[A-Za-z](?:\s(?=[A-Za-z]\b))){2,}[A-Za-z]\b")
@@ -206,13 +218,13 @@ def _match_column_to_field(header_text):
     # match "SUB-STRAND" (normalized "substrand") just because it's a
     # substring, silently colliding two genuinely different columns onto
     # the same field.
-    for field, patterns in HEADER_MATCH_PATTERNS.items():
+    for field, patterns in NORMALIZED_HEADER_MATCH_PATTERNS.items():
         if normalized in patterns:
             return field
     # Fall back to substring matching, but only for patterns that are at
     # least 5 characters — short patterns are exactly what causes false
     # substring collisions like the one above.
-    for field, patterns in HEADER_MATCH_PATTERNS.items():
+    for field, patterns in NORMALIZED_HEADER_MATCH_PATTERNS.items():
         for pattern in patterns:
             if len(pattern) >= 5 and (pattern in normalized or normalized in pattern):
                 return field
