@@ -505,6 +505,66 @@ def bootstrap_database_schema():
                 );
             """)
 
+            # CRITICAL FIX: marks were previously keyed only by
+            # (student, subject, cycle_name) — with NO term or year at
+            # all. "Opener" in Term 1 and "Opener" in Term 3 were the
+            # exact same database row, so entering a later term's marks
+            # silently overwrote whatever an earlier term had stored for
+            # that same cycle name. Adding term/year here is what
+            # actually fixes this — each term's marks now get their own
+            # row going forward.
+            cur.execute("""
+                ALTER TABLE student_scores ADD COLUMN IF NOT EXISTS term VARCHAR(20);
+                ALTER TABLE student_scores ADD COLUMN IF NOT EXISTS year INTEGER;
+                ALTER TABLE paper_based_scores ADD COLUMN IF NOT EXISTS term VARCHAR(20);
+                ALTER TABLE paper_based_scores ADD COLUMN IF NOT EXISTS year INTEGER;
+            """)
+
+            # Backfill existing rows (term IS NULL means "never tagged
+            # yet") using each school's CURRENTLY active term/year as the
+            # best available reconstruction — a reasonable guess, not a
+            # certainty: because of the overwrite bug, a row's current
+            # value is whatever was MOST RECENTLY entered, which is
+            # usually the school's current term, but a row that was
+            # overwritten by a mistaken entry can't be distinguished from
+            # one that wasn't. Only ever touches untagged rows, so this
+            # is safe to run on every startup.
+            cur.execute("""
+                UPDATE student_scores ss
+                SET term = COALESCE(sett.active_term, 'Term 1'), year = COALESCE(sett.active_year, 2026)
+                FROM students s
+                LEFT JOIN school_settings sett ON sett.school_id = s.school_id
+                WHERE ss.student_id = s.id AND ss.term IS NULL;
+            """)
+            cur.execute("""
+                UPDATE paper_based_scores pbs
+                SET term = COALESCE(sett.active_term, 'Term 1'), year = COALESCE(sett.active_year, 2026)
+                FROM students s
+                LEFT JOIN school_settings sett ON sett.school_id = s.school_id
+                WHERE pbs.student_id = s.id AND pbs.term IS NULL;
+            """)
+
+            # Swap the unique constraint to actually include term/year —
+            # this is what stops the overwrite bug from ever happening
+            # again. Wrapped defensively: constraint operations can fail
+            # in ways that vary between a fresh install and a database
+            # that's been through several migrations already, and that
+            # must never take down the whole app on startup.
+            try:
+                cur.execute("ALTER TABLE student_scores DROP CONSTRAINT IF EXISTS student_scores_student_id_learning_area_id_cycle_name_key;")
+                cur.execute("ALTER TABLE student_scores ADD CONSTRAINT student_scores_student_subject_cycle_term_year_key UNIQUE (student_id, learning_area_id, cycle_name, term, year);")
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"Could not swap student_scores uniqueness constraint (non-fatal, save logic checks term/year explicitly regardless): {e}")
+
+            try:
+                cur.execute("ALTER TABLE paper_based_scores DROP CONSTRAINT IF EXISTS paper_based_scores_student_id_learning_area_id_cycle_name_key;")
+                cur.execute("ALTER TABLE paper_based_scores ADD CONSTRAINT paper_based_scores_student_subject_cycle_term_year_key UNIQUE (student_id, learning_area_id, cycle_name, term, year);")
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"Could not swap paper_based_scores uniqueness constraint (non-fatal, save logic checks term/year explicitly regardless): {e}")
+
+
             # Populate Classes
             classes_payload = [
                 (1, 'Grade 1', 'Lower Primary'), (2, 'Grade 2', 'Lower Primary'), (3, 'Grade 3', 'Lower Primary'),
@@ -1421,14 +1481,18 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             active_announcements = cur.fetchall()
 
             # School-wide average score per exam cycle, for the trend chart —
-            # one simple aggregate query, no per-student loop.
+            # one simple aggregate query, no per-student loop. Scoped to the
+            # currently active term/year specifically — otherwise this
+            # silently averages marks across every term ever entered.
+            _dash_active_term = (settings['active_term'] if settings else None) or 'Term 1'
+            _dash_active_year = (settings['active_year'] if settings else None) or 2026
             cur.execute("""
                 SELECT sc.cycle_name, AVG(sc.raw_score) AS avg_score, COUNT(DISTINCT sc.student_id) AS student_count
                 FROM student_scores sc
                 JOIN students s ON sc.student_id = s.id
-                WHERE s.school_id = %s
+                WHERE s.school_id = %s AND sc.term = %s AND sc.year = %s
                 GROUP BY sc.cycle_name;
-            """, (school_id,))
+            """, (school_id, _dash_active_term, _dash_active_year))
             trend_rows = {r['cycle_name']: r for r in cur.fetchall()}
 
     if not school:
@@ -2629,11 +2693,14 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                     # subject can be averaged across whichever of
                     # Opener/Midterm/End Term actually have data — the same
                     # methodology report cards already use per subject.
+                    # Still scoped to the current term/year — "combined"
+                    # means combining cycles within this term, not mixing
+                    # in marks from a different term entirely.
                     cur.execute("""
                         SELECT student_id, learning_area_id, cycle_name, raw_score
                         FROM student_scores
-                        WHERE student_id = ANY(%s);
-                    """, (student_ids,))
+                        WHERE student_id = ANY(%s) AND term = %s AND year = %s;
+                    """, (student_ids, st['active_term'], st['active_year']))
                     raw_by_subject = {}
                     for row in cur.fetchall():
                         raw_by_subject.setdefault(row['student_id'], {}).setdefault(row['learning_area_id'], []).append(float(row['raw_score']))
@@ -2644,8 +2711,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                     cur.execute("""
                         SELECT student_id, learning_area_id, raw_score
                         FROM student_scores
-                        WHERE student_id = ANY(%s) AND cycle_name = %s;
-                    """, (student_ids, st['active_cycle']))
+                        WHERE student_id = ANY(%s) AND cycle_name = %s AND term = %s AND year = %s;
+                    """, (student_ids, st['active_cycle'], st['active_term'], st['active_year']))
                     for row in cur.fetchall():
                         score_map.setdefault(row['student_id'], {})[row['learning_area_id']] = float(row['raw_score'])
 
@@ -2904,8 +2971,8 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
                 cur.execute("""
                     SELECT student_id, learning_area_id, raw_score
                     FROM student_scores
-                    WHERE student_id = ANY(%s) AND cycle_name = %s;
-                """, (student_ids, st['active_cycle']))
+                    WHERE student_id = ANY(%s) AND cycle_name = %s AND term = %s AND year = %s;
+                """, (student_ids, st['active_cycle'], st['active_term'], st['active_year']))
                 for row in cur.fetchall():
                     score_map.setdefault(row['student_id'], {})[row['learning_area_id']] = float(row['raw_score'])
 
@@ -3019,8 +3086,8 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
                 JOIN students s ON sc.student_id = s.id
                 JOIN classes c ON s.class_id = c.id
                 WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s AND s.stream = %s
-                  AND sc.cycle_name = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
-            """, (school_id, grade_name, education_level, stream, st['active_cycle']))
+                  AND sc.cycle_name = %s AND sc.term = %s AND sc.year = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
+            """, (school_id, grade_name, education_level, stream, st['active_cycle'], st['active_term'], st['active_year']))
             all_scores = cur.fetchall()
 
     scores_by_subject = {}
@@ -3129,8 +3196,8 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
                 JOIN students s ON sc.student_id = s.id
                 JOIN classes c ON s.class_id = c.id
                 WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
-                  AND sc.cycle_name = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
-            """, (school_id, grade_name, education_level, st['active_cycle']))
+                  AND sc.cycle_name = %s AND sc.term = %s AND sc.year = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
+            """, (school_id, grade_name, education_level, st['active_cycle'], st['active_term'], st['active_year']))
             all_scores = cur.fetchall()
 
     PLD_ORDER = ["EE1", "EE2", "ME1", "ME2", "AE1", "AE2", "BE1", "BE2"]
@@ -3452,7 +3519,7 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
 
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
-            st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term'}
+            st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
 
             cur.execute("""
                 SELECT s.id
@@ -3472,8 +3539,8 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
                 cur.execute("""
                     SELECT student_id, learning_area_id, cycle_name, raw_score
                     FROM student_scores
-                    WHERE student_id = ANY(%s);
-                """, (student_ids,))
+                    WHERE student_id = ANY(%s) AND term = %s AND year = %s;
+                """, (student_ids, st['active_term'], st['active_year']))
                 for row in cur.fetchall():
                     score_map.setdefault(row['student_id'], {}).setdefault(row['learning_area_id'], {})[row['cycle_name']] = float(row['raw_score'])
 
@@ -3727,7 +3794,12 @@ def manage_individual_scores_view(school_id: int, student_id: int, request: Requ
             student = cur.fetchone()
             if not student:
                 raise HTTPException(status_code=404, detail="Student target missing.")
-            
+
+            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings_row = cur.fetchone()
+            active_term = (settings_row['active_term'] if settings_row else None) or 'Term 1'
+            active_year = (settings_row['active_year'] if settings_row else None) or 2026
+
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (student['education_level'],))
             subjects = cur.fetchall()
             
@@ -3735,8 +3807,8 @@ def manage_individual_scores_view(school_id: int, student_id: int, request: Requ
                 SELECT ss.id as score_id, la.name as subject_name, ss.cycle_name, ss.raw_score 
                 FROM student_scores ss
                 JOIN learning_areas la ON ss.learning_area_id = la.id
-                WHERE ss.student_id = %s;
-            """, (student_id,))
+                WHERE ss.student_id = %s AND ss.term = %s AND ss.year = %s;
+            """, (student_id, active_term, active_year))
             existing_scores = cur.fetchall()
 
     subject_options = "".join([f"<option value='{s['id']}'>{s['name']}</option>" for s in subjects])
@@ -3823,6 +3895,11 @@ def educators_bulk_entry_grid(
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
+
+            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings_row = cur.fetchone()
+            active_term = (settings_row['active_term'] if settings_row else None) or 'Term 1'
+            active_year = (settings_row['active_year'] if settings_row else None) or 2026
             
             # Fetch relevant subjects matched by the educational segment level
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
@@ -3851,8 +3928,8 @@ def educators_bulk_entry_grid(
             if selected_area_id and is_paper_mode:
                 cur.execute("""
                     SELECT student_id, paper1_marks, paper1_max, paper2_marks, paper2_max FROM paper_based_scores
-                    WHERE learning_area_id = %s AND cycle_name = %s;
-                """, (selected_area_id, cycle_name))
+                    WHERE learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;
+                """, (selected_area_id, cycle_name, active_term, active_year))
                 rows = cur.fetchall()
                 for r in rows:
                     paper_map[r['student_id']] = r
@@ -3869,8 +3946,8 @@ def educators_bulk_entry_grid(
             elif selected_area_id:
                 cur.execute("""
                     SELECT student_id, raw_score FROM student_scores 
-                    WHERE learning_area_id = %s AND cycle_name = %s;
-                """, (selected_area_id, cycle_name))
+                    WHERE learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;
+                """, (selected_area_id, cycle_name, active_term, active_year))
                 for scr in cur.fetchall():
                     score_map[scr['student_id']] = float(scr['raw_score'])
 
@@ -4015,7 +4092,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         sc.learning_area_id,
                         AVG(sc.raw_score) AS subject_avg
                     FROM student_scores sc
-                    WHERE sc.cycle_name IN ('Opener', 'Midterm', 'End Term')
+                    WHERE sc.cycle_name IN ('Opener', 'Midterm', 'End Term') AND sc.term = %s AND sc.year = %s
                     GROUP BY sc.student_id, sc.learning_area_id
                 ),
                 student_mean_scores AS (
@@ -4073,7 +4150,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                 SELECT * FROM cohort_rankings
                 WHERE stream = %s
                 ORDER BY stream_position ASC, admission_number ASC;
-            """, (school_id, grade_name, stream))
+            """, (st['active_term'], st['active_year'], school_id, grade_name, stream))
             students = cur.fetchall()
             
             if not students:
@@ -4091,8 +4168,8 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             student_ids_in_batch = [s['student_id'] for s in students]
             cur.execute("""
                 SELECT DISTINCT cycle_name FROM student_scores
-                WHERE student_id = ANY(%s) AND cycle_name IN ('Opener', 'Midterm', 'End Term');
-            """, (student_ids_in_batch,))
+                WHERE student_id = ANY(%s) AND cycle_name IN ('Opener', 'Midterm', 'End Term') AND term = %s AND year = %s;
+            """, (student_ids_in_batch, st['active_term'], st['active_year']))
             cycles_with_data = {r['cycle_name'] for r in cur.fetchall()}
             show_opener = 'Opener' in cycles_with_data
             show_midterm = 'Midterm' in cycles_with_data
@@ -4159,8 +4236,8 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             all_scores_by_student = {}
             if student_ids_in_batch:
                 cur.execute(
-                    "SELECT student_id, learning_area_id, cycle_name, raw_score FROM student_scores WHERE student_id = ANY(%s);",
-                    (student_ids_in_batch,)
+                    "SELECT student_id, learning_area_id, cycle_name, raw_score FROM student_scores WHERE student_id = ANY(%s) AND term = %s AND year = %s;",
+                    (student_ids_in_batch, st['active_term'], st['active_year'])
                 )
                 for sc in cur.fetchall():
                     all_scores_by_student.setdefault(sc['student_id'], []).append(sc)
@@ -5019,12 +5096,28 @@ def upsert_individual_score(school_id: int, student_id: int = Form(...), learnin
             cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
             if not cur.fetchone():
                 raise HTTPException(status_code=403, detail="Cross-tenant execution attempt blocked.")
-            
+
+            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings_row = cur.fetchone()
+            active_term = settings_row[0] if settings_row else 'Term 1'
+            active_year = settings_row[1] if settings_row else 2026
+
+            # Check-then-update-or-insert rather than ON CONFLICT — safer
+            # given the constraint swap above is itself wrapped
+            # defensively and might not have succeeded on every
+            # deployment; this never depends on that constraint existing.
             cur.execute("""
-                INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (student_id, learning_area_id, cycle_name) DO UPDATE SET raw_score = EXCLUDED.raw_score;
-            """, (student_id, learning_area_id, cycle_name, raw_score))
+                SELECT id FROM student_scores
+                WHERE student_id = %s AND learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;
+            """, (student_id, learning_area_id, cycle_name, active_term, active_year))
+            existing_row = cur.fetchone()
+            if existing_row:
+                cur.execute("UPDATE student_scores SET raw_score = %s WHERE id = %s;", (raw_score, existing_row[0]))
+            else:
+                cur.execute("""
+                    INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score, term, year)
+                    VALUES (%s, %s, %s, %s, %s, %s);
+                """, (student_id, learning_area_id, cycle_name, raw_score, active_term, active_year))
             conn.commit()
     return RedirectResponse(url=f"/admin/scores/manage/{school_id}?student_id={student_id}", status_code=303)
 
@@ -5054,6 +5147,17 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     cycle_name = (form_data.get('cycle_name') or "").strip()
     if not cycle_name:
         raise HTTPException(status_code=400, detail="An assessment cycle must be selected before saving.")
+
+    # Fetched once here, used by both save branches below — every mark
+    # saved in this request is scoped to the school's currently active
+    # term/year, which is what actually prevents Term 3 marks from
+    # silently overwriting Term 1's for the same cycle name.
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings_row = cur.fetchone()
+    active_term = settings_row[0] if settings_row else 'Term 1'
+    active_year = settings_row[1] if settings_row else 2026
 
     is_paper_mode = form_data.get("is_paper_mode") == "1"
     skipped_entries = 0
@@ -5116,22 +5220,37 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
                         percentage = round(p2 / paper2_max * 100, 2)
 
                     cur.execute("""
-                        INSERT INTO paper_based_scores (student_id, learning_area_id, cycle_name, paper1_marks, paper1_max, paper2_marks, paper2_max)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (student_id, learning_area_id, cycle_name)
-                        DO UPDATE SET paper1_marks = EXCLUDED.paper1_marks, paper1_max = EXCLUDED.paper1_max,
-                                      paper2_marks = EXCLUDED.paper2_marks, paper2_max = EXCLUDED.paper2_max;
-                    """, (sid, learning_area_id, cycle_name, p1, paper1_max, p2, paper2_max))
+                        SELECT id FROM paper_based_scores
+                        WHERE student_id = %s AND learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;
+                    """, (sid, learning_area_id, cycle_name, active_term, active_year))
+                    existing_paper_row = cur.fetchone()
+                    if existing_paper_row:
+                        cur.execute("""
+                            UPDATE paper_based_scores SET paper1_marks = %s, paper1_max = %s, paper2_marks = %s, paper2_max = %s
+                            WHERE id = %s;
+                        """, (p1, paper1_max, p2, paper2_max, existing_paper_row[0]))
+                    else:
+                        cur.execute("""
+                            INSERT INTO paper_based_scores (student_id, learning_area_id, cycle_name, paper1_marks, paper1_max, paper2_marks, paper2_max, term, year)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (sid, learning_area_id, cycle_name, p1, paper1_max, p2, paper2_max, active_term, active_year))
 
                     # The resulting percentage is written into student_scores
                     # exactly like any normal single-mark entry — report
                     # cards, rankings, and every other report keep reading
                     # this the same way, with no idea one or two papers were involved.
                     cur.execute("""
-                        INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (student_id, learning_area_id, cycle_name) DO UPDATE SET raw_score = EXCLUDED.raw_score;
-                    """, (sid, learning_area_id, cycle_name, percentage))
+                        SELECT id FROM student_scores
+                        WHERE student_id = %s AND learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;
+                    """, (sid, learning_area_id, cycle_name, active_term, active_year))
+                    existing_score_row = cur.fetchone()
+                    if existing_score_row:
+                        cur.execute("UPDATE student_scores SET raw_score = %s WHERE id = %s;", (percentage, existing_score_row[0]))
+                    else:
+                        cur.execute("""
+                            INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score, term, year)
+                            VALUES (%s, %s, %s, %s, %s, %s);
+                        """, (sid, learning_area_id, cycle_name, percentage, active_term, active_year))
                 conn.commit()
 
         if skipped_entries:
@@ -5173,10 +5292,17 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
                 cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (target_student_id, school_id))
                 if cur.fetchone():
                     cur.execute("""
-                        INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (student_id, learning_area_id, cycle_name) DO UPDATE SET raw_score = EXCLUDED.raw_score;
-                    """, (target_student_id, learning_area_id, cycle_name, raw_score))
+                        SELECT id FROM student_scores
+                        WHERE student_id = %s AND learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;
+                    """, (target_student_id, learning_area_id, cycle_name, active_term, active_year))
+                    existing_row = cur.fetchone()
+                    if existing_row:
+                        cur.execute("UPDATE student_scores SET raw_score = %s WHERE id = %s;", (raw_score, existing_row[0]))
+                    else:
+                        cur.execute("""
+                            INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score, term, year)
+                            VALUES (%s, %s, %s, %s, %s, %s);
+                        """, (target_student_id, learning_area_id, cycle_name, raw_score, active_term, active_year))
                 else:
                     skipped_entries += 1
             conn.commit()
