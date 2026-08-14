@@ -1846,7 +1846,11 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                         <span class="w-2 h-2 rounded-full bg-slate-500"></span> Settings
                     </h2>
                     <form action="/api/v1/settings/update/{school_id}" method="post" class="space-y-3">
-                        <div class="grid grid-cols-2 gap-2">
+                        <div class="grid grid-cols-3 gap-2">
+                            <div>
+                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Active Year</label>
+                                <input type="number" name="active_year" value="{st.get('active_year') or 2026}" min="2020" max="2100" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
+                            </div>
                             <div>
                                 <label class="text-[11px] font-semibold text-slate-500 block mb-1">Academic Term</label>
                                 <select name="active_term" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
@@ -1864,6 +1868,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                                 </select>
                             </div>
                         </div>
+                        <p class="text-[10px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-2">⚠️ Marks are saved against whatever Year + Term + Assessment Phase are set here at the moment of saving. Double-check all three are correct before entering marks for a new term.</p>
 
                         <div>
                             <label class="text-[11px] font-semibold text-slate-500 block mb-1">Theme Branding Color</label>
@@ -4535,6 +4540,149 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             </body>
             </html>
             """
+
+
+@app.get("/admin/fix-mistagged-marks/{school_id}", response_class=HTMLResponse)
+def fix_mistagged_marks_view(school_id: int, request: Request, from_term: str = None, from_year: int = None, to_term: str = None, to_year: int = None):
+    """A one-off correction tool for marks that got tagged with the wrong
+    term/year — most likely to matter right after the term/year migration,
+    where every pre-existing mark was backfilled with whatever term/year
+    was active AT THE MOMENT the migration ran, regardless of which
+    cycle/term it was actually entered for. Shows an exact preview count
+    before anything is changed — never applies silently."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            # A breakdown of what's currently tagged, so admin can see
+            # exactly what exists before deciding what to move.
+            cur.execute("""
+                SELECT ss.term, ss.year, ss.cycle_name, COUNT(*) AS cnt
+                FROM student_scores ss
+                JOIN students s ON ss.student_id = s.id
+                WHERE s.school_id = %s
+                GROUP BY ss.term, ss.year, ss.cycle_name
+                ORDER BY ss.year DESC, ss.term ASC, ss.cycle_name ASC;
+            """, (school_id,))
+            breakdown = cur.fetchall()
+
+            preview_count = None
+            if from_term and from_year and to_term and to_year:
+                cur.execute("""
+                    SELECT COUNT(*) AS cnt FROM student_scores ss
+                    JOIN students s ON ss.student_id = s.id
+                    WHERE s.school_id = %s AND ss.term = %s AND ss.year = %s;
+                """, (school_id, from_term, from_year))
+                preview_count = cur.fetchone()['cnt']
+
+    breakdown_html = "".join(
+        f"<tr><td class='p-2 text-xs'>{esc(r['term'] or '(none)')}</td><td class='p-2 text-xs'>{r['year'] or '(none)'}</td><td class='p-2 text-xs'>{esc(r['cycle_name'])}</td><td class='p-2 text-xs text-right font-bold'>{r['cnt']}</td></tr>"
+        for r in breakdown
+    )
+
+    term_options = "".join(f"<option value='{esc(t)}'>{esc(t)}</option>" for t in ["Term 1", "Term 2", "Term 3"])
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Fix Mistagged Marks</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">🔧 Fix Mistagged Marks — {esc(school['name'])}</h2>
+                <p class="text-xs text-slate-400 mt-1">Moves every mark currently tagged with one term/year to a different term/year. Use this to correct marks that got tagged wrong during the recent term/year migration. Always shows exactly how many marks will move before anything changes.</p>
+            </div>
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-bold text-slate-800 mb-2">Current breakdown</h3>
+                <table class="w-full">
+                    <thead><tr class="text-[10px] uppercase text-slate-400 border-b"><th class="p-2 text-left">Term</th><th class="p-2 text-left">Year</th><th class="p-2 text-left">Cycle</th><th class="p-2 text-right">Count</th></tr></thead>
+                    <tbody>{breakdown_html or "<tr><td colspan='4' class='p-4 text-center text-slate-400 text-xs italic'>No marks entered yet.</td></tr>"}</tbody>
+                </table>
+            </div>
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-bold text-slate-800 mb-3">Move marks</h3>
+                <form method="get" class="grid grid-cols-2 gap-3 mb-3">
+                    <input type="hidden" name="to_term" value="">
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500 block mb-1">Currently tagged as — Term</label>
+                        <select name="from_term" class="w-full border p-2 rounded-lg text-xs bg-white">{term_options}</select>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500 block mb-1">Currently tagged as — Year</label>
+                        <input type="number" name="from_year" value="{from_year or 2026}" class="w-full border p-2 rounded-lg text-xs">
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500 block mb-1">Should actually be — Term</label>
+                        <select name="to_term" class="w-full border p-2 rounded-lg text-xs bg-white">{term_options}</select>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500 block mb-1">Should actually be — Year</label>
+                        <input type="number" name="to_year" value="{to_year or 2026}" class="w-full border p-2 rounded-lg text-xs">
+                    </div>
+                    <button type="submit" class="col-span-2 bg-slate-800 hover:bg-slate-900 text-white font-bold py-2.5 rounded-xl text-sm transition">Preview</button>
+                </form>
+
+                {f'''<div class="bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl">
+                    <p class="font-bold">This will move {preview_count} mark(s) from {esc(from_term)} {from_year} to {esc(to_term)} {to_year}.</p>
+                    <form action="/api/v1/fix-mistagged-marks/{school_id}" method="post" onsubmit="return confirm('Move {preview_count} mark(s) from {esc(from_term)} {from_year} to {esc(to_term)} {to_year}? This cannot be undone automatically.');" class="mt-2">
+                        <input type="hidden" name="from_term" value="{esc(from_term)}">
+                        <input type="hidden" name="from_year" value="{from_year}">
+                        <input type="hidden" name="to_term" value="{esc(to_term)}">
+                        <input type="hidden" name="to_year" value="{to_year}">
+                        <button type="submit" class="bg-rose-600 hover:bg-rose-700 text-white font-bold py-2.5 px-5 rounded-xl text-xs transition">Confirm — Move {preview_count} Mark(s)</button>
+                    </form>
+                </div>''' if preview_count is not None else ""}
+            </div>
+
+            <a href="/admin/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back to Dashboard</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/api/v1/fix-mistagged-marks/{school_id}")
+def fix_mistagged_marks_apply(school_id: int, request: Request, from_term: str = Form(...), from_year: int = Form(...), to_term: str = Form(...), to_year: int = Form(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    allowed_terms = {"Term 1", "Term 2", "Term 3"}
+    if from_term not in allowed_terms or to_term not in allowed_terms:
+        raise HTTPException(status_code=400, detail="Invalid term.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE student_scores ss SET term = %s, year = %s
+                FROM students s
+                WHERE ss.student_id = s.id AND s.school_id = %s AND ss.term = %s AND ss.year = %s;
+            """, (to_term, to_year, school_id, from_term, from_year))
+            moved_scores = cur.rowcount
+
+            cur.execute("""
+                UPDATE paper_based_scores pbs SET term = %s, year = %s
+                FROM students s
+                WHERE pbs.student_id = s.id AND s.school_id = %s AND pbs.term = %s AND pbs.year = %s;
+            """, (to_term, to_year, school_id, from_term, from_year))
+            moved_papers = cur.rowcount
+
+            conn.commit()
+            log_audit_action(cur, request, school_id, "marks_retagged", f"Moved {moved_scores} score(s) and {moved_papers} paper-score(s) from {from_term} {from_year} to {to_term} {to_year}")
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/fix-mistagged-marks/{school_id}", status_code=303)
+
+
 @app.get("/admin/class-teachers/{school_id}", response_class=HTMLResponse)
 def class_teachers_view(school_id: int, request: Request):
     """Lets admin assign which staff member is the CLASS (homeroom)
@@ -4655,6 +4803,7 @@ def update_settings_endpoint(
     theme_color: str = Form(...),
     is_single_stream: str = Form(None),
     head_teacher_name: str = Form(""),
+    active_year: int = Form(...),
 ):
     auth_error = require_admin_session(request, school_id)
     if auth_error:
@@ -4672,6 +4821,8 @@ def update_settings_endpoint(
         raise HTTPException(status_code=400, detail="Invalid assessment cycle selected.")
     if theme_color not in allowed_themes:
         theme_color = "emerald"
+    if not (2020 <= active_year <= 2100):
+        raise HTTPException(status_code=400, detail="Active year looks wrong — please check it.")
 
     # A checkbox only appears in form data when it's checked — its absence
     # here correctly means "unchecked", not "leave unchanged".
@@ -4680,21 +4831,22 @@ def update_settings_endpoint(
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO school_settings (school_id, active_term, active_cycle, opening_date, closing_date, is_single_stream, head_teacher_name)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO school_settings (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream, head_teacher_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (school_id) DO UPDATE 
                 SET active_term = EXCLUDED.active_term, 
                     active_cycle = EXCLUDED.active_cycle, 
+                    active_year = EXCLUDED.active_year,
                     opening_date = EXCLUDED.opening_date, 
                     closing_date = EXCLUDED.closing_date,
                     is_single_stream = EXCLUDED.is_single_stream,
                     head_teacher_name = EXCLUDED.head_teacher_name;
-            """, (school_id, active_term, active_cycle, opening_date, closing_date, is_single_stream_bool, head_teacher_name.strip() or None))
+            """, (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream_bool, head_teacher_name.strip() or None))
             
             # Sync the modern Tailwind color layout across the institution node
             cur.execute("UPDATE schools SET theme_color = %s WHERE id = %s;", (theme_color, school_id))
             conn.commit()
-            log_audit_action(cur, request, school_id, "settings_updated", f"Term={active_term}, Cycle={active_cycle}, Theme={theme_color}, SingleStream={is_single_stream_bool}")
+            log_audit_action(cur, request, school_id, "settings_updated", f"Term={active_term}, Year={active_year}, Cycle={active_cycle}, Theme={theme_color}, SingleStream={is_single_stream_bool}")
             conn.commit()
             
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
