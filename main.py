@@ -374,6 +374,10 @@ def bootstrap_database_schema():
                     is_single_stream BOOLEAN DEFAULT FALSE
                 );
 
+                -- Head of Institution's printed name for the report card
+                -- signature block — a school sets this once in Settings.
+                ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS head_teacher_name VARCHAR(255);
+
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
                     email VARCHAR(255) UNIQUE NOT NULL,
@@ -391,6 +395,21 @@ def bootstrap_database_schema():
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(255);
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS tsc_number VARCHAR(100);
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number VARCHAR(50);
+
+                -- Which staff member is the CLASS teacher (homeroom) for a
+                -- given class+stream — distinct from subject-teaching
+                -- assignments in the timetable module. Scoped per school
+                -- since the shared `classes` table (grade_name +
+                -- education_level only) is shared across every school.
+                CREATE TABLE IF NOT EXISTS class_teachers (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    grade_name VARCHAR(100) NOT NULL,
+                    education_level VARCHAR(100) NOT NULL,
+                    stream VARCHAR(50) NOT NULL,
+                    teacher_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    UNIQUE(school_id, grade_name, education_level, stream)
+                );
 
                 CREATE TABLE IF NOT EXISTS password_resets (
                     id SERIAL PRIMARY KEY,
@@ -1687,6 +1706,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <a href="/admin/audit-log/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📋 Activity Log</a>
                 <a href="/admin/school/profile/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🏫 School Profile</a>
                 <a href="/finance/dashboard/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-3 py-2 rounded-xl transition">💰 Finance</a>
+                <a href="/admin/class-teachers/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🧑‍🏫 Class Teachers</a>
                 <a href="/schemes/manage/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📘 Schemes of Work</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
@@ -1796,6 +1816,12 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                                 <span class="text-[10px] text-slate-400 block">Hides class sorting columns</span>
                             </div>
                             <input type="checkbox" name="is_single_stream" value="true" {"checked" if is_single_stream else ""} class="w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500 cursor-pointer">
+                        </div>
+
+                        <div>
+                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Head of Institution's Name</label>
+                            <input type="text" name="head_teacher_name" value="{esc(st.get('head_teacher_name') or '')}" placeholder="e.g. Jane Wanjiru" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
+                            <span class="text-[10px] text-slate-400 block mt-1">Printed on the report card signature block.</span>
                         </div>
 
                         <div class="grid grid-cols-2 gap-2">
@@ -4081,6 +4107,33 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
             subjects = cur.fetchall()
 
+            # Class teacher (homeroom) name, for the signature block —
+            # falls back gracefully to a blank line if never assigned.
+            cur.execute("""
+                SELECT u.full_name, u.email FROM class_teachers ct
+                JOIN users u ON ct.teacher_user_id = u.id
+                WHERE ct.school_id = %s AND ct.grade_name = %s AND ct.education_level = %s AND ct.stream = %s;
+            """, (school_id, grade_name, education_level, stream))
+            class_teacher_row = cur.fetchone()
+            class_teacher_name = (class_teacher_row['full_name'] or class_teacher_row['email']) if class_teacher_row else ""
+
+            # Which teacher teaches each subject for this specific class —
+            # pulled from the timetable module's own assignment table.
+            # Wrapped defensively: if that table doesn't exist for some
+            # reason (e.g. an unusual partial deploy), this must never
+            # crash report card generation — it just shows no names.
+            subject_teacher_names = {}
+            try:
+                cur.execute("""
+                    SELECT tsa.learning_area_id, u.full_name, u.email
+                    FROM teacher_subject_assignments tsa
+                    JOIN users u ON tsa.staff_user_id = u.id
+                    WHERE tsa.school_id = %s AND tsa.grade_name = %s AND tsa.education_level = %s AND tsa.stream = %s;
+                """, (school_id, grade_name, education_level, stream))
+                subject_teacher_names = {r['learning_area_id']: (r['full_name'] or r['email']) for r in cur.fetchall()}
+            except Exception:
+                conn.rollback()  # a failed query here must not poison the rest of this transaction
+
             # The subject table is the one part of this report whose height
             # scales with the school's own data (4 subjects for Lower Primary
             # vs 9 for Junior School) — a single fixed row padding that looks
@@ -4194,6 +4247,8 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         (f'<td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-size:{row_font};">{end_str}</td>' if show_endterm else "")
                     )
 
+                    subject_teacher_name = subject_teacher_names.get(sub['id'], "")
+
                     rows_markup += f"""
                     <tr>
                         <td style="padding: {row_vpad} 6px; border: 1px solid #222; font-weight:bold; font-size:{row_font};">{sub['name']}</td>
@@ -4202,6 +4257,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         <td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-weight:bold; font-size:{row_font};">{pld}</td>
                         <td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-weight:bold; font-size:{row_font};">{pts}</td>
                         <td style="padding: {row_vpad} 6px; border: 1px solid #222; font-size:{desc_font}; line-height: 1.2;">{descriptor}</td>
+                        <td style="padding: {row_vpad} 6px; border: 1px solid #222; font-size:{desc_font};">{esc(subject_teacher_name)}</td>
                     </tr>
                     """
 
@@ -4270,6 +4326,7 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                                     <th style="padding:6px; border:1px solid #222; width:70px; text-align:center;">CBE Code</th>
                                     <th style="padding:6px; border:1px solid #222; width:65px; text-align:center;">Scale Pts</th>
                                     <th style="padding:6px; border:1px solid #222; text-align:left;">Competence Descriptor Status</th>
+                                    <th style="padding:6px; border:1px solid #222; width:90px; text-align:left;">Teacher</th>
                                 </tr>
                             </thead>
                             <tbody>{rows_markup}</tbody>
@@ -4325,6 +4382,25 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         <div style="display:flex; justify-content:space-between; margin-top: 8px; padding-top: 6px; border-top: 1.5px solid #cbd5e1; font-size: 11px; font-style: italic; color: #475569;">
                             <div><b>Current Term Closing Date:</b> {st['closing_date']}</div>
                             <div><b>Next Term Opening Date:</b> {st['opening_date']}</div>
+                        </div>
+
+                        <div style="display:flex; justify-content:space-between; gap:12px; margin-top:8px; padding-top:6px; border-top: 1.5px solid #cbd5e1;">
+                            <div style="flex:1; text-align:center;">
+                                <div style="border-bottom:1px solid #334155; height:16px;"></div>
+                                <div style="font-size:9px; color:#334155; margin-top:2px;">
+                                    <b>{esc(st.get('head_teacher_name') or '')}</b><br>Head of Institution — Signature
+                                </div>
+                            </div>
+                            <div style="flex:1; text-align:center;">
+                                <div style="border-bottom:1px solid #334155; height:16px;"></div>
+                                <div style="font-size:9px; color:#334155; margin-top:2px;">
+                                    <b>{esc(class_teacher_name)}</b><br>Class Teacher — Signature
+                                </div>
+                            </div>
+                            <div style="flex:1; text-align:center;">
+                                <div style="border-bottom:1px solid #334155; height:16px;"></div>
+                                <div style="font-size:9px; color:#334155; margin-top:2px;">Parent/Guardian — Signature</div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -4382,6 +4458,115 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
             </body>
             </html>
             """
+@app.get("/admin/class-teachers/{school_id}", response_class=HTMLResponse)
+def class_teachers_view(school_id: int, request: Request):
+    """Lets admin assign which staff member is the CLASS (homeroom)
+    teacher for each class+stream — distinct from subject-teaching
+    assignments in the timetable module. Used on report cards for the
+    class teacher's name/signature line."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'staff' AND is_verified = TRUE ORDER BY full_name NULLS LAST, email ASC;", (school_id,))
+            staff_members = cur.fetchall()
+
+            cur.execute("""
+                SELECT DISTINCT c.grade_name, s.stream, c.education_level
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                ORDER BY c.grade_name ASC, s.stream ASC;
+            """, (school_id,))
+            classes = cur.fetchall()
+
+            cur.execute("SELECT grade_name, education_level, stream, teacher_user_id FROM class_teachers WHERE school_id = %s;", (school_id,))
+            current_assignments = {(r['grade_name'], r['education_level'], r['stream']): r['teacher_user_id'] for r in cur.fetchall()}
+
+    def _class_label(c):
+        return c['grade_name'] if c['stream'] == 'SINGLE STREAM' else f"{c['grade_name']} — {c['stream']}"
+
+    rows_html = ""
+    for c in classes:
+        key = (c['grade_name'], c['education_level'], c['stream'])
+        assigned_id = current_assignments.get(key)
+        staff_options = "".join(
+            f"<option value='{s['id']}' {'selected' if s['id'] == assigned_id else ''}>{esc(s['full_name'] or s['email'])}</option>"
+            for s in staff_members
+        )
+        rows_html += f"""
+        <div class="flex items-center justify-between gap-3 py-2.5 border-b border-slate-50 last:border-0">
+            <span class="text-sm font-semibold text-slate-700 w-40 shrink-0">{esc(_class_label(c))}</span>
+            <form action="/api/v1/class-teachers/save/{school_id}" method="post" class="flex items-center gap-2 flex-1">
+                <input type="hidden" name="grade_name" value="{esc(c['grade_name'])}">
+                <input type="hidden" name="education_level" value="{esc(c['education_level'])}">
+                <input type="hidden" name="stream" value="{esc(c['stream'])}">
+                <select name="teacher_user_id" class="flex-1 border p-2 rounded-lg text-xs font-semibold bg-white">
+                    <option value="">— Unassigned —</option>{staff_options}
+                </select>
+                <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white px-3 py-2 rounded-lg text-xs font-bold transition">Save</button>
+            </form>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Class Teachers</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">🧑‍🏫 Class Teachers</h2>
+                <p class="text-xs text-slate-400 mt-1">Assign which staff member is the class (homeroom) teacher for each class — shown on the report card's signature line.</p>
+                {"<p class='text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3 mt-3'>No verified staff accounts yet — add and activate staff first, then come back to assign them here.</p>" if not staff_members else ""}
+            </div>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                {rows_html or "<p class='text-slate-400 text-xs italic'>No classes with students yet.</p>"}
+            </div>
+            <a href="/admin/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back to Dashboard</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/api/v1/class-teachers/save/{school_id}")
+def save_class_teacher(school_id: int, request: Request, grade_name: str = Form(...), education_level: str = Form(...), stream: str = Form(...), teacher_user_id: str = Form("")):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            teacher_id = int(teacher_user_id) if teacher_user_id else None
+
+            # Check-then-update-or-insert rather than ON CONFLICT — safer
+            # than relying on a named constraint that might not exist on
+            # every deployment, matching the lesson learned elsewhere in
+            # this codebase with fee_structures.
+            cur.execute("""
+                SELECT id FROM class_teachers WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
+            """, (school_id, grade_name, education_level, stream))
+            existing_row = cur.fetchone()
+            if existing_row:
+                cur.execute("UPDATE class_teachers SET teacher_user_id = %s WHERE id = %s;", (teacher_id, existing_row[0]))
+            else:
+                cur.execute("""
+                    INSERT INTO class_teachers (school_id, grade_name, education_level, stream, teacher_user_id)
+                    VALUES (%s, %s, %s, %s, %s);
+                """, (school_id, grade_name, education_level, stream, teacher_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/class-teachers/{school_id}", status_code=303)
+
+
 @app.post("/api/v1/settings/update/{school_id}")
 def update_settings_endpoint(
     school_id: int, 
@@ -4392,6 +4577,7 @@ def update_settings_endpoint(
     closing_date: str = Form(...), 
     theme_color: str = Form(...),
     is_single_stream: str = Form(None),
+    head_teacher_name: str = Form(""),
 ):
     auth_error = require_admin_session(request, school_id)
     if auth_error:
@@ -4417,15 +4603,16 @@ def update_settings_endpoint(
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO school_settings (school_id, active_term, active_cycle, opening_date, closing_date, is_single_stream)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO school_settings (school_id, active_term, active_cycle, opening_date, closing_date, is_single_stream, head_teacher_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (school_id) DO UPDATE 
                 SET active_term = EXCLUDED.active_term, 
                     active_cycle = EXCLUDED.active_cycle, 
                     opening_date = EXCLUDED.opening_date, 
                     closing_date = EXCLUDED.closing_date,
-                    is_single_stream = EXCLUDED.is_single_stream;
-            """, (school_id, active_term, active_cycle, opening_date, closing_date, is_single_stream_bool))
+                    is_single_stream = EXCLUDED.is_single_stream,
+                    head_teacher_name = EXCLUDED.head_teacher_name;
+            """, (school_id, active_term, active_cycle, opening_date, closing_date, is_single_stream_bool, head_teacher_name.strip() or None))
             
             # Sync the modern Tailwind color layout across the institution node
             cur.execute("UPDATE schools SET theme_color = %s WHERE id = %s;", (theme_color, school_id))
