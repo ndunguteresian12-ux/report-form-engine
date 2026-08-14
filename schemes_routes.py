@@ -39,6 +39,8 @@ from shared import (
     require_school_session,
     require_admin_session,
     require_superadmin_session,
+    get_dashboard_url,
+    get_current_session_user,
 )
 
 router = APIRouter()
@@ -351,9 +353,11 @@ def schemes_upload_form(request: Request):
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Upload Scheme of Work</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
-        <div class="max-w-lg mx-auto bg-white p-6 rounded-2xl border shadow-xs">
+        <div class="max-w-lg mx-auto space-y-4">
+            <a href="/superadmin/schemes/list" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Master Schemes</a>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">📘 Upload Master Scheme of Work</h2>
-            <p class="text-xs text-slate-400 mb-4">Upload a PDF — the system will try to detect the table and split it into rows automatically. You'll review and correct every row on the next screen before this becomes available to schools.</p>
+            <p class="text-xs text-slate-400 mb-4">Upload a PDF — the system will try to detect the table and split it into rows automatically. This becomes visible to schools and teachers immediately, so you'll land on the review screen right after to check and fix anything the parser got wrong.</p>
             <form action="/api/v1/superadmin/schemes/upload" method="post" enctype="multipart/form-data" class="space-y-3">
                 <div>
                     <label class="text-xs font-bold text-slate-600 block mb-1">Subject / Learning Area</label>
@@ -387,6 +391,7 @@ def schemes_upload_form(request: Request):
                 </div>
                 <button type="submit" class="w-full bg-indigo-800 hover:bg-indigo-900 text-white font-bold py-3 rounded-xl text-sm transition">Upload &amp; Parse</button>
             </form>
+            </div>
         </div>
     </body>
     </html>
@@ -431,9 +436,13 @@ async def schemes_upload_process(
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             recorded_by = request.cookies.get("session_user_id")
+            # Published immediately on upload — no separate approval step
+            # blocking visibility. The review/edit page (redirected to
+            # right below) is still there to check and fix content, but
+            # it's a convenience, not a gate.
             cur.execute("""
-                INSERT INTO scheme_masters (subject_name, grade_name, education_level, term, year, title, source_pdf_filename, parse_review_status, created_by_user_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'draft', %s) RETURNING id;
+                INSERT INTO scheme_masters (subject_name, grade_name, education_level, term, year, title, source_pdf_filename, parse_review_status, created_by_user_id, published_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'published', %s, NOW()) RETURNING id;
             """, (subject_name.strip(), grade_name.strip(), education_level, term, year, f"{subject_name.strip()} — {grade_name.strip()}", pdf_file.filename, recorded_by))
             master_id = cur.fetchone()[0]
 
@@ -499,9 +508,10 @@ def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Review Scheme</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-5xl mx-auto space-y-4">
+            <a href="/superadmin/schemes/list" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Master Schemes</a>
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">📘 Review — {esc(master['subject_name'])} — {esc(master['grade_name'])} ({esc(master['term'])} {master['year']})</h2>
-                <p class="text-xs text-slate-400 mt-1">{len(rows)} row(s) detected. Check every row carefully — this parse is best-effort, not guaranteed accurate. Fix anything wrong before publishing; schools will import exactly what you approve here.</p>
+                <p class="text-xs text-slate-400 mt-1">{len(rows)} row(s) detected. This scheme is already live and visible to schools — check every row carefully, since this parse is best-effort, not guaranteed accurate, and fix anything wrong below.</p>
                 {f"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-xs px-4 py-3 rounded-xl mt-3'><b>⚠️ Parser flagged these concerns:</b><ul class='list-disc list-inside mt-1'>{warnings_html}</ul></div>" if warning_list else ""}
             </div>
 
@@ -509,7 +519,7 @@ def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
                 {rows_html or "<p class='text-slate-400 text-sm italic bg-white p-6 rounded-2xl border text-center'>No rows were detected — add them manually using the button below, or re-upload a clearer PDF.</p>"}
                 <button type="button" onclick="addBlankRow()" class="w-full bg-white hover:bg-slate-50 border border-dashed border-slate-300 text-slate-500 font-bold py-3 rounded-2xl text-sm transition">+ Add a Row Manually</button>
                 <div class="flex gap-3 sticky bottom-4">
-                    <button type="submit" class="flex-1 bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-3.5 rounded-xl text-sm transition shadow-lg">✅ Approve &amp; Publish to Schools</button>
+                    <button type="submit" class="flex-1 bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-3.5 rounded-xl text-sm transition shadow-lg">💾 Save Changes</button>
                 </div>
             </form>
         </div>
@@ -539,9 +549,11 @@ def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
 
 @router.post("/api/v1/superadmin/schemes/publish/{master_id}")
 async def schemes_publish(master_id: int, request: Request):
-    """Saves the (human-reviewed and corrected) rows as the final master
-    content, replacing whatever the initial parse produced, and marks the
-    scheme published — visible to schools from this point on."""
+    """Saves the (reviewed and corrected) rows as the current master
+    content, replacing whatever was there before. The scheme was already
+    published at upload time — this just updates its content, it doesn't
+    gate visibility. Harmless to re-run repeatedly; published_at simply
+    reflects the most recent edit."""
     auth_error = require_superadmin_session(request)
     if auth_error:
         return auth_error
@@ -661,7 +673,10 @@ def schemes_master_list(request: Request):
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Master Schemes</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-[#F7F9F8] min-h-screen">
         <header class="bg-white border-b px-6 sm:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-base font-bold text-slate-900">📘 Master Schemes of Work</h1>
+            <div>
+                <a href="/superadmin/dashboard" class="text-slate-400 hover:text-slate-600 text-xs font-bold block mb-1">← Back to Super Admin Portal</a>
+                <h1 class="text-base font-bold text-slate-900">📘 Master Schemes of Work</h1>
+            </div>
             <a href="/superadmin/schemes/upload" class="bg-indigo-800 hover:bg-indigo-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">+ Upload New</a>
         </header>
         <div class="p-4 sm:p-8 max-w-3xl mx-auto space-y-3">
@@ -716,6 +731,7 @@ def schemes_available_for_school(school_id: int, request: Request):
     <body class="bg-[#F7F9F8] min-h-screen">
         <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
             <div>
+                <a href="/schemes/manage/{school_id}" class="text-slate-400 hover:text-slate-600 text-xs font-bold block mb-1">← Back to Manage Schemes</a>
                 <h1 class="text-base font-bold text-slate-900">📘 Schemes of Work — {esc(school['name']) if school else ''}</h1>
                 <p class="text-xs text-slate-400">Master schemes published by Elimu Hub, ready to import for your school.</p>
             </div>
@@ -762,7 +778,9 @@ def schemes_import_form(school_id: int, master_id: int, request: Request):
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Import Scheme</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
-        <div class="max-w-lg mx-auto bg-white p-6 rounded-2xl border shadow-xs">
+        <div class="max-w-lg mx-auto space-y-4">
+            <a href="/schemes/available/{school_id}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Available Schemes</a>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">Import: {esc(master['subject_name'])} — {esc(master['grade_name'])}</h2>
             <p class="text-xs text-slate-400 mb-4">This creates your school's own copy — customizing it later never affects the master template.</p>
             <form action="/api/v1/schemes/import/{school_id}/{master_id}" method="post" class="space-y-3">
@@ -778,6 +796,7 @@ def schemes_import_form(school_id: int, master_id: int, request: Request):
                 </div>
                 <button type="submit" class="w-full bg-indigo-800 hover:bg-indigo-900 text-white font-bold py-3 rounded-xl text-sm transition">Import This Scheme</button>
             </form>
+            </div>
         </div>
     </body>
     </html>
@@ -845,14 +864,20 @@ def schemes_manage_school(school_id: int, request: Request):
             cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'staff' AND is_verified = TRUE ORDER BY full_name NULLS LAST, email ASC;", (school_id,))
             staff_members = cur.fetchall()
 
-    rows_html = ""
+    # Grouped School → Term → Grade/Class → Scheme(s), per the requested
+    # reorganization — a flat list stops being usable once a school has
+    # imported schemes across multiple terms and grades.
+    by_term = {}
     for c in copies:
+        by_term.setdefault(c['term'], {}).setdefault(c['grade_name'], []).append(c)
+
+    def _scheme_card(c):
         staff_options = "".join(f"<option value='{s['id']}' {'selected' if s['id'] == c['teacher_user_id'] else ''}>{esc(s['full_name'] or s['email'])}</option>" for s in staff_members)
-        rows_html += f"""
+        return f"""
         <div class="bg-white rounded-2xl border shadow-xs p-4 flex items-center justify-between flex-wrap gap-3">
             <div>
-                <h3 class="text-sm font-bold text-slate-800">{esc(c['subject_name'])} — {esc(c['grade_name'])} {esc(c['stream']) if c['stream'] != 'ALL' else ''}</h3>
-                <p class="text-xs text-slate-400">{esc(c['term'])} {c['year']}</p>
+                <h3 class="text-sm font-bold text-slate-800">{esc(c['subject_name'])} {esc(c['stream']) if c['stream'] != 'ALL' else ''}</h3>
+                <p class="text-xs text-slate-400">{c['year']}</p>
             </div>
             <form action="/api/v1/schemes/assign/{school_id}/{c['id']}" method="post" class="flex items-center gap-2">
                 <select name="teacher_user_id" class="border p-2 rounded-lg text-xs bg-white">
@@ -864,6 +889,24 @@ def schemes_manage_school(school_id: int, request: Request):
         </div>
         """
 
+    sections_html = ""
+    for term in sorted(by_term.keys()):
+        grades_html = ""
+        for grade_name in sorted(by_term[term].keys()):
+            cards_html = "".join(_scheme_card(c) for c in by_term[term][grade_name])
+            grades_html += f"""
+            <div class="mb-4">
+                <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2 pl-1">{esc(grade_name)}</h3>
+                <div class="space-y-2">{cards_html}</div>
+            </div>
+            """
+        sections_html += f"""
+        <div class="mb-8">
+            <h2 class="text-sm font-black text-slate-700 mb-3 pb-2 border-b-2 border-indigo-100">📅 {esc(term)}</h2>
+            {grades_html}
+        </div>
+        """
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -871,13 +914,14 @@ def schemes_manage_school(school_id: int, request: Request):
     <body class="bg-[#F7F9F8] min-h-screen">
         <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
             <div>
+                <a href="/admin/dashboard/{school_id}" class="text-slate-400 hover:text-slate-600 text-xs font-bold block mb-1">← Back to Dashboard</a>
                 <h1 class="text-base font-bold text-slate-900">📋 Manage Schemes — {esc(school['name']) if school else ''}</h1>
-                <p class="text-xs text-slate-400">Imported schemes and who they're assigned to.</p>
+                <p class="text-xs text-slate-400">Imported schemes, organized by term and grade.</p>
             </div>
             <a href="/schemes/available/{school_id}" class="bg-indigo-800 hover:bg-indigo-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">+ Import More</a>
         </header>
-        <div class="p-4 sm:p-8 max-w-3xl mx-auto space-y-3">
-            {rows_html or "<p class='text-slate-400 text-sm italic text-center py-8'>No schemes imported yet.</p>"}
+        <div class="p-4 sm:p-8 max-w-3xl mx-auto">
+            {sections_html or "<p class='text-slate-400 text-sm italic text-center py-8'>No schemes imported yet.</p>"}
         </div>
     </body>
     </html>
@@ -925,15 +969,41 @@ def my_schemes_list(school_id: int, request: Request):
             """, (school_id, user_id))
             my_schemes = cur.fetchall()
 
-    rows_html = "".join(f"""
+    # Grouped by Term → Grade, consistent with the admin's Manage Schemes
+    # page — most teachers only have a handful of schemes, but grouping
+    # still helps once a teacher has schemes across multiple terms.
+    by_term = {}
+    for s in my_schemes:
+        by_term.setdefault(s['term'], {}).setdefault(s['grade_name'], []).append(s)
+
+    def _scheme_card(s):
+        return f"""
         <a href="/schemes/edit/{school_id}/{s['id']}" class="bg-white rounded-2xl border shadow-xs p-4 flex items-center justify-between flex-wrap gap-2 hover:shadow-md transition-shadow block">
             <div>
-                <h3 class="text-sm font-bold text-slate-800">{esc(s['subject_name'])} — {esc(s['grade_name'])} {esc(s['stream']) if s['stream'] != 'ALL' else ''}</h3>
-                <p class="text-xs text-slate-400">{esc(s['term'])} {s['year']} — {s['row_count']} lesson(s)</p>
+                <h3 class="text-sm font-bold text-slate-800">{esc(s['subject_name'])} {esc(s['stream']) if s['stream'] != 'ALL' else ''}</h3>
+                <p class="text-xs text-slate-400">{s['year']} — {s['row_count']} lesson(s)</p>
             </div>
             <span class="text-xs text-indigo-700 font-bold">Open →</span>
         </a>
-    """ for s in my_schemes)
+        """
+
+    sections_html = ""
+    for term in sorted(by_term.keys()):
+        grades_html = ""
+        for grade_name in sorted(by_term[term].keys()):
+            cards_html = "".join(_scheme_card(s) for s in by_term[term][grade_name])
+            grades_html += f"""
+            <div class="mb-4">
+                <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2 pl-1">{esc(grade_name)}</h3>
+                <div class="space-y-2">{cards_html}</div>
+            </div>
+            """
+        sections_html += f"""
+        <div class="mb-8">
+            <h2 class="text-sm font-black text-slate-700 mb-3 pb-2 border-b-2 border-indigo-100">📅 {esc(term)}</h2>
+            {grades_html}
+        </div>
+        """
 
     return f"""
     <!DOCTYPE html>
@@ -941,11 +1011,12 @@ def my_schemes_list(school_id: int, request: Request):
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | My Schemes of Work</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-[#F7F9F8] min-h-screen">
         <header class="bg-white border-b px-6 sm:px-8 py-4">
+            <a href="{get_dashboard_url(request, school_id)}" class="text-slate-400 hover:text-slate-600 text-xs font-bold block mb-1">← Back to Dashboard</a>
             <h1 class="text-base font-bold text-slate-900">📘 My Schemes of Work — {esc(school['name']) if school else ''}</h1>
             <p class="text-xs text-slate-400">Schemes assigned to you — open one to review, customize, or print it.</p>
         </header>
-        <div class="p-4 sm:p-8 max-w-3xl mx-auto space-y-3">
-            {rows_html or "<p class='text-slate-400 text-sm italic text-center py-8'>No schemes assigned to you yet — ask your admin to assign one.</p>"}
+        <div class="p-4 sm:p-8 max-w-3xl mx-auto">
+            {sections_html or "<p class='text-slate-400 text-sm italic text-center py-8'>No schemes assigned to you yet — ask your admin to assign one.</p>"}
         </div>
     </body>
     </html>
@@ -990,12 +1061,17 @@ def scheme_copy_editor(school_id: int, copy_id: int, request: Request, saved: st
 
     rows_html = "".join(_row_block(r, i) for i, r in enumerate(rows))
 
+    viewer = get_current_session_user(request)
+    back_url = f"/schemes/manage/{school_id}" if viewer and viewer['role'] != 'staff' else f"/schemes/my-schemes/{school_id}"
+    back_label = "Manage Schemes" if viewer and viewer['role'] != 'staff' else "My Schemes of Work"
+
     return f"""
     <!DOCTYPE html>
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | {esc(copy['subject_name'])} Scheme</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-5xl mx-auto space-y-4">
+            <a href="{back_url}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to {esc(back_label)}</a>
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <div class="flex items-center justify-between flex-wrap gap-2">
                     <h2 class="text-lg font-black text-slate-800">{esc(copy['subject_name'])} — {esc(copy['grade_name'])} {esc(copy['stream']) if copy['stream'] != 'ALL' else ''} ({esc(copy['term'])} {copy['year']})</h2>
