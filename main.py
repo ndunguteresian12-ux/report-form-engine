@@ -12,7 +12,7 @@ import requests as http_requests
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from supabase import create_client
 from dotenv import load_dotenv
@@ -224,6 +224,163 @@ async def add_security_headers(request: Request, call_next):
     if request.url.scheme == "https":
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
+
+
+# ============================================================
+# Guided Help Widget — a free, self-contained "?" button that appears on
+# every page via middleware (below), showing contextual help for whatever
+# page the user is currently on. No external API, no ongoing cost, no
+# per-page code changes needed anywhere else in the app.
+# ============================================================
+HELP_WIDGET_HTML = r"""
+<div id="elimu-help-root" style="position:fixed;bottom:20px;right:20px;z-index:99999;font-family:Arial,sans-serif;">
+    <button id="elimu-help-btn" onclick="document.getElementById('elimu-help-panel').style.display='flex';this.style.display='none';"
+        style="width:52px;height:52px;border-radius:50%;background:#4f46e5;color:white;border:none;font-size:24px;font-weight:bold;
+               cursor:pointer;box-shadow:0 4px 14px rgba(79,70,229,0.4);display:flex;align-items:center;justify-content:center;">?</button>
+    <div id="elimu-help-panel" style="display:none;flex-direction:column;position:absolute;bottom:0;right:0;width:320px;max-height:70vh;
+         background:white;border-radius:16px;box-shadow:0 10px 40px rgba(0,0,0,0.25);overflow:hidden;border:1px solid #e2e8f0;">
+        <div style="background:#4f46e5;color:white;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-weight:bold;font-size:14px;">💡 Guide</span>
+            <button onclick="document.getElementById('elimu-help-panel').style.display='none';document.getElementById('elimu-help-btn').style.display='flex';"
+                style="background:none;border:none;color:white;font-size:20px;cursor:pointer;line-height:1;">×</button>
+        </div>
+        <div id="elimu-help-body" style="padding:16px;overflow-y:auto;font-size:13px;line-height:1.6;color:#334155;flex:1;"></div>
+    </div>
+</div>
+<script>
+(function() {
+    // Matched by checking if the current URL path CONTAINS each key —
+    // robust to dynamic segments like school IDs (e.g. /admin/dashboard/4)
+    // without needing exact-match routing logic duplicated here.
+    var HELP_CONTENT = {
+        "/admin/dashboard": {
+            title: "Admin Dashboard",
+            body: "This is your school's main control center. Use the header buttons to reach Finance, Timetable, Schemes of Work, and Class Teachers. The checklist (if shown) highlights anything still worth setting up."
+        },
+        "/staff/dashboard": {
+            title: "Staff Portal",
+            body: "Your personal workspace as a teacher. From here you can enter marks, view your timetable, collect fees (if enabled), and open any Schemes of Work assigned to you."
+        },
+        "/timetable/dashboard": {
+            title: "Timetable Workspace",
+            body: "Classes are grouped by education level. Use <b>Test & Generate Level</b> or <b>Test & Generate WHOLE SCHOOL</b> to auto-build timetables — generating a whole level or the whole school together (not one class at a time) is what correctly avoids double-booking a teacher across classes."
+        },
+        "/timetable/grade": {
+            title: "Class Timetable",
+            body: "View and manually adjust this class's schedule. Click any cell to change what's taught there. Use Print to get a clean, printable copy."
+        },
+        "/timetable/collision-check": {
+            title: "Collision Checker",
+            body: "Scans every already-generated slot for a teacher double-booked across two classes at the same time. Green means clean — nothing to fix."
+        },
+        "/timetable/teacher-workload": {
+            title: "Teacher Workload",
+            body: "Shows each teacher's total lessons/week against how many periods actually exist. A teacher shown in red has been assigned more than physically fits in the week — reduce a subject's lessons or reassign a class to fix it."
+        },
+        "/finance/dashboard": {
+            title: "Finance Dashboard",
+            body: "Overview of fees expected, collected, and outstanding. Set up Fee Categories and Fee Structure first if amounts look wrong or missing."
+        },
+        "/finance/staff/collect": {
+            title: "Collect Fees",
+            body: "Search for a student by name, or browse a whole class by fee category to see who still owes. Click a student to record a payment."
+        },
+        "/finance/categories": {
+            title: "Fee Categories",
+            body: "Add categories here (e.g. Transport, Activity Fees) beyond the default School Fees. Each one can have its own amount per grade under Fee Structure."
+        },
+        "/schemes/manage": {
+            title: "Manage Schemes of Work",
+            body: "Schemes imported from Elimu Hub's master library, organized by term and grade. Assign each one to the teacher who'll use it, or open it to edit directly."
+        },
+        "/schemes/my-schemes": {
+            title: "My Schemes of Work",
+            body: "Schemes assigned to you. Open one to review, edit any field freely, or print a clean copy with your name and TSC number filled in."
+        },
+        "/schemes/available": {
+            title: "Available Schemes",
+            body: "Master schemes published by Elimu Hub. Click Import to bring one into your school — this creates your own editable copy, without changing the master."
+        },
+        "/admin/class-teachers": {
+            title: "Class Teachers",
+            body: "Assign which staff member is the homeroom (class) teacher for each class — this name appears on report card signature lines."
+        },
+        "/admin/scores/manage": {
+            title: "Manage Scores",
+            body: "View and edit an individual student's marks for the currently active term. To change term or year, update it first in Settings."
+        },
+        "/admin/settings": {
+            title: "Settings",
+            body: "Set the school's currently active Year, Term, and Assessment Phase here before entering any marks — every mark saved gets tagged with whatever is set here at that moment, so double-check it's correct first."
+        },
+        "/superadmin/dashboard": {
+            title: "Super Admin Portal",
+            body: "Platform-wide control: manage every school, post announcements, trigger backups, and upload master Schemes of Work for all schools to use."
+        },
+        "/superadmin/schemes": {
+            title: "Master Schemes of Work",
+            body: "Upload a PDF here — it's parsed automatically and published immediately. Review the parsed rows for accuracy; the parser is best-effort, not guaranteed perfect."
+        }
+    };
+    var DEFAULT_HELP = {
+        title: "Elimu Hub",
+        body: "Click around — most pages have clear labels and confirmation prompts before anything destructive happens. If you're stuck, check with your school admin or look for a Back link to return to a page you know."
+    };
+
+    var path = window.location.pathname;
+    var match = DEFAULT_HELP;
+    for (var key in HELP_CONTENT) {
+        if (path.indexOf(key) !== -1) { match = HELP_CONTENT[key]; break; }
+    }
+    var bodyEl = document.getElementById('elimu-help-body');
+    if (bodyEl) {
+        bodyEl.innerHTML = '<h3 style="margin:0 0 8px;font-size:14px;color:#1e293b;">' + match.title + '</h3><p style="margin:0;">' + match.body + '</p>';
+    }
+})();
+</script>
+"""
+
+
+def _inject_help_widget(html: str) -> str:
+    """Inserts the help widget right before </body> — returns the HTML
+    unchanged if there's no </body> tag to anchor on (e.g. a fragment,
+    not a full page)."""
+    if "</body>" in html:
+        return html.replace("</body>", HELP_WIDGET_HTML + "</body>", 1)
+    return html
+
+
+@app.middleware("http")
+async def inject_help_widget_middleware(request: Request, call_next):
+    response = await call_next(request)
+
+    # Only ever touch genuine HTML page responses — every API/JSON/
+    # redirect/file/binary response passes through completely untouched.
+    content_type = response.headers.get("content-type", "")
+    if "text/html" not in content_type:
+        return response
+
+    body_chunks = [chunk async for chunk in response.body_iterator]
+    body = b"".join(body_chunks)
+
+    try:
+        html = body.decode("utf-8")
+    except UnicodeDecodeError:
+        # Not actually decodable text despite the content-type — pass
+        # through completely unchanged rather than risk corrupting it.
+        return Response(content=body, status_code=response.status_code, headers=dict(response.headers), media_type=response.media_type)
+
+    new_html = _inject_help_widget(html)
+    new_body = new_html.encode("utf-8")
+
+    headers = dict(response.headers)
+    # Must be recalculated to match the new body size, or browsers can
+    # truncate the page waiting for bytes that were promised but never
+    # arrive, since the original content-length no longer matches.
+    headers["content-length"] = str(len(new_body))
+
+    return Response(content=new_body, status_code=response.status_code, headers=headers, media_type=response.media_type)
+
 
 def _branded_error_page(status_code: int, message: str) -> HTMLResponse:
     return HTMLResponse(status_code=status_code, content=f"""
