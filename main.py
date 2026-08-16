@@ -353,11 +353,11 @@ HELP_WIDGET_HTML = r"""
 NAV_SIDEBAR_HTML = r"""
 <div id="elimu-nav-root" style="font-family:Arial,sans-serif;">
     <button id="elimu-nav-btn" onclick="document.getElementById('elimu-nav-panel').style.transform='translateX(0)';document.getElementById('elimu-nav-backdrop').style.display='block';"
-        style="position:fixed;top:16px;left:16px;z-index:99998;width:42px;height:42px;border-radius:10px;background:white;border:1px solid #e2e8f0;
-               box-shadow:0 2px 10px rgba(0,0,0,0.1);cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;">
-        <span style="width:18px;height:2px;background:#334155;border-radius:1px;"></span>
-        <span style="width:18px;height:2px;background:#334155;border-radius:1px;"></span>
-        <span style="width:18px;height:2px;background:#334155;border-radius:1px;"></span>
+        style="position:fixed;bottom:20px;left:20px;z-index:99998;width:52px;height:52px;border-radius:50%;background:white;border:1px solid #e2e8f0;
+               box-shadow:0 4px 14px rgba(0,0,0,0.15);cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;">
+        <span style="width:20px;height:2px;background:#334155;border-radius:1px;"></span>
+        <span style="width:20px;height:2px;background:#334155;border-radius:1px;"></span>
+        <span style="width:20px;height:2px;background:#334155;border-radius:1px;"></span>
     </button>
     <div id="elimu-nav-backdrop" onclick="document.getElementById('elimu-nav-panel').style.transform='translateX(-100%)';this.style.display='none';"
         style="display:none;position:fixed;inset:0;background:rgba(15,23,42,0.4);z-index:99998;"></div>
@@ -422,17 +422,56 @@ NAV_SIDEBAR_HTML = r"""
 """
 
 
+# ============================================================
+# Loading States — disables the submit button and shows a spinner the
+# instant any form is genuinely submitted, preventing accidental double-
+# submission. Deliberately skips two cases, both verified with real DOM
+# event testing before writing this: a form whose submission was
+# cancelled (e.g. the user clicked "Cancel" on a confirm() dialog — the
+# button must NOT get stuck disabled forever), and a form that opens in
+# a new tab via target="_blank" — the original page never reloads in
+# that case, so a disabled button there would also never re-enable.
+# ============================================================
+LOADING_STATES_SCRIPT = r"""
+<script>
+(function() {
+    var style = document.createElement('style');
+    style.textContent = '@keyframes elimuSpin { to { transform: rotate(360deg); } } .elimu-spinner { display:inline-block; width:12px; height:12px; border:2px solid rgba(255,255,255,0.45); border-top-color:#fff; border-radius:50%; animation: elimuSpin 0.6s linear infinite; vertical-align:-2px; margin-right:6px; }';
+    document.head.appendChild(style);
+
+    document.addEventListener('submit', function(e) {
+        if (e.defaultPrevented) return; // cancelled — e.g. a confirm() dialog was declined
+        var form = e.target;
+        if (!form || form.tagName !== 'FORM') return;
+        if (form.target === '_blank') return; // original page never reloads — would stay stuck disabled
+
+        var buttons = form.querySelectorAll('button:not([type]), button[type="submit"], input[type="submit"]');
+        buttons.forEach(function(btn) {
+            if (btn.disabled) return;
+            btn.disabled = true;
+            btn.style.opacity = '0.65';
+            btn.style.cursor = 'wait';
+            if (btn.tagName === 'BUTTON') {
+                btn.innerHTML = '<span class="elimu-spinner"></span>' + btn.innerHTML;
+            }
+        });
+    }, false);
+})();
+</script>
+"""
+
+
 def _inject_help_widget(html: str) -> str:
-    """Inserts the help widget, nav sidebar, and (only if one isn't
-    already present) a toast container, right before </body>. Checking
-    for an existing toast-container first avoids a duplicate element on
-    the handful of pages that already include one manually. Returns the
-    HTML unchanged if there's no </body> tag to anchor on (e.g. a
-    fragment, not a full page)."""
+    """Inserts the help widget, nav sidebar, loading-states script, and
+    (only if one isn't already present) a toast container, right before
+    </body>. Checking for an existing toast-container first avoids a
+    duplicate element on the handful of pages that already include one
+    manually. Returns the HTML unchanged if there's no </body> tag to
+    anchor on (e.g. a fragment, not a full page)."""
     if "</body>" not in html:
         return html
 
-    injected = HELP_WIDGET_HTML + NAV_SIDEBAR_HTML
+    injected = HELP_WIDGET_HTML + NAV_SIDEBAR_HTML + LOADING_STATES_SCRIPT
     if 'id="toast-container"' not in html:
         injected += TOAST_CONTAINER_HTML
 
