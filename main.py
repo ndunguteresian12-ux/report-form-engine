@@ -390,7 +390,7 @@ NAV_SIDEBAR_HTML = r"""
             ['🏠', 'Dashboard', '/staff/dashboard/' + sid],
             ['📘', 'My Schemes of Work', '/schemes/my-schemes/' + sid],
             ['💰', 'Collect Fees', '/finance/staff/collect/' + sid],
-            ['📅', 'Timetable', '/timetable/dashboard/' + sid]
+            ['📅', 'My Timetable', '/timetable/teachers/' + sid]
         ];
     } else if (sid) {
         links = [
@@ -2807,7 +2807,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
             <div class="flex items-center space-x-3 text-xs font-semibold">
                 <span class="bg-indigo-50 text-indigo-700 border border-indigo-100 px-3 py-2 rounded-xl">Staff Portal</span>
                 <span class="bg-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
-                <a href="/timetable/dashboard/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 Timetable</a>
+                <a href="/timetable/teachers/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 My Timetable</a>
                 <a href="/finance/staff/collect/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-3 py-2 rounded-xl transition">💰 Collect Fees</a>
                 <a href="/schemes/my-schemes/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📘 My Schemes of Work</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>

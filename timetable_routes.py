@@ -38,6 +38,7 @@ from shared import (
     sort_subjects_for_display,
     abbreviate_subject,
     full_student_name,
+    get_current_session_user,
 )
 
 router = APIRouter()
@@ -1047,6 +1048,15 @@ def teacher_timetable_picker(school_id: int, request: Request):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
+
+    # Staff go straight to their own schedule — they can't view anyone
+    # else's now anyway (enforced server-side in print_teacher_timetable),
+    # so showing them a picker full of names they can't actually open
+    # would just be a confusing dead end. Admin/superadmin still get the
+    # full picker, since they legitimately manage every teacher's schedule.
+    viewer = get_current_session_user(request)
+    if viewer and viewer['role'] == 'staff':
+        return RedirectResponse(url=f"/timetable/print/teacher/{school_id}/{viewer['id']}", status_code=303)
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -3707,6 +3717,14 @@ def print_teacher_timetable(school_id: int, teacher_id: int, request: Request):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
+
+    # Staff may only ever view their own schedule — never another
+    # teacher's, even by guessing/editing the teacher_id in the URL.
+    # Admin and superadmin keep full visibility, since they legitimately
+    # need to check any teacher's timetable for management purposes.
+    viewer = get_current_session_user(request)
+    if viewer and viewer['role'] == 'staff' and viewer['id'] != teacher_id:
+        raise HTTPException(status_code=403, detail="Access Denied: You can only view your own timetable.")
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
