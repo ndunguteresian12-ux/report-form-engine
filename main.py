@@ -766,6 +766,14 @@ def bootstrap_database_schema():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_students_school_status ON students (school_id, status);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_area_cycle ON student_scores (learning_area_id, cycle_name);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_users_school_role ON users (school_id, role);")
+            # Every report card, marks entry, and merit list query now
+            # filters by term/year (added when the term/year scoping fix
+            # was deployed) — without this, those queries fall back to a
+            # full table scan, and this table only grows over time since
+            # each term's marks now get their own rows instead of
+            # overwriting the previous term's.
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_term_year_student ON student_scores (term, year, student_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_paper_scores_term_year_student ON paper_based_scores (term, year, student_id);")
 
             conn.commit()
             logger.info("Database initialized successfully.")
