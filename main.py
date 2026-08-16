@@ -233,6 +233,7 @@ async def add_security_headers(request: Request, call_next):
 # per-page code changes needed anywhere else in the app.
 # ============================================================
 HELP_WIDGET_HTML = r"""
+<style>@media print { #elimu-help-root, #elimu-nav-root, #toast-container { display: none !important; } }</style>
 <div id="elimu-help-root" style="position:fixed;bottom:20px;right:20px;z-index:99999;font-family:Arial,sans-serif;">
     <button id="elimu-help-btn" onclick="document.getElementById('elimu-help-panel').style.display='flex';this.style.display='none';"
         style="width:52px;height:52px;border-radius:50%;background:#4f46e5;color:white;border:none;font-size:24px;font-weight:bold;
@@ -341,13 +342,101 @@ HELP_WIDGET_HTML = r"""
 """
 
 
+# ============================================================
+# Global Nav Sidebar — a slide-out panel, triggered by a hamburger button
+# fixed at top-left on every page. Deliberately built to need ZERO extra
+# database queries per page load: which links to show (Admin/Staff/Super
+# Admin) and the school_id to build them with are both worked out
+# entirely from the current URL path, client-side in JS — nothing here
+# adds a single additional request to any page.
+# ============================================================
+NAV_SIDEBAR_HTML = r"""
+<div id="elimu-nav-root" style="font-family:Arial,sans-serif;">
+    <button id="elimu-nav-btn" onclick="document.getElementById('elimu-nav-panel').style.transform='translateX(0)';document.getElementById('elimu-nav-backdrop').style.display='block';"
+        style="position:fixed;top:16px;left:16px;z-index:99998;width:42px;height:42px;border-radius:10px;background:white;border:1px solid #e2e8f0;
+               box-shadow:0 2px 10px rgba(0,0,0,0.1);cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;">
+        <span style="width:18px;height:2px;background:#334155;border-radius:1px;"></span>
+        <span style="width:18px;height:2px;background:#334155;border-radius:1px;"></span>
+        <span style="width:18px;height:2px;background:#334155;border-radius:1px;"></span>
+    </button>
+    <div id="elimu-nav-backdrop" onclick="document.getElementById('elimu-nav-panel').style.transform='translateX(-100%)';this.style.display='none';"
+        style="display:none;position:fixed;inset:0;background:rgba(15,23,42,0.4);z-index:99998;"></div>
+    <div id="elimu-nav-panel" style="position:fixed;top:0;left:0;bottom:0;width:260px;background:white;z-index:99999;
+         transform:translateX(-100%);transition:transform 0.25s ease;box-shadow:4px 0 24px rgba(0,0,0,0.15);overflow-y:auto;">
+        <div style="padding:18px 16px;border-bottom:1px solid #f1f5f9;display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-weight:bold;font-size:15px;color:#1e293b;">📘 Elimu Hub</span>
+            <button onclick="document.getElementById('elimu-nav-panel').style.transform='translateX(-100%)';document.getElementById('elimu-nav-backdrop').style.display='none';"
+                style="background:none;border:none;font-size:20px;color:#94a3b8;cursor:pointer;">×</button>
+        </div>
+        <div id="elimu-nav-links" style="padding:8px;"></div>
+    </div>
+</div>
+<script>
+(function() {
+    var path = window.location.pathname;
+    // school_id is consistently the first numeric path segment across
+    // every route in this app (e.g. /admin/dashboard/4, /schemes/edit/4/12)
+    var idMatch = path.match(/\/(\d+)/);
+    var sid = idMatch ? idMatch[1] : '';
+
+    var links = [];
+    if (path.indexOf('/superadmin/') !== -1) {
+        links = [
+            ['🛡️', 'Super Admin Portal', '/superadmin/dashboard'],
+            ['📘', 'Master Schemes of Work', '/superadmin/schemes/list']
+        ];
+    } else if (path.indexOf('/staff/') !== -1 || path.indexOf('/finance/staff/') !== -1) {
+        links = [
+            ['🏠', 'Dashboard', '/staff/dashboard/' + sid],
+            ['📘', 'My Schemes of Work', '/schemes/my-schemes/' + sid],
+            ['💰', 'Collect Fees', '/finance/staff/collect/' + sid],
+            ['📅', 'Timetable', '/timetable/dashboard/' + sid]
+        ];
+    } else if (sid) {
+        links = [
+            ['🏠', 'Dashboard', '/admin/dashboard/' + sid],
+            ['💰', 'Finance', '/finance/dashboard/' + sid],
+            ['📅', 'Timetable', '/timetable/dashboard/' + sid],
+            ['📘', 'Schemes of Work', '/schemes/manage/' + sid],
+            ['🧑\u200d🏫', 'Class Teachers', '/admin/class-teachers/' + sid],
+            ['🔧', 'Fix Mistagged Marks', '/admin/fix-mistagged-marks/' + sid]
+        ];
+    }
+
+    var container = document.getElementById('elimu-nav-links');
+    if (container && links.length) {
+        links.forEach(function(l) {
+            var a = document.createElement('a');
+            a.href = l[2];
+            a.style.cssText = "display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:10px;color:#334155;text-decoration:none;font-size:13.5px;font-weight:600;margin-bottom:2px;";
+            a.onmouseover = function() { this.style.background = '#f1f5f9'; };
+            a.onmouseout = function() { this.style.background = 'transparent'; };
+            a.innerHTML = '<span style="font-size:16px;">' + l[0] + '</span>' + l[1];
+            container.appendChild(a);
+        });
+    } else if (container) {
+        container.innerHTML = '<p style="padding:12px;font-size:12.5px;color:#94a3b8;">Navigation isn\'t available on this page.</p>';
+    }
+})();
+</script>
+"""
+
+
 def _inject_help_widget(html: str) -> str:
-    """Inserts the help widget right before </body> — returns the HTML
-    unchanged if there's no </body> tag to anchor on (e.g. a fragment,
-    not a full page)."""
-    if "</body>" in html:
-        return html.replace("</body>", HELP_WIDGET_HTML + "</body>", 1)
-    return html
+    """Inserts the help widget, nav sidebar, and (only if one isn't
+    already present) a toast container, right before </body>. Checking
+    for an existing toast-container first avoids a duplicate element on
+    the handful of pages that already include one manually. Returns the
+    HTML unchanged if there's no </body> tag to anchor on (e.g. a
+    fragment, not a full page)."""
+    if "</body>" not in html:
+        return html
+
+    injected = HELP_WIDGET_HTML + NAV_SIDEBAR_HTML
+    if 'id="toast-container"' not in html:
+        injected += TOAST_CONTAINER_HTML
+
+    return html.replace("</body>", injected + "</body>", 1)
 
 
 @app.middleware("http")
