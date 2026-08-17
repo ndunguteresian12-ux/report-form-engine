@@ -927,19 +927,25 @@ def schemes_manage_school(school_id: int, request: Request):
 
     def _scheme_card(c):
         staff_options = "".join(f"<option value='{s['id']}' {'selected' if s['id'] == c['teacher_user_id'] else ''}>{esc(s['full_name'] or s['email'])}</option>" for s in staff_members)
+        confirm_msg = f"Remove {c['subject_name']} — {c['grade_name']} from your school? This deletes your school\\'s copy of this scheme permanently, including any edits made to it. This cannot be undone."
         return f"""
         <div class="bg-white rounded-2xl border shadow-xs p-4 flex items-center justify-between flex-wrap gap-3">
             <div>
                 <h3 class="text-sm font-bold text-slate-800">{esc(c['subject_name'])} {esc(c['stream']) if c['stream'] != 'ALL' else ''}</h3>
                 <p class="text-xs text-slate-400">{c['year']}</p>
             </div>
-            <form action="/api/v1/schemes/assign/{school_id}/{c['id']}" method="post" class="flex items-center gap-2">
-                <select name="teacher_user_id" class="border p-2 rounded-lg text-xs bg-white">
-                    <option value="">— Unassigned —</option>{staff_options}
-                </select>
-                <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white px-3 py-2 rounded-lg text-xs font-bold transition">Save</button>
-                <a href="/schemes/edit/{school_id}/{c['id']}" class="text-indigo-700 hover:underline text-xs font-bold ml-1">Edit →</a>
-            </form>
+            <div class="flex items-center gap-2">
+                <form action="/api/v1/schemes/assign/{school_id}/{c['id']}" method="post" class="flex items-center gap-2">
+                    <select name="teacher_user_id" class="border p-2 rounded-lg text-xs bg-white">
+                        <option value="">— Unassigned —</option>{staff_options}
+                    </select>
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white px-3 py-2 rounded-lg text-xs font-bold transition">Save</button>
+                    <a href="/schemes/edit/{school_id}/{c['id']}" class="text-indigo-700 hover:underline text-xs font-bold ml-1">Edit →</a>
+                </form>
+                <form action="/api/v1/schemes/delete-copy/{school_id}/{c['id']}" method="post" onsubmit="return confirm('{esc(confirm_msg)}');">
+                    <button type="submit" class="text-rose-500 hover:text-rose-700 text-xs font-bold">Remove</button>
+                </form>
+            </div>
         </div>
         """
 
@@ -980,6 +986,28 @@ def schemes_manage_school(school_id: int, request: Request):
     </body>
     </html>
     """
+
+
+@router.post("/api/v1/schemes/delete-copy/{school_id}/{copy_id}")
+def schemes_delete_copy(school_id: int, copy_id: int, request: Request):
+    """Deletes a school's own imported scheme copy. Independent of
+    whether the master template it originally came from still exists —
+    this is exactly what's needed for a copy that's become orphaned
+    (master deleted) or simply no longer wanted, neither of which the
+    super admin's master-level delete can address."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM scheme_copies WHERE id = %s AND school_id = %s;", (copy_id, school_id))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Scheme not found.")
+            cur.execute("DELETE FROM scheme_copies WHERE id = %s AND school_id = %s;", (copy_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/schemes/manage/{school_id}", status_code=303)
 
 
 @router.post("/api/v1/schemes/assign/{school_id}/{copy_id}")
