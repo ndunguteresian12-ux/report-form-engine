@@ -140,6 +140,42 @@ def bootstrap_schemes_schema():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_scheme_copies_teacher ON scheme_copies (teacher_user_id);")
             conn.commit()
 
+    # Every published master gets auto-copied to every school that doesn't
+    # already have one — no admin import required, per explicit product
+    # decision. Idempotent (WHERE NOT EXISTS), so running this on every
+    # startup is what safely backfills any master a school is missing —
+    # including retroactively for schemes published before this existed,
+    # and automatically for schools that register after a master already
+    # exists. Verified directly against a real Postgres instance before
+    # shipping: correctly skips schools that already have a copy (e.g.
+    # one manually imported earlier), correctly leaves that existing
+    # copy's rows untouched, and correctly creates+populates new copies
+    # for everyone else.
+    auto_copy_published_masters_to_all_schools()
+
+
+def auto_copy_published_masters_to_all_schools():
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                WITH new_copies AS (
+                    INSERT INTO scheme_copies (school_id, master_id, subject_name, grade_name, education_level, stream, term, year)
+                    SELECT s.id, m.id, m.subject_name, m.grade_name, m.education_level, 'ALL', m.term, m.year
+                    FROM schools s
+                    CROSS JOIN scheme_masters m
+                    WHERE m.parse_review_status = 'published'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM scheme_copies sc WHERE sc.school_id = s.id AND sc.master_id = m.id
+                      )
+                    RETURNING id, master_id
+                )
+                INSERT INTO scheme_copy_rows (copy_id, sort_order, week_number, lesson_number, strand, sub_strand, learning_outcomes, learning_experiences, key_inquiry_questions, learning_resources, assessment_methods, reflection)
+                SELECT nc.id, mr.sort_order, mr.week_number, mr.lesson_number, mr.strand, mr.sub_strand, mr.learning_outcomes, mr.learning_experiences, mr.key_inquiry_questions, mr.learning_resources, mr.assessment_methods, mr.reflection
+                FROM new_copies nc
+                JOIN scheme_master_rows mr ON mr.master_id = nc.master_id;
+            """)
+            conn.commit()
+
 
 SCHEME_ROW_FIELDS = [
     "week_number", "lesson_number", "strand", "sub_strand",
@@ -464,6 +500,13 @@ async def schemes_upload_process(
                 ))
             conn.commit()
 
+    # Immediately propagate to every school — no admin import required.
+    # The bootstrap-time call handles retroactive backfill and new
+    # schools registering later; this call is what makes a freshly
+    # uploaded scheme visible school-wide right away, not just on the
+    # next restart.
+    auto_copy_published_masters_to_all_schools()
+
     warning_param = urllib.parse.quote("|".join(parse_warnings)) if parse_warnings else ""
     return RedirectResponse(url=f"/superadmin/schemes/review/{master_id}?warnings={warning_param}", status_code=303)
 
@@ -644,6 +687,11 @@ async def schemes_publish(master_id: int, request: Request):
 
             cur.execute("UPDATE scheme_masters SET parse_review_status = 'published', published_at = NOW() WHERE id = %s;", (master_id,))
             conn.commit()
+
+    # Safety net — cheap no-op if every school already has a copy, but
+    # catches any school that was somehow missed (e.g. a very recent
+    # registration racing the original upload's own auto-copy call).
+    auto_copy_published_masters_to_all_schools()
 
     return RedirectResponse(url="/superadmin/schemes/list", status_code=303)
 
@@ -1046,9 +1094,9 @@ def my_schemes_list(school_id: int, request: Request):
             cur.execute("""
                 SELECT c.*, (SELECT COUNT(*) FROM scheme_copy_rows r WHERE r.copy_id = c.id) AS row_count
                 FROM scheme_copies c
-                WHERE c.school_id = %s AND c.teacher_user_id = %s
+                WHERE c.school_id = %s
                 ORDER BY c.grade_name ASC, c.subject_name ASC;
-            """, (school_id, user_id))
+            """, (school_id,))
             my_schemes = cur.fetchall()
 
     # Grouped by Term → Grade, consistent with the admin's Manage Schemes
@@ -1059,10 +1107,12 @@ def my_schemes_list(school_id: int, request: Request):
         by_term.setdefault(s['term'], {}).setdefault(s['grade_name'], []).append(s)
 
     def _scheme_card(s):
+        is_assigned_to_me = str(s['teacher_user_id']) == str(user_id)
+        badge = "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200'>Assigned to you</span>" if is_assigned_to_me else ""
         return f"""
         <a href="/schemes/edit/{school_id}/{s['id']}" class="bg-white rounded-2xl border shadow-xs p-4 flex items-center justify-between flex-wrap gap-2 hover:shadow-md transition-shadow block">
             <div>
-                <h3 class="text-sm font-bold text-slate-800">{esc(s['subject_name'])} {esc(s['stream']) if s['stream'] != 'ALL' else ''}</h3>
+                <h3 class="text-sm font-bold text-slate-800">{esc(s['subject_name'])} {esc(s['stream']) if s['stream'] != 'ALL' else ''} {badge}</h3>
                 <p class="text-xs text-slate-400">{s['year']} — {s['row_count']} lesson(s)</p>
             </div>
             <span class="text-xs text-indigo-700 font-bold">Open →</span>
@@ -1095,10 +1145,10 @@ def my_schemes_list(school_id: int, request: Request):
         <header class="bg-white border-b px-6 sm:px-8 py-4">
             <a href="{get_dashboard_url(request, school_id)}" class="text-slate-400 hover:text-slate-600 text-xs font-bold block mb-1">← Back to Dashboard</a>
             <h1 class="text-base font-bold text-slate-900">📘 My Schemes of Work — {esc(school['name']) if school else ''}</h1>
-            <p class="text-xs text-slate-400">Schemes assigned to you — open one to review, customize, or print it.</p>
+            <p class="text-xs text-slate-400">Every scheme available at your school — open one to review, customize, or print it. Ones assigned specifically to you are marked below.</p>
         </header>
         <div class="p-4 sm:p-8 max-w-3xl mx-auto">
-            {sections_html or "<p class='text-slate-400 text-sm italic text-center py-8'>No schemes assigned to you yet — ask your admin to assign one.</p>"}
+            {sections_html or "<p class='text-slate-400 text-sm italic text-center py-8'>No schemes have been uploaded for your school's grades yet.</p>"}
         </div>
     </body>
     </html>
