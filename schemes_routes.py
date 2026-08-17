@@ -29,7 +29,7 @@ import re
 import logging
 import urllib.parse
 from fastapi import APIRouter, Request, HTTPException, Form, UploadFile, File
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from shared import (
@@ -72,6 +72,13 @@ def bootstrap_schemes_schema():
                     published_at TIMESTAMP
                 );
             """)
+            # The original uploaded PDF, stored directly rather than
+            # depending on Supabase Storage being configured — parsing
+            # can miss content on some document layouts, and having the
+            # real source right there to reference (not just a filename)
+            # is what makes filling in the gaps during review actually
+            # fast and trustworthy, rather than a guessing game.
+            cur.execute("ALTER TABLE scheme_masters ADD COLUMN IF NOT EXISTS source_pdf_data BYTEA;")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS scheme_master_rows (
                     id SERIAL PRIMARY KEY,
@@ -441,9 +448,9 @@ async def schemes_upload_process(
             # right below) is still there to check and fix content, but
             # it's a convenience, not a gate.
             cur.execute("""
-                INSERT INTO scheme_masters (subject_name, grade_name, education_level, term, year, title, source_pdf_filename, parse_review_status, created_by_user_id, published_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'published', %s, NOW()) RETURNING id;
-            """, (subject_name.strip(), grade_name.strip(), education_level, term, year, f"{subject_name.strip()} — {grade_name.strip()}", pdf_file.filename, recorded_by))
+                INSERT INTO scheme_masters (subject_name, grade_name, education_level, term, year, title, source_pdf_filename, source_pdf_data, parse_review_status, created_by_user_id, published_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'published', %s, NOW()) RETURNING id;
+            """, (subject_name.strip(), grade_name.strip(), education_level, term, year, f"{subject_name.strip()} — {grade_name.strip()}", pdf_file.filename, contents, recorded_by))
             master_id = cur.fetchone()[0]
 
             for i, row in enumerate(parsed_rows):
@@ -461,6 +468,31 @@ async def schemes_upload_process(
     return RedirectResponse(url=f"/superadmin/schemes/review/{master_id}?warnings={warning_param}", status_code=303)
 
 
+@router.get("/superadmin/schemes/pdf/{master_id}")
+def schemes_view_source_pdf(master_id: int, request: Request):
+    """Serves the original uploaded PDF's raw bytes, for embedding
+    directly on the review page — so whoever is fixing up whatever the
+    parser missed can see the real source right there, rather than
+    needing to dig up their own copy of the file separately."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT source_pdf_data, source_pdf_filename FROM scheme_masters WHERE id = %s;", (master_id,))
+            row = cur.fetchone()
+            if not row or not row[0]:
+                raise HTTPException(status_code=404, detail="No source PDF stored for this scheme — it may have been uploaded before this feature was added.")
+
+    pdf_bytes, filename = row
+    return Response(
+        content=bytes(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename or "scheme.pdf"}"'},
+    )
+
+
 @router.get("/superadmin/schemes/review/{master_id}", response_class=HTMLResponse)
 def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
     auth_error = require_superadmin_session(request)
@@ -469,7 +501,12 @@ def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM scheme_masters WHERE id = %s;", (master_id,))
+            cur.execute("""
+                SELECT id, subject_name, grade_name, education_level, term, year, title,
+                       source_pdf_filename, parse_review_status, created_by_user_id, created_at, published_at,
+                       (source_pdf_data IS NOT NULL) AS has_source_pdf
+                FROM scheme_masters WHERE id = %s;
+            """, (master_id,))
             master = cur.fetchone()
             if not master:
                 raise HTTPException(status_code=404, detail="Scheme not found.")
@@ -502,26 +539,43 @@ def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
 
     rows_html = "".join(_row_block(r['id'], r, i) for i, r in enumerate(rows))
 
+    if master['has_source_pdf']:
+        pdf_panel = f"""
+        <iframe src="/superadmin/schemes/pdf/{master_id}" style="width:100%; height:100%; border:none; border-radius:12px;" title="Original uploaded scheme PDF"></iframe>
+        """
+    else:
+        pdf_panel = """
+        <div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center; text-align:center; padding:24px;">
+            <p style="color:#94a3b8; font-size:13px;">No source PDF stored for this scheme — it was uploaded before this feature was added. Re-upload it to keep the original alongside future edits.</p>
+        </div>
+        """
+
     return f"""
     <!DOCTYPE html>
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Review Scheme</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
-        <div class="max-w-5xl mx-auto space-y-4">
+        <div class="max-w-[1600px] mx-auto space-y-4">
             <a href="/superadmin/schemes/list" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Master Schemes</a>
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">📘 Review — {esc(master['subject_name'])} — {esc(master['grade_name'])} ({esc(master['term'])} {master['year']})</h2>
-                <p class="text-xs text-slate-400 mt-1">{len(rows)} row(s) detected. This scheme is already live and visible to schools — check every row carefully, since this parse is best-effort, not guaranteed accurate, and fix anything wrong below.</p>
+                <p class="text-xs text-slate-400 mt-1">{len(rows)} row(s) detected. This scheme is already live and visible to schools. Parsing is best-effort, not guaranteed accurate — the original PDF is shown alongside so you can quickly fill in anything it missed.</p>
                 {f"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-xs px-4 py-3 rounded-xl mt-3'><b>⚠️ Parser flagged these concerns:</b><ul class='list-disc list-inside mt-1'>{warnings_html}</ul></div>" if warning_list else ""}
             </div>
 
-            <form action="/api/v1/superadmin/schemes/publish/{master_id}" method="post" class="space-y-3">
-                {rows_html or "<p class='text-slate-400 text-sm italic bg-white p-6 rounded-2xl border text-center'>No rows were detected — add them manually using the button below, or re-upload a clearer PDF.</p>"}
-                <button type="button" onclick="addBlankRow()" class="w-full bg-white hover:bg-slate-50 border border-dashed border-slate-300 text-slate-500 font-bold py-3 rounded-2xl text-sm transition">+ Add a Row Manually</button>
-                <div class="flex gap-3 sticky bottom-4">
-                    <button type="submit" class="flex-1 bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-3.5 rounded-xl text-sm transition shadow-lg">💾 Save Changes</button>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+                <div class="bg-white rounded-2xl border shadow-xs overflow-hidden lg:sticky lg:top-4" style="height: calc(100vh - 220px); min-height: 500px;">
+                    {pdf_panel}
                 </div>
-            </form>
+
+                <form action="/api/v1/superadmin/schemes/publish/{master_id}" method="post" class="space-y-3">
+                    {rows_html or "<p class='text-slate-400 text-sm italic bg-white p-6 rounded-2xl border text-center'>No rows were detected — add them manually using the button below, referencing the PDF alongside, or re-upload a clearer PDF.</p>"}
+                    <button type="button" onclick="addBlankRow()" class="w-full bg-white hover:bg-slate-50 border border-dashed border-slate-300 text-slate-500 font-bold py-3 rounded-2xl text-sm transition">+ Add a Row Manually</button>
+                    <div class="flex gap-3 sticky bottom-4">
+                        <button type="submit" class="flex-1 bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-3.5 rounded-xl text-sm transition shadow-lg">💾 Save Changes</button>
+                    </div>
+                </form>
+            </div>
         </div>
 
         <script>
@@ -755,7 +809,7 @@ def schemes_import_form(school_id: int, master_id: int, request: Request):
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM scheme_masters WHERE id = %s AND parse_review_status = 'published';", (master_id,))
+            cur.execute("SELECT subject_name, grade_name, education_level, term, year FROM scheme_masters WHERE id = %s AND parse_review_status = 'published';", (master_id,))
             master = cur.fetchone()
             if not master:
                 raise HTTPException(status_code=404, detail="Scheme not found or not yet published.")
@@ -811,7 +865,7 @@ def schemes_import_process(school_id: int, master_id: int, request: Request, tea
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM scheme_masters WHERE id = %s;", (master_id,))
+            cur.execute("SELECT subject_name, grade_name, education_level, term, year FROM scheme_masters WHERE id = %s;", (master_id,))
             master = cur.fetchone()
             if not master:
                 raise HTTPException(status_code=404, detail="Scheme not found.")
