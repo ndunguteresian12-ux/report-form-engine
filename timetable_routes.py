@@ -3089,109 +3089,136 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             # subject's quota is used up, any leftover slots simply stay
             # free rather than being force-filled. ---
             # (valid_slot_count already computed earlier, for Phase 0.)
+            #
+            # Split into two sub-passes across the WHOLE week, rather than
+            # one single pass — this is what actually fixes a real,
+            # confirmed bug: a teacher shared across two classes (e.g.
+            # teaching the same subjects in both Grade 8 and Grade 9)
+            # would have their subject's weekly quota "used up" on early
+            # days via teacherless placements, purely because that's
+            # whichever day the loop reached first while every remaining
+            # subject in the queue happened to share that busy teacher —
+            # even when a later day in the same week was actually
+            # completely free for that exact teacher. Verified directly
+            # against a real Postgres instance: a shared teacher's second
+            # class ended up with 10 teacherless slots concentrated on
+            # Monday–Thursday while Friday sat almost entirely empty.
+            # Pass A gives every subject a genuine shot at a clean slot
+            # ANYWHERE in the week first; only Pass B, once the whole week
+            # has had that fair pass, accepts a teacher conflict as a
+            # last resort — exactly the same fallback logic as before,
+            # just deferred until every slot has had first-round priority.
+            all_week_slots = [(day, period) for day in days for period in teaching_periods if (day, period['id']) not in filled]
+
+            def _try_fill_slot(day, period, allow_teacher_conflict):
+                nonlocal qi, queue
+                if (day, period['id']) in filled or not queue:
+                    return False
+
+                used_today = used_today_by_day[day]
+                last_subject_id = last_subject_by_day[day]
+                conflict_levels = ((True, True), (True, False), (False, True), (False, False)) if allow_teacher_conflict else ((True, True), (False, True))
+
+                chosen_idx, chosen_subject, chosen_teacher = None, None, None
+                for avoid_conditional, avoid_teacher_conflict in conflict_levels:
+                    if chosen_subject is not None:
+                        break
+                    priority_order = sorted(
+                        range(len(queue)),
+                        key=lambda idx: (valid_slot_count.get(queue[idx]['id'], 999), (idx - qi) % len(queue))
+                    )
+                    for idx in priority_order:
+                        candidate = queue[idx]
+                        cid = candidate['id']
+                        if cid in used_today:
+                            continue
+                        if any((cid, other) in same_day_forbidden for other in used_today):
+                            continue
+                        if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
+                            continue
+                        if (cid, day, period['id']) in subject_unavailable:
+                            continue
+                        if avoid_conditional and (cid, day, period['id']) in subject_conditional:
+                            continue
+
+                        cand_teacher = teacher_for_subject.get(cid)
+                        if cand_teacher and (cand_teacher, day, period['id']) in unavailable:
+                            continue
+                        if cand_teacher and avoid_conditional and (cand_teacher, day, period['id']) in conditional:
+                            continue
+                        if cand_teacher and cand_teacher in booked.get((day, period['id']), set()):
+                            if avoid_teacher_conflict:
+                                continue  # try a different candidate first rather than nulling this one's teacher
+                            cand_teacher = None
+
+                        chosen_idx, chosen_subject, chosen_teacher = idx, candidate, cand_teacher
+                        break
+
+                if chosen_subject is None and not allow_teacher_conflict:
+                    return False  # Pass A: no clean candidate here — leave it for Pass B, don't force anything
+
+                if chosen_subject is None:
+                    # Last-resort round-robin fallback (Pass B only) — this
+                    # must NEVER mean ignoring a subject's own "Not
+                    # Available" time-off or the same-day/consecutive-day
+                    # rules — those are hard, non-negotiable blocks, not
+                    # preferences to relax. Only teacher-related soft
+                    # conflicts get relaxed here; if genuinely every
+                    # subject in the queue is hard-blocked at this exact
+                    # slot, it's left empty rather than violating one of them.
+                    priority_order = sorted(
+                        range(len(queue)),
+                        key=lambda idx: (valid_slot_count.get(queue[idx]['id'], 999), (idx - qi) % len(queue))
+                    )
+                    for idx in priority_order:
+                        candidate = queue[idx]
+                        cid = candidate['id']
+                        if cid in used_today:
+                            continue
+                        if any((cid, other) in same_day_forbidden for other in used_today):
+                            continue
+                        if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
+                            continue
+                        if (cid, day, period['id']) in subject_unavailable:
+                            continue
+                        chosen_idx, chosen_subject = idx, candidate
+                        break
+
+                if chosen_subject is None:
+                    return False  # every remaining subject is hard-blocked at this exact slot — leave it empty
+
+                chosen_teacher = teacher_for_subject.get(chosen_subject['id'])
+                if chosen_teacher and (
+                    chosen_teacher in booked.get((day, period['id']), set())
+                    or (chosen_teacher, day, period['id']) in unavailable
+                ):
+                    chosen_teacher = None
+
+                qi = chosen_idx + 1
+                _place(day, period['id'], chosen_subject, chosen_teacher)
+                last_subject_by_day[day] = chosen_subject['id']
+                # Remove exactly one used-up occurrence from the queue so
+                # a satisfied subject can't be picked again.
+                queue = [s for s in queue if s['id'] != chosen_subject['id']] + (
+                    [chosen_subject] * remaining.get(chosen_subject['id'], 0)
+                )
+                return True
 
             queue = [subj for subj in free_subjects for _ in range(remaining.get(subj['id'], 0))]
             qi = 0
-            for day in days:
-                for period in teaching_periods:
-                    if (day, period['id']) in filled:
-                        continue
-                    if not queue:
-                        break  # every subject's quota is met — this slot stays free
 
-                    used_today = used_today_by_day[day]
-                    last_subject_id = last_subject_by_day[day]
+            # Pass A — entire week, clean placements only.
+            for day, period in all_week_slots:
+                if not queue:
+                    break
+                _try_fill_slot(day, period, allow_teacher_conflict=False)
 
-                    chosen_idx, chosen_subject, chosen_teacher = None, None, None
-                    # Priority order: (avoid_conditional, avoid_teacher_conflict) —
-                    # try hardest for a fully clean pick first (no conditional
-                    # clashes, no teacher conflict), and only relax one
-                    # constraint at a time. This matters specifically because
-                    # the previous version accepted the FIRST subject that
-                    # passed the non-teacher rules and only THEN checked for a
-                    # teacher conflict (nulling the teacher if so) — meaning a
-                    # later candidate in the same queue that had no conflict
-                    # at all was never even considered.
-                    for avoid_conditional, avoid_teacher_conflict in ((True, True), (True, False), (False, True), (False, False)):
-                        if chosen_subject is not None:
-                            break
-                        priority_order = sorted(
-                            range(len(queue)),
-                            key=lambda idx: (valid_slot_count.get(queue[idx]['id'], 999), (idx - qi) % len(queue))
-                        )
-                        for idx in priority_order:
-                            candidate = queue[idx]
-                            cid = candidate['id']
-                            if cid in used_today:
-                                continue
-                            if any((cid, other) in same_day_forbidden for other in used_today):
-                                continue
-                            if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
-                                continue
-                            if (cid, day, period['id']) in subject_unavailable:
-                                continue
-                            if avoid_conditional and (cid, day, period['id']) in subject_conditional:
-                                continue
-
-                            cand_teacher = teacher_for_subject.get(cid)
-                            if cand_teacher and (cand_teacher, day, period['id']) in unavailable:
-                                continue
-                            if cand_teacher and avoid_conditional and (cand_teacher, day, period['id']) in conditional:
-                                continue
-                            if cand_teacher and cand_teacher in booked.get((day, period['id']), set()):
-                                if avoid_teacher_conflict:
-                                    continue  # try a different candidate first rather than nulling this one's teacher
-                                cand_teacher = None
-
-                            chosen_idx, chosen_subject, chosen_teacher = idx, candidate, cand_teacher
-                            break
-
-                    if chosen_subject is None:
-                        # Nothing satisfied every rule — fall back to a
-                        # round-robin pick, but this must NEVER mean
-                        # ignoring a subject's own "Not Available" time-off
-                        # or the same-day/consecutive-day rules — those are
-                        # hard, non-negotiable blocks, not preferences to
-                        # relax. Only teacher-related soft conflicts get
-                        # relaxed here; if genuinely every subject in the
-                        # queue is hard-blocked at this exact slot, it's
-                        # left empty rather than violating one of them.
-                        priority_order = sorted(
-                            range(len(queue)),
-                            key=lambda idx: (valid_slot_count.get(queue[idx]['id'], 999), (idx - qi) % len(queue))
-                        )
-                        for idx in priority_order:
-                            candidate = queue[idx]
-                            cid = candidate['id']
-                            if cid in used_today:
-                                continue
-                            if any((cid, other) in same_day_forbidden for other in used_today):
-                                continue
-                            if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
-                                continue
-                            if (cid, day, period['id']) in subject_unavailable:
-                                continue
-                            chosen_idx, chosen_subject = idx, candidate
-                            break
-
-                    if chosen_subject is None:
-                        continue  # every remaining subject is hard-blocked at this exact slot — leave it empty
-
-                    chosen_teacher = teacher_for_subject.get(chosen_subject['id'])
-                    if chosen_teacher and (
-                        chosen_teacher in booked.get((day, period['id']), set())
-                        or (chosen_teacher, day, period['id']) in unavailable
-                    ):
-                        chosen_teacher = None
-
-                    qi = chosen_idx + 1
-                    _place(day, period['id'], chosen_subject, chosen_teacher)
-                    last_subject_by_day[day] = chosen_subject['id']
-                    # Remove exactly one used-up occurrence from the queue so
-                    # a satisfied subject can't be picked again.
-                    queue = [s for s in queue if s['id'] != chosen_subject['id']] + (
-                        [chosen_subject] * remaining.get(chosen_subject['id'], 0)
-                    )
+            # Pass B — entire week again, now accepting teacher conflicts
+            # as a last resort for whatever's still unplaced.
+            for day, period in all_week_slots:
+                if not queue:
+                    break
+                _try_fill_slot(day, period, allow_teacher_conflict=True)
 
             conn.commit()
 
