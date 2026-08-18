@@ -49,6 +49,23 @@ logger = logging.getLogger(__name__)
 EDUCATION_LEVELS = ["Lower Primary", "Upper Primary", "Junior School"]
 
 
+def _normalize_match_key(text):
+    """Loosens subject/grade name comparisons so real inconsistencies in
+    how names get typed or seeded elsewhere in the app (case differences,
+    a stray trailing period, extra whitespace) don't silently break the
+    exact-match filter below. Confirmed against this app's own seed data
+    in main.py: Lower Primary subjects are stored ALL CAPS ('MATHEMATICS'),
+    Junior/Upper Primary are stored Title Case with some carrying a
+    trailing period ('Integrated science.'), while a scheme master's
+    subject_name is freely typed by the super admin at upload time
+    ('Mathematics', 'Integrated Science') — none of which match the
+    timetable data byte-for-byte, even when they clearly mean the same
+    subject. This keeps the filter meaningful without requiring every
+    scheme upload to retype subject names to match a specific school's
+    exact historical seed casing/punctuation."""
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
 def bootstrap_schemes_schema():
     """Creates/upgrades every table this module owns. Purely additive."""
     with get_db_connection() as conn:
@@ -1209,12 +1226,21 @@ def my_schemes_list(school_id: int, request: Request):
                         JOIN learning_areas la ON tsa.learning_area_id = la.id
                         WHERE tsa.school_id = %s AND tsa.staff_user_id = %s;
                     """, (school_id, user_id))
-                    my_taught_subjects = {(r['subject_name'], r['grade_name'], r['education_level']) for r in cur.fetchall()}
+                    # Normalized (case/punctuation-insensitive) match keys —
+                    # see _normalize_match_key for why an exact match is too
+                    # strict against this app's own real-world naming.
+                    my_taught_subjects = {
+                        (_normalize_match_key(r['subject_name']), _normalize_match_key(r['grade_name']), _normalize_match_key(r['education_level']))
+                        for r in cur.fetchall()
+                    }
             except Exception:
                 conn.rollback()  # a failed query here must not poison the rest of this transaction, and must not block the page
 
     if my_taught_subjects is not None:
-        my_schemes = [s for s in all_school_schemes if (s['subject_name'], s['grade_name'], s['education_level']) in my_taught_subjects]
+        my_schemes = [
+            s for s in all_school_schemes
+            if (_normalize_match_key(s['subject_name']), _normalize_match_key(s['grade_name']), _normalize_match_key(s['education_level'])) in my_taught_subjects
+        ]
     else:
         my_schemes = all_school_schemes
 
