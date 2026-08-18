@@ -698,12 +698,23 @@ async def schemes_publish(master_id: int, request: Request):
 
 @router.post("/api/v1/superadmin/schemes/delete/{master_id}")
 def schemes_delete_master(master_id: int, request: Request):
-    """Deletes a master template and its own rows (via CASCADE on
-    scheme_master_rows). Deliberately does NOT touch any school's
-    already-imported copy — scheme_copies.master_id is ON DELETE SET
-    NULL, not CASCADE, specifically so a school's own (possibly
-    customized) scheme never disappears just because the master template
-    it originally came from was removed."""
+    """Deletes a master template and every school's auto-propagated copy
+    of it (scheme_copy_rows cascade off scheme_copies via their own FK).
+
+    Previously this only deleted the master itself and left every
+    school's copy in place (scheme_copies.master_id was ON DELETE SET
+    NULL) — that made sense back when copies were something a school
+    admin deliberately imported and might have customized. Now that
+    every published master is auto-copied to every school with no
+    admin action involved, an orphaned auto-copy has no owner who
+    "imported" it on purpose, so leaving it behind after the master is
+    removed is exactly the bug: super admin sees it gone, every school
+    still sees it. Deleting a master now removes it everywhere.
+
+    Note: this also removes any edits a teacher made to their copy. The
+    confirmation dialog on the list page says so explicitly before this
+    runs, since that's now real, irreversible data loss for a teacher
+    who customized their scheme."""
     auth_error = require_superadmin_session(request)
     if auth_error:
         return auth_error
@@ -713,6 +724,7 @@ def schemes_delete_master(master_id: int, request: Request):
             cur.execute("SELECT id FROM scheme_masters WHERE id = %s;", (master_id,))
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Scheme not found.")
+            cur.execute("DELETE FROM scheme_copies WHERE master_id = %s;", (master_id,))
             cur.execute("DELETE FROM scheme_masters WHERE id = %s;", (master_id,))
             conn.commit()
 
@@ -741,14 +753,13 @@ def schemes_master_list(request: Request):
         if m['import_count'] > 0:
             confirm_msg = (
                 f"Remove this master template ({m['subject_name']} — {m['grade_name']})? "
-                f"Note: {m['import_count']} school(s) already imported it \\u2014 their own copies are "
-                f"completely unaffected and will keep working exactly as they are, but this master "
-                f"will no longer be available for new imports. This cannot be undone."
+                f"This will also delete it from all {m['import_count']} school(s) it's currently in "
+                f"\\u2014 including any edits a teacher has made to their copy. This cannot be undone."
             )
         else:
             confirm_msg = (
                 f"Remove this master template ({m['subject_name']} — {m['grade_name']})? "
-                f"No school has imported it yet, so nothing else is affected. This cannot be undone."
+                f"No school has this scheme yet, so nothing else is affected. This cannot be undone."
             )
         # Single quotes inside the message are escaped for the JS string
         # literal; esc() then handles the surrounding HTML attribute.
