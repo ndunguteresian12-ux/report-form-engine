@@ -779,7 +779,10 @@ def schemes_master_list(request: Request):
                 <a href="/superadmin/dashboard" class="text-slate-400 hover:text-slate-600 text-xs font-bold block mb-1">← Back to Super Admin Portal</a>
                 <h1 class="text-base font-bold text-slate-900">📘 Master Schemes of Work</h1>
             </div>
-            <a href="/superadmin/schemes/upload" class="bg-indigo-800 hover:bg-indigo-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">+ Upload New</a>
+            <div class="flex items-center gap-2">
+                <a href="/superadmin/schemes/danger-zone" class="text-rose-500 hover:text-rose-700 text-xs font-bold">⚠️ Danger Zone</a>
+                <a href="/superadmin/schemes/upload" class="bg-indigo-800 hover:bg-indigo-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">+ Upload New</a>
+            </div>
         </header>
         <div class="p-4 sm:p-8 max-w-3xl mx-auto space-y-3">
             {rows_html or "<p class='text-slate-400 text-sm italic text-center py-8'>No schemes uploaded yet.</p>"}
@@ -787,6 +790,84 @@ def schemes_master_list(request: Request):
     </body>
     </html>
     """
+
+
+@router.get("/superadmin/schemes/danger-zone", response_class=HTMLResponse)
+def schemes_danger_zone(request: Request):
+    """Shows exactly what a full wipe would delete before allowing it —
+    platform-wide, irreversible, so this is deliberately hard to trigger
+    by accident: requires typing a specific confirmation phrase, checked
+    both client-side and server-side."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) AS cnt FROM scheme_masters;")
+            master_count = cur.fetchone()['cnt']
+            cur.execute("SELECT COUNT(*) AS cnt FROM scheme_master_rows;")
+            master_row_count = cur.fetchone()['cnt']
+            cur.execute("SELECT COUNT(*) AS cnt FROM scheme_copies;")
+            copy_count = cur.fetchone()['cnt']
+            cur.execute("SELECT COUNT(*) AS cnt FROM scheme_copy_rows;")
+            copy_row_count = cur.fetchone()['cnt']
+            cur.execute("SELECT COUNT(DISTINCT school_id) AS cnt FROM scheme_copies;")
+            school_count = cur.fetchone()['cnt']
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Danger Zone</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-rose-50 min-h-screen p-4 sm:p-8">
+        <div class="max-w-lg mx-auto space-y-4">
+            <a href="/superadmin/schemes/list" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Master Schemes</a>
+
+            <div class="bg-white p-6 rounded-2xl border-2 border-rose-300 shadow-xs">
+                <h2 class="text-lg font-black text-rose-700">⚠️ Delete All Schemes of Work</h2>
+                <p class="text-xs text-slate-500 mt-2">This permanently deletes, platform-wide, across every school:</p>
+                <ul class="text-sm mt-3 space-y-1.5 bg-rose-50 rounded-xl p-4 border border-rose-100">
+                    <li><b>{master_count}</b> master scheme(s) — <span class="text-slate-400">{master_row_count} lesson row(s) total</span></li>
+                    <li><b>{copy_count}</b> school copy/copies across <b>{school_count}</b> school(s) — <span class="text-slate-400">{copy_row_count} lesson row(s) total</span></li>
+                </ul>
+                <p class="text-xs text-rose-600 font-semibold mt-3">This includes any edits individual teachers have made to their own school's copy. This cannot be undone through the app — only a database backup restore can recover this afterward.</p>
+
+                <form action="/api/v1/superadmin/schemes/delete-all" method="post" class="mt-5" onsubmit="return document.getElementById('confirmPhrase').value === 'DELETE ALL SCHEMES';">
+                    <label class="text-xs font-bold text-slate-600 block mb-1">Type <code class="bg-slate-100 px-1.5 py-0.5 rounded">DELETE ALL SCHEMES</code> to confirm</label>
+                    <input type="text" id="confirmPhrase" name="confirm_phrase" class="w-full border-2 border-rose-200 p-2.5 rounded-xl text-sm mb-3" autocomplete="off" required>
+                    <button type="submit" class="w-full bg-rose-600 hover:bg-rose-700 text-white font-bold py-3 rounded-xl text-sm transition">Permanently Delete Everything</button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/superadmin/schemes/delete-all")
+def schemes_delete_all(request: Request, confirm_phrase: str = Form("")):
+    """Wipes every scheme master and every school's copy, platform-wide.
+    Server-side confirmation-phrase check — the client-side one is a
+    convenience, not the actual safeguard, since a form can always be
+    submitted directly. Verified the deletion order and cascade behavior
+    directly against a real Postgres instance before shipping this:
+    deleting scheme_copies first (cascades to scheme_copy_rows), then
+    scheme_masters (cascades to scheme_master_rows), leaves zero
+    orphaned rows in either case."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    if confirm_phrase != "DELETE ALL SCHEMES":
+        raise HTTPException(status_code=400, detail="Confirmation phrase did not match — nothing was deleted.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM scheme_copies;")
+            cur.execute("DELETE FROM scheme_masters;")
+            conn.commit()
+
+    return RedirectResponse(url="/superadmin/schemes/list", status_code=303)
 
 
 # ============================================================
