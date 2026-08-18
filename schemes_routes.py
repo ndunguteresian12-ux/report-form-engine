@@ -1178,7 +1178,34 @@ def my_schemes_list(school_id: int, request: Request):
                 WHERE c.school_id = %s
                 ORDER BY c.grade_name ASC, c.subject_name ASC;
             """, (school_id,))
-            my_schemes = cur.fetchall()
+            all_school_schemes = cur.fetchall()
+
+            # Filter to subjects/grades this teacher actually teaches,
+            # per the timetable module's own assignment data — but only
+            # if that data actually exists for this school. If the
+            # school hasn't set up timetables at all, there's nothing
+            # meaningful to filter by, so every scheme stays visible
+            # rather than silently showing nothing. Wrapped defensively:
+            # a missing/broken timetable table must never crash this page.
+            my_taught_subjects = None
+            try:
+                cur.execute("SELECT EXISTS(SELECT 1 FROM teacher_subject_assignments WHERE school_id = %s) AS has_data;", (school_id,))
+                school_has_timetable_data = cur.fetchone()['has_data']
+                if school_has_timetable_data:
+                    cur.execute("""
+                        SELECT DISTINCT la.name AS subject_name, tsa.grade_name, tsa.education_level
+                        FROM teacher_subject_assignments tsa
+                        JOIN learning_areas la ON tsa.learning_area_id = la.id
+                        WHERE tsa.school_id = %s AND tsa.staff_user_id = %s;
+                    """, (school_id, user_id))
+                    my_taught_subjects = {(r['subject_name'], r['grade_name'], r['education_level']) for r in cur.fetchall()}
+            except Exception:
+                conn.rollback()  # a failed query here must not poison the rest of this transaction, and must not block the page
+
+    if my_taught_subjects is not None:
+        my_schemes = [s for s in all_school_schemes if (s['subject_name'], s['grade_name'], s['education_level']) in my_taught_subjects]
+    else:
+        my_schemes = all_school_schemes
 
     # Grouped by Term → Grade, consistent with the admin's Manage Schemes
     # page — most teachers only have a handful of schemes, but grouping
@@ -1218,6 +1245,13 @@ def my_schemes_list(school_id: int, request: Request):
         </div>
         """
 
+    if sections_html:
+        empty_state_msg = None
+    elif my_taught_subjects is not None:
+        empty_state_msg = "No schemes match the subjects/grades on your timetable yet. If this looks wrong, check with your admin that your teaching assignments are set up correctly."
+    else:
+        empty_state_msg = "No schemes have been uploaded for your school's grades yet."
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -1226,10 +1260,10 @@ def my_schemes_list(school_id: int, request: Request):
         <header class="bg-white border-b px-6 sm:px-8 py-4">
             <a href="{get_dashboard_url(request, school_id)}" class="text-slate-400 hover:text-slate-600 text-xs font-bold block mb-1">← Back to Dashboard</a>
             <h1 class="text-base font-bold text-slate-900">📘 My Schemes of Work — {esc(school['name']) if school else ''}</h1>
-            <p class="text-xs text-slate-400">Every scheme available at your school — open one to review, customize, or print it. Ones assigned specifically to you are marked below.</p>
+            <p class="text-xs text-slate-400">{"Filtered to the subjects and grades you teach, per your timetable." if my_taught_subjects is not None else "Your school hasn't set up timetables yet, so every scheme is shown."} Open one to review, customize, or print it. Ones assigned specifically to you are marked below.</p>
         </header>
         <div class="p-4 sm:p-8 max-w-3xl mx-auto">
-            {sections_html or "<p class='text-slate-400 text-sm italic text-center py-8'>No schemes have been uploaded for your school's grades yet.</p>"}
+            {sections_html or f"<p class='text-slate-400 text-sm italic text-center py-8 px-4'>{esc(empty_state_msg)}</p>"}
         </div>
     </body>
     </html>
