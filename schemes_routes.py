@@ -568,8 +568,8 @@ def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
             is_short = field in ("week_number", "lesson_number")
             field_inputs += f"""
             <div class="{'col-span-1' if is_short else 'col-span-3'}">
-                <label class="text-[10px] font-bold text-slate-400 uppercase block mb-0.5">{esc(label)}</label>
-                {"<input type='text' name='" + field + "_" + str(idx) + "' value='" + value + "' class='w-full border p-1.5 rounded-lg text-xs'>" if is_short else "<textarea name='" + field + "_" + str(idx) + "' rows='2' class='w-full border p-1.5 rounded-lg text-xs'>" + value + "</textarea>"}
+                <label class="text-[11px] font-bold text-slate-500 uppercase block mb-1">{esc(label)}</label>
+                {"<input type='text' name='" + field + "_" + str(idx) + "' value='" + value + "' class='w-full border p-2 rounded-lg text-sm'>" if is_short else "<textarea name='" + field + "_" + str(idx) + "' rows='3' class='w-full border p-2 rounded-lg text-sm'>" + value + "</textarea>"}
             </div>
             """
         return f"""
@@ -632,7 +632,7 @@ def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
             let inner = `<button type="button" onclick="this.closest('.bg-white').remove()" class="absolute top-2 right-2 text-rose-400 hover:text-rose-600 text-xs font-bold">✕ Remove</button><input type="hidden" name="row_ids" value="${{nextIdx}}">`;
             fields.forEach(f => {{
                 const isShort = shortFields.includes(f);
-                inner += `<div class="${{isShort ? 'col-span-1' : 'col-span-3'}}"><label class="text-[10px] font-bold text-slate-400 uppercase block mb-0.5">${{labels[f]}}</label>${{isShort ? `<input type='text' name='${{f}}_${{nextIdx}}' class='w-full border p-1.5 rounded-lg text-xs'>` : `<textarea name='${{f}}_${{nextIdx}}' rows='2' class='w-full border p-1.5 rounded-lg text-xs'></textarea>`}}</div>`;
+                inner += `<div class="${{isShort ? 'col-span-1' : 'col-span-3'}}"><label class="text-[11px] font-bold text-slate-500 uppercase block mb-1">${{labels[f]}}</label>${{isShort ? `<input type='text' name='${{f}}_${{nextIdx}}' class='w-full border p-2 rounded-lg text-sm'>` : `<textarea name='${{f}}_${{nextIdx}}' rows='3' class='w-full border p-2 rounded-lg text-sm'></textarea>`}}</div>`;
             }});
             container.innerHTML = inner;
             document.querySelector('form').insertBefore(container, document.querySelector('form').lastElementChild.previousElementSibling);
@@ -1179,8 +1179,8 @@ def scheme_copy_editor(school_id: int, copy_id: int, request: Request, saved: st
             is_short = field in ("week_number", "lesson_number")
             field_inputs += f"""
             <div class="{'col-span-1' if is_short else 'col-span-3'}">
-                <label class="text-[10px] font-bold text-slate-400 uppercase block mb-0.5">{esc(label)}</label>
-                {"<input type='text' name='" + field + "_" + str(idx) + "' value='" + value + "' class='w-full border p-1.5 rounded-lg text-xs'>" if is_short else "<textarea name='" + field + "_" + str(idx) + "' rows='2' class='w-full border p-1.5 rounded-lg text-xs'>" + value + "</textarea>"}
+                <label class="text-[11px] font-bold text-slate-500 uppercase block mb-1">{esc(label)}</label>
+                {"<input type='text' name='" + field + "_" + str(idx) + "' value='" + value + "' class='w-full border p-2 rounded-lg text-sm'>" if is_short else "<textarea name='" + field + "_" + str(idx) + "' rows='3' class='w-full border p-2 rounded-lg text-sm'>" + value + "</textarea>"}
             </div>
             """
         return f"""
@@ -1248,7 +1248,7 @@ def scheme_copy_editor(school_id: int, copy_id: int, request: Request, saved: st
             let inner = `<button type="button" onclick="this.closest('.bg-white').remove()" class="absolute top-2 right-2 text-rose-400 hover:text-rose-600 text-xs font-bold">✕ Remove</button><input type="hidden" name="row_ids" value="${{nextIdx}}">`;
             fields.forEach(f => {{
                 const isShort = shortFields.includes(f);
-                inner += `<div class="${{isShort ? 'col-span-1' : 'col-span-3'}}"><label class="text-[10px] font-bold text-slate-400 uppercase block mb-0.5">${{labels[f]}}</label>${{isShort ? `<input type='text' name='${{f}}_${{nextIdx}}' class='w-full border p-1.5 rounded-lg text-xs'>` : `<textarea name='${{f}}_${{nextIdx}}' rows='2' class='w-full border p-1.5 rounded-lg text-xs'></textarea>`}}</div>`;
+                inner += `<div class="${{isShort ? 'col-span-1' : 'col-span-3'}}"><label class="text-[11px] font-bold text-slate-500 uppercase block mb-1">${{labels[f]}}</label>${{isShort ? `<input type='text' name='${{f}}_${{nextIdx}}' class='w-full border p-2 rounded-lg text-sm'>` : `<textarea name='${{f}}_${{nextIdx}}' rows='3' class='w-full border p-2 rounded-lg text-sm'></textarea>`}}</div>`;
             }});
             container.innerHTML = inner;
             const form = document.querySelector('form[action^="/api/v1/schemes/save"]');
@@ -1358,16 +1358,16 @@ def scheme_copy_print(school_id: int, copy_id: int, request: Request):
             return esc(val).replace("\n", "<br>")
         rows_html += f"""
         <tr>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;text-align:center;">{esc(r['week_number'] or '')}</td>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;text-align:center;">{esc(r['lesson_number'] or '')}</td>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;">{_fmt('strand')}</td>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;">{_fmt('sub_strand')}</td>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;">{_fmt('learning_outcomes')}</td>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;">{_fmt('learning_experiences')}</td>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;">{_fmt('key_inquiry_questions')}</td>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;">{_fmt('learning_resources')}</td>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;">{_fmt('assessment_methods')}</td>
-            <td style="padding:5px 6px;border:1px solid #cbd5e1;">{_fmt('reflection')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;text-align:center;">{esc(r['week_number'] or '')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;text-align:center;">{esc(r['lesson_number'] or '')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;">{_fmt('strand')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;">{_fmt('sub_strand')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;">{_fmt('learning_outcomes')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;">{_fmt('learning_experiences')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;">{_fmt('key_inquiry_questions')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;">{_fmt('learning_resources')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;">{_fmt('assessment_methods')}</td>
+            <td style="padding:7px 8px;border:1px solid #cbd5e1;">{_fmt('reflection')}</td>
         </tr>
         """
 
@@ -1378,11 +1378,12 @@ def scheme_copy_print(school_id: int, copy_id: int, request: Request):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Elimu Hub | Scheme of Work — {esc(copy['subject_name'])}</title>
         <style>
-            @page {{ size: A3 landscape; margin: 10mm; }}
-            body {{ font-family: Arial, sans-serif; color: #1e293b; padding: 16px; font-size: 10px; }}
+            @page {{ size: A4 landscape; margin: 8mm; }}
+            body {{ font-family: Arial, sans-serif; color: #1e293b; padding: 16px; font-size: 14px; }}
             @media print {{ .no-print {{ display: none !important; }} body {{ padding: 0; }} }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-            th {{ background: #f1f5f9; border: 1px solid #cbd5e1; padding: 6px; font-size: 9px; text-transform: uppercase; }}
+            th {{ background: #f1f5f9; border: 1px solid #cbd5e1; padding: 8px; font-size: 13px; text-transform: uppercase; }}
+            td {{ font-size: 13px; line-height: 1.4; }}
         </style>
     </head>
     <body>
@@ -1392,20 +1393,20 @@ def scheme_copy_print(school_id: int, copy_id: int, request: Request):
         <div style="display:flex;align-items:center;gap:14px;border-bottom:3px double #4f46e5;padding-bottom:10px;">
             {logo_html}
             <div>
-                <h1 style="margin:0;font-size:16px;">{esc(school['name']) if school else ''}</h1>
-                <p style="margin:2px 0 0;font-size:12px;font-weight:bold;">SCHEME OF WORK</p>
+                <h1 style="margin:0;font-size:21px;">{esc(school['name']) if school else ''}</h1>
+                <p style="margin:2px 0 0;font-size:15px;font-weight:bold;">SCHEME OF WORK</p>
             </div>
         </div>
         <table style="margin-top:10px;border:none;">
             <tr>
-                <td style="border:none;padding:2px 0;"><b>Teacher:</b> {esc(teacher_display_name)}</td>
-                <td style="border:none;padding:2px 0;"><b>TSC No.:</b> {esc(tsc_display)}</td>
-                <td style="border:none;padding:2px 0;"><b>Subject:</b> {esc(copy['subject_name'])}</td>
+                <td style="border:none;padding:3px 0;font-size:14px;"><b>Teacher:</b> {esc(teacher_display_name)}</td>
+                <td style="border:none;padding:3px 0;font-size:14px;"><b>TSC No.:</b> {esc(tsc_display)}</td>
+                <td style="border:none;padding:3px 0;font-size:14px;"><b>Subject:</b> {esc(copy['subject_name'])}</td>
             </tr>
             <tr>
-                <td style="border:none;padding:2px 0;"><b>Grade:</b> {esc(copy['grade_name'])} {esc(copy['stream']) if copy['stream'] != 'ALL' else ''}</td>
-                <td style="border:none;padding:2px 0;"><b>Term:</b> {esc(copy['term'])}</td>
-                <td style="border:none;padding:2px 0;"><b>Year:</b> {copy['year']}</td>
+                <td style="border:none;padding:3px 0;font-size:14px;"><b>Grade:</b> {esc(copy['grade_name'])} {esc(copy['stream']) if copy['stream'] != 'ALL' else ''}</td>
+                <td style="border:none;padding:3px 0;font-size:14px;"><b>Term:</b> {esc(copy['term'])}</td>
+                <td style="border:none;padding:3px 0;font-size:14px;"><b>Year:</b> {copy['year']}</td>
             </tr>
         </table>
         <table>
@@ -1418,7 +1419,7 @@ def scheme_copy_print(school_id: int, copy_id: int, request: Request):
             </thead>
             <tbody>{rows_html or "<tr><td colspan='10' style='padding:20px;text-align:center;color:#94a3b8;'>No lessons added yet.</td></tr>"}</tbody>
         </table>
-        <p style="margin-top:16px;font-size:9px;color:#94a3b8;text-align:center;">Generated by Elimu Hub — {esc(school['name']) if school else ''}</p>
+        <p style="margin-top:16px;font-size:12px;color:#94a3b8;text-align:center;">Generated by Elimu Hub — {esc(school['name']) if school else ''}</p>
     </body>
     </html>
     """
