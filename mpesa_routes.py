@@ -799,6 +799,11 @@ def superadmin_mpesa_diagnostic(request: Request):
     if auth_error:
         return auth_error
 
+    # These aren't secrets — a public URL and a public test shortcode —
+    # so show them in full rather than masked, since seeing the exact
+    # value is the whole point of checking a callback delivery failure.
+    NON_SENSITIVE = {"MPESA_ENV", "MPESA_SHORTCODE", "MPESA_CALLBACK_URL"}
+
     checks = [
         ("MPESA_ENV", MPESA_ENV, "sandbox' or 'production"),
         ("MPESA_CONSUMER_KEY", MPESA_CONSUMER_KEY, None),
@@ -812,7 +817,14 @@ def superadmin_mpesa_diagnostic(request: Request):
     for name, value, hint in checks:
         is_set = bool(value)
         status = f"<span class='text-emerald-700 font-bold'>✅ Set ({len(value)} characters)</span>" if is_set else "<span class='text-rose-600 font-bold'>❌ Not set / empty</span>"
-        preview = f"<span class='text-slate-400 text-xs'>starts with: {esc(value[:4])}…</span>" if is_set and len(value) > 4 else ""
+        if not is_set:
+            preview = ""
+        elif name in NON_SENSITIVE:
+            preview = f"<span class='text-slate-600 text-xs font-mono'>{esc(value)}</span>"
+        elif len(value) > 4:
+            preview = f"<span class='text-slate-400 text-xs'>starts with: {esc(value[:4])}…</span>"
+        else:
+            preview = ""
         rows += f"""
         <tr class="border-b">
             <td class="p-3 font-mono text-xs font-bold">{name}</td>
