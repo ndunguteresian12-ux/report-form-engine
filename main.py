@@ -958,6 +958,11 @@ from schemes_routes import router as schemes_router, bootstrap_schemes_schema
 bootstrap_schemes_schema()
 app.include_router(schemes_router)
 
+# --- M-Pesa billing (extracted to its own file — see mpesa_routes.py) ---
+from mpesa_routes import router as mpesa_router, bootstrap_mpesa_schema, BILLING_ENFORCED
+bootstrap_mpesa_schema()
+app.include_router(mpesa_router)
+
 # --- Core Business & CBE Analytics Helper Logic ---
 def log_audit_action(cur, request: Request, school_id: int, action: str, details: str = ""):
     """Records an entry in the audit log, using the same cursor/transaction
@@ -2056,7 +2061,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 </div>
             </div>
             <div class="flex items-center flex-wrap gap-2 text-xs font-semibold">
-                <span class="bg-gradient-to-r from-amber-500 to-amber-600 text-white px-3 py-2 rounded-xl shadow-xs">💰 KSh {float(school['wallet_balance']):,.2f}</span>
+                <span class="{('bg-gradient-to-r from-emerald-500 to-emerald-600' if school.get('subscription_expires_at') and school['subscription_expires_at'] > datetime.now() else 'bg-gradient-to-r from-rose-500 to-rose-600') if BILLING_ENFORCED else 'bg-gradient-to-r from-slate-500 to-slate-600'} text-white px-3 py-2 rounded-xl shadow-xs">{(('✅ Active until ' + school['subscription_expires_at'].strftime('%d %b %Y')) if school.get('subscription_expires_at') and school['subscription_expires_at'] > datetime.now() else '⚠️ No active subscription') if BILLING_ENFORCED else '💳 Subscriptions launching soon'}</span>
                 <span class="bg-gradient-to-r from-indigo-800 to-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 Timetable</a>
                 <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
@@ -2111,26 +2116,16 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                     </div>
                 </div>
 
-                <!-- System Wallet -->
+                <!-- Subscription Status -->
                 <div class="pt-5 border-t border-slate-100">
                     <h2 class="text-[11px] font-bold uppercase tracking-wider text-amber-700 flex items-center gap-1.5 mb-2.5">
-                        <span class="w-2 h-2 rounded-full bg-amber-500"></span> System Wallet
+                        <span class="w-2 h-2 rounded-full bg-amber-500"></span> Subscription Status
                     </h2>
                     <div class="bg-gradient-to-br from-amber-50 to-white border border-amber-100 rounded-xl p-3 mb-3">
-                        <p class="text-[10px] text-amber-700 font-bold uppercase tracking-wide">Current Balance</p>
-                        <p class="text-lg font-black text-slate-900">KSh {float(school['wallet_balance']):,.2f}</p>
+                        <p class="text-[10px] text-amber-700 font-bold uppercase tracking-wide">Status</p>
+                        <p class="text-lg font-black text-slate-900">{(('✅ Active until ' + school['subscription_expires_at'].strftime('%d %b %Y')) if school.get('subscription_expires_at') and school['subscription_expires_at'] > datetime.now() else '⚠️ No active subscription') if BILLING_ENFORCED else '💳 Launching soon'}</p>
                     </div>
-                    <form action="/api/v1/wallet/stkpush/{school_id}" method="post" class="space-y-2.5">
-                        <div>
-                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Lipa na M-PESA Phone Number</label>
-                            <input type="text" name="phone_number" placeholder="07XXXXXXXX" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-amber-400" required>
-                        </div>
-                        <div>
-                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Topup Amount (KSh)</label>
-                            <input type="number" name="amount" value="500" min="10" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-amber-400" required>
-                        </div>
-                        <button type="submit" class="w-full bg-amber-500 hover:bg-amber-600 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">🚀 Request STK Push</button>
-                    </form>
+                    <a href="/billing/subscription/{school_id}" class="block text-center w-full bg-amber-500 hover:bg-amber-600 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs">💳 Manage Subscription</a>
                 </div>
 
                 <!-- Settings -->
@@ -2326,7 +2321,9 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
             </td>
             <td class="p-4 text-center font-semibold">{s['student_count']}</td>
             <td class="p-4 text-center font-semibold">{s['staff_count']}</td>
-            <td class="p-4 text-center">KSh {float(s['wallet_balance']):,.2f}</td>
+            <td class="p-4 text-center">
+                {(f"<span class='text-xs font-bold text-emerald-700'>✅ {s['subscription_expires_at'].strftime('%d %b %Y')}</span>" if s.get('subscription_expires_at') and s['subscription_expires_at'] > datetime.now() else "<span class='text-xs font-bold text-rose-500'>⚠️ None</span>") if BILLING_ENFORCED else "<span class='text-xs font-bold text-slate-400'>Not enforced yet</span>"}
+            </td>
             <td class="p-4 text-xs text-slate-400">{s['created_at'].strftime('%d %b %Y') if s['created_at'] else '—'}</td>
             <td class="p-4 text-right text-xs">{action_buttons}</td>
         </tr>
@@ -2348,6 +2345,7 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
             <h1 class="text-base font-bold tracking-tight">🛡️ Super Admin Portal</h1>
             <div class="flex items-center gap-2">
                 <a href="/superadmin/schemes/list" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">📘 Schemes of Work</a>
+                <a href="/superadmin/billing/settings" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">💰 Billing Settings</a>
                 <form action="/api/v1/superadmin/backup-now" method="post" onsubmit="return confirm('Trigger an on-demand database backup now? This runs in the background via GitHub Actions and does not affect any school\\'s live data.');">
                     <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded-xl text-xs font-bold transition">💾 Backup Now</button>
                 </form>
@@ -2399,7 +2397,7 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
                                 <th class="p-4">Admin Contact</th>
                                 <th class="p-4 text-center">Students</th>
                                 <th class="p-4 text-center">Staff</th>
-                                <th class="p-4 text-center">Wallet</th>
+                                <th class="p-4 text-center">Subscription</th>
                                 <th class="p-4">Registered</th>
                                 <th class="p-4 text-right">Actions</th>
                             </tr>
@@ -2849,6 +2847,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                 <a href="/timetable/teachers/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 My Timetable</a>
                 <a href="/finance/staff/collect/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-3 py-2 rounded-xl transition">💰 Collect Fees</a>
                 <a href="/schemes/my-schemes/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📘 My Schemes of Work</a>
+                <a href="/staff/wallet/{school_id}" class="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-2 rounded-xl transition">💳 My Wallet</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
@@ -5776,36 +5775,6 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
         "skipped": skipped_entries,
     })
     return RedirectResponse(url=f"/staff/bulk-entry/{school_id}?{redirect_params}", status_code=303)
-
-@app.post("/api/v1/wallet/stkpush/{school_id}")
-def process_simulated_mpesa_stk_push(school_id: int, request: Request, phone_number: str = Form(...), amount: float = Form(...)):
-    auth_error = require_admin_session(request, school_id)
-    if auth_error:
-        return auth_error
-
-    phone_number = phone_number.strip()
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Top-up amount must be greater than zero.")
-    if not re.fullmatch(r"[0-9+\s]{7,15}", phone_number):
-        raise HTTPException(status_code=400, detail="Please provide a valid phone number.")
-
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE schools SET wallet_balance = wallet_balance + %s WHERE id = %s;", (amount, school_id))
-            conn.commit()
-
-    # Encode the user-supplied phone number as a JSON string literal (not just
-    # HTML-escaped) before splicing it into inline JavaScript, since it sits
-    # inside a `<script>` block where HTML-escaping alone would not stop
-    # someone from breaking out of the quoted string.
-    import json as _json
-    safe_phone_js = _json.dumps(phone_number)
-    return HTMLResponse(f"""
-    <script>
-        alert('STK Push Triggered to ' + {safe_phone_js} + ' successfully! Mock transaction completed.');
-        window.location.href='/admin/dashboard/{school_id}';
-    </script>
-    """)
 
 @app.post("/api/v1/school/promote-classes/{school_id}")
 def promote_school_classes(school_id: int, request: Request):

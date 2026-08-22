@@ -1349,6 +1349,20 @@ def scheme_copy_editor(school_id: int, copy_id: int, request: Request, saved: st
     back_url = f"/schemes/manage/{school_id}" if viewer and viewer['role'] != 'staff' else f"/schemes/my-schemes/{school_id}"
     back_label = "Manage Schemes" if viewer and viewer['role'] != 'staff' else "My Schemes of Work"
 
+    # Staff see a paywall on the print button until they've unlocked this
+    # specific scheme copy for its year; admins/super admins print for free.
+    # While billing isn't enforced yet (no production M-Pesa credentials
+    # set up), everyone prints free — see mpesa_routes.BILLING_ENFORCED.
+    print_button = f'<a href="/schemes/print/{school_id}/{copy_id}" target="_blank" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">🖨 Print</a>'
+    from mpesa_routes import BILLING_ENFORCED
+    if BILLING_ENFORCED and viewer and viewer['role'] == 'staff':
+        from mpesa_routes import has_scheme_print_unlock, get_billing_settings
+        if has_scheme_print_unlock(copy_id, viewer['id'], copy['year']):
+            print_button = f'<a href="/schemes/print/{school_id}/{copy_id}" target="_blank" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">🖨 Print ✅</a>'
+        else:
+            price = get_billing_settings()["scheme_print_amount"]
+            print_button = f'<a href="/schemes/pay/{school_id}/{copy_id}" class="bg-amber-600 hover:bg-amber-700 text-white px-4 py-2 rounded-xl text-xs font-bold transition">🔒 Unlock Print (KES {price:,.0f})</a>'
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -1359,7 +1373,7 @@ def scheme_copy_editor(school_id: int, copy_id: int, request: Request, saved: st
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <div class="flex items-center justify-between flex-wrap gap-2">
                     <h2 class="text-lg font-black text-slate-800">{esc(copy['subject_name'])} — {esc(copy['grade_name'])} {esc(copy['stream']) if copy['stream'] != 'ALL' else ''} ({esc(copy['term'])} {copy['year']})</h2>
-                    <a href="/schemes/print/{school_id}/{copy_id}" target="_blank" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">🖨 Print</a>
+                    {print_button}
                 </div>
                 <p class="text-xs text-slate-400 mt-1">Edit any field freely — this is your own copy, changes here never affect the master template or other schools.</p>
                 {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2 rounded-xl mt-3'>✅ Saved.</div>" if saved else ""}
@@ -1477,6 +1491,8 @@ def scheme_copy_print(school_id: int, copy_id: int, request: Request):
     if auth_error:
         return auth_error
 
+    viewer = get_current_session_user(request)
+
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
@@ -1493,6 +1509,17 @@ def scheme_copy_print(school_id: int, copy_id: int, request: Request):
 
             cur.execute("SELECT * FROM scheme_copy_rows WHERE copy_id = %s ORDER BY sort_order ASC;", (copy_id,))
             rows = cur.fetchall()
+
+    # Teachers pay individually, per scheme, per year, before they can
+    # print/download it — once paid for this scheme's year, it's free for
+    # the rest of that year. Admins and super admins are never gated here.
+    # While billing isn't enforced yet, nobody is gated — see
+    # mpesa_routes.BILLING_ENFORCED.
+    from mpesa_routes import BILLING_ENFORCED
+    if BILLING_ENFORCED and viewer and viewer['role'] == 'staff':
+        from mpesa_routes import has_scheme_print_unlock
+        if not has_scheme_print_unlock(copy_id, viewer['id'], copy['year']):
+            return RedirectResponse(url=f"/schemes/pay/{school_id}/{copy_id}", status_code=303)
 
     teacher_display_name = copy['teacher_name_override'] or copy['teacher_name_from_account'] or "___________________"
     tsc_display = copy['tsc_number_override'] or "___________________"
