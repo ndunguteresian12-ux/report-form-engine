@@ -856,10 +856,47 @@ def superadmin_billing_settings_page(request: Request, saved: str = None):
 
     settings = get_billing_settings()
 
+    # Revenue actually collected (completed transactions only — pending
+    # or failed ones never moved real money). Subscriptions and staff
+    # wallet top-ups are the only two channels money ever comes in
+    # through; 'scheme_print' is a legacy purpose from before the wallet
+    # model and is included in the staff total for historical accuracy,
+    # in case any old direct per-scheme payments exist.
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT purpose, COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total
+                FROM mpesa_transactions
+                WHERE status = 'completed'
+                GROUP BY purpose;
+            """)
+            by_purpose = {r['purpose']: r for r in cur.fetchall()}
+
+    subscription_total = float(by_purpose.get('subscription', {}).get('total', 0) or 0)
+    subscription_count = by_purpose.get('subscription', {}).get('cnt', 0) or 0
+    staff_total = float(by_purpose.get('wallet_topup', {}).get('total', 0) or 0) + float(by_purpose.get('scheme_print', {}).get('total', 0) or 0)
+    staff_count = (by_purpose.get('wallet_topup', {}).get('cnt', 0) or 0) + (by_purpose.get('scheme_print', {}).get('cnt', 0) or 0)
+
+    revenue_cards = f"""
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div class="bg-gradient-to-br from-indigo-50 to-white border border-indigo-100 rounded-xl p-4">
+                <p class="text-[10px] text-indigo-700 font-bold uppercase tracking-wide">Collected from Schools (Subscriptions)</p>
+                <p class="text-2xl font-black text-slate-900">KES {subscription_total:,.0f}</p>
+                <p class="text-xs text-slate-400">{subscription_count} completed payment(s)</p>
+            </div>
+            <div class="bg-gradient-to-br from-emerald-50 to-white border border-emerald-100 rounded-xl p-4">
+                <p class="text-[10px] text-emerald-700 font-bold uppercase tracking-wide">Collected from Staff (Wallet Top-ups)</p>
+                <p class="text-2xl font-black text-slate-900">KES {staff_total:,.0f}</p>
+                <p class="text-xs text-slate-400">{staff_count} completed payment(s)</p>
+            </div>
+        </div>
+    """
+
     body = f"""
         <a href="/superadmin/dashboard" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Super Admin Portal</a>
         <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
             <h2 class="text-lg font-black text-slate-800">Billing Settings</h2>
+            {revenue_cards}
             <p class="text-xs text-slate-400">These are the only place prices are set in the whole system — every school subscription payment and every teacher's scheme print/download payment uses these amounts.</p>
             <a href="/superadmin/billing/mpesa-diagnostic" class="text-xs font-bold text-indigo-700 hover:text-indigo-900 inline-block">🔍 Check M-Pesa environment variables</a>
             {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2 rounded-xl'>✅ Saved.</div>" if saved else ""}
