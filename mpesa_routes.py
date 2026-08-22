@@ -306,7 +306,7 @@ def subscription_billing_page(school_id: int, request: Request):
         """
 
     body = f"""
-        <a href="{esc(get_dashboard_url(viewer))}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Dashboard</a>
+        <a href="{get_dashboard_url(request, school_id)}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Dashboard</a>
         <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
             <h2 class="text-lg font-black text-slate-800">Elimu Hub Subscription</h2>
             {status_html if BILLING_ENFORCED else ""}
