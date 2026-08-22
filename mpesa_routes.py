@@ -732,6 +732,61 @@ async def mpesa_callback(request: Request):
     return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
 
+@router.get("/superadmin/billing/mpesa-transactions", response_class=HTMLResponse)
+def superadmin_mpesa_transactions(request: Request):
+    """Shows the last 30 mpesa_transactions rows exactly as stored —
+    this is the ground truth for what actually happened to a payment,
+    since it tells us whether Safaricom's callback ever reached us at
+    all (status stuck on 'pending' = callback never arrived; status
+    'completed' but the wallet/subscription still looks wrong = the
+    callback arrived but something after that failed)."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT t.*, s.name AS school_name
+                FROM mpesa_transactions t
+                LEFT JOIN schools s ON t.school_id = s.id
+                ORDER BY t.created_at DESC
+                LIMIT 30;
+            """)
+            txns = cur.fetchall()
+
+    rows = ""
+    for t in txns:
+        status_color = {"completed": "text-emerald-700", "failed": "text-rose-600", "pending": "text-amber-600"}.get(t["status"], "text-slate-500")
+        rows += f"""
+        <tr class="border-b text-xs">
+            <td class="p-2">{t['id']}</td>
+            <td class="p-2">{esc(t['school_name'] or '—')}</td>
+            <td class="p-2">{esc(t['purpose'])}</td>
+            <td class="p-2">{t['reference_id'] if t['reference_id'] is not None else '—'}</td>
+            <td class="p-2">KES {t['amount']:,.0f}</td>
+            <td class="p-2 font-mono">{esc(t['phone_number'])}</td>
+            <td class="p-2 font-bold {status_color}">{esc(t['status'])}</td>
+            <td class="p-2">{esc(t['mpesa_receipt_number'] or '—')}</td>
+            <td class="p-2 text-slate-400">{esc((t['result_desc'] or '—')[:60])}</td>
+            <td class="p-2 text-slate-400">{t['created_at'].strftime('%d %b %H:%M')}</td>
+        </tr>
+        """
+
+    body = f"""
+        <a href="/superadmin/billing/settings" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Billing Settings</a>
+        <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4 overflow-x-auto">
+            <h2 class="text-lg font-black text-slate-800">Recent M-Pesa Transactions</h2>
+            <p class="text-xs text-slate-400">If a payment shows status "pending" here even though the customer got a real M-Pesa confirmation SMS, Safaricom's callback never reached this server — almost always a wrong/unreachable MPESA_CALLBACK_URL. If it shows "completed" but a wallet/subscription still looks unpaid, the callback arrived but something in processing it failed.</p>
+            <table class="w-full min-w-[900px]">
+                <thead><tr class="border-b-2 text-xs text-left"><th class="p-2">ID</th><th class="p-2">School</th><th class="p-2">Purpose</th><th class="p-2">Ref</th><th class="p-2">Amount</th><th class="p-2">Phone</th><th class="p-2">Status</th><th class="p-2">Receipt</th><th class="p-2">Result</th><th class="p-2">Created</th></tr></thead>
+                <tbody>{rows if rows else '<tr><td colspan="10" class="p-4 text-center text-slate-400">No transactions yet.</td></tr>'}</tbody>
+            </table>
+        </div>
+    """
+    return _page_shell("M-Pesa Transactions", body)
+
+
 @router.get("/superadmin/billing/mpesa-diagnostic", response_class=HTMLResponse)
 def superadmin_mpesa_diagnostic(request: Request):
     """Shows whether the RUNNING process actually sees each MPESA_*
@@ -775,6 +830,7 @@ def superadmin_mpesa_diagnostic(request: Request):
                 <thead><tr class="border-b-2"><th class="p-3 text-left">Variable</th><th class="p-3 text-left">Status</th><th class="p-3 text-left"></th></tr></thead>
                 <tbody>{rows}</tbody>
             </table>
+            <a href="/superadmin/billing/mpesa-transactions" class="block text-center w-full bg-indigo-600 hover:bg-indigo-700 text-white text-xs py-2.5 rounded-xl font-semibold transition">📋 View Recent Transactions</a>
         </div>
     """
     return _page_shell("M-Pesa Diagnostic", body)
