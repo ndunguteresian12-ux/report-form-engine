@@ -732,6 +732,54 @@ async def mpesa_callback(request: Request):
     return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
 
+@router.get("/superadmin/billing/mpesa-diagnostic", response_class=HTMLResponse)
+def superadmin_mpesa_diagnostic(request: Request):
+    """Shows whether the RUNNING process actually sees each MPESA_*
+    environment variable as set — never the values themselves. This
+    exists because 'I set it on Render' and 'this process can see it'
+    are two different claims, and the only way to tell them apart for
+    sure is to ask the process directly rather than guess from
+    screenshots of the dashboard."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    checks = [
+        ("MPESA_ENV", MPESA_ENV, "sandbox' or 'production"),
+        ("MPESA_CONSUMER_KEY", MPESA_CONSUMER_KEY, None),
+        ("MPESA_CONSUMER_SECRET", MPESA_CONSUMER_SECRET, None),
+        ("MPESA_SHORTCODE", MPESA_SHORTCODE, "174379 in sandbox"),
+        ("MPESA_PASSKEY", MPESA_PASSKEY, None),
+        ("MPESA_CALLBACK_URL", MPESA_CALLBACK_URL, None),
+    ]
+
+    rows = ""
+    for name, value, hint in checks:
+        is_set = bool(value)
+        status = f"<span class='text-emerald-700 font-bold'>✅ Set ({len(value)} characters)</span>" if is_set else "<span class='text-rose-600 font-bold'>❌ Not set / empty</span>"
+        preview = f"<span class='text-slate-400 text-xs'>starts with: {esc(value[:4])}…</span>" if is_set and len(value) > 4 else ""
+        rows += f"""
+        <tr class="border-b">
+            <td class="p-3 font-mono text-xs font-bold">{name}</td>
+            <td class="p-3">{status}</td>
+            <td class="p-3">{preview}</td>
+        </tr>
+        """
+
+    body = f"""
+        <a href="/superadmin/billing/settings" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Billing Settings</a>
+        <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+            <h2 class="text-lg font-black text-slate-800">M-Pesa Environment Variable Check</h2>
+            <p class="text-xs text-slate-400">This checks what the CURRENTLY RUNNING process actually sees — not what's saved on Render's dashboard. If a variable shows "Not set" here after you've saved it and redeployed, the name almost certainly doesn't match exactly (case, spelling, a stray space) between what's on Render and what the code reads.</p>
+            <table class="w-full text-sm">
+                <thead><tr class="border-b-2"><th class="p-3 text-left">Variable</th><th class="p-3 text-left">Status</th><th class="p-3 text-left"></th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+        </div>
+    """
+    return _page_shell("M-Pesa Diagnostic", body)
+
+
 @router.get("/superadmin/billing/settings", response_class=HTMLResponse)
 def superadmin_billing_settings_page(request: Request, saved: str = None):
     auth_error = require_superadmin_session(request)
@@ -745,6 +793,7 @@ def superadmin_billing_settings_page(request: Request, saved: str = None):
         <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
             <h2 class="text-lg font-black text-slate-800">Billing Settings</h2>
             <p class="text-xs text-slate-400">These are the only place prices are set in the whole system — every school subscription payment and every teacher's scheme print/download payment uses these amounts.</p>
+            <a href="/superadmin/billing/mpesa-diagnostic" class="text-xs font-bold text-indigo-700 hover:text-indigo-900 inline-block">🔍 Check M-Pesa environment variables</a>
             {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2 rounded-xl'>✅ Saved.</div>" if saved else ""}
             <form method="post" action="/superadmin/billing/settings" class="space-y-4">
                 <div>
