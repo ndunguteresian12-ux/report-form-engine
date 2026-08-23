@@ -183,11 +183,22 @@ def bootstrap_mpesa_schema():
 
 def get_billing_settings() -> dict:
     """Reads the Super Admin's current prices. Always returns a row —
-    bootstrap_mpesa_schema guarantees one exists."""
+    bootstrap_mpesa_schema guarantees one exists.
+
+    Converts the NUMERIC columns to plain float rather than leaving them
+    as psycopg2's default decimal.Decimal — several call sites do direct
+    arithmetic against wallet balances (which are floats, see
+    get_wallet_balance), and Python raises a TypeError on Decimal-minus-
+    float rather than silently coercing one to the other. Converting
+    once here means every caller gets a plain float automatically,
+    instead of needing its own float() cast at every comparison site."""
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM billing_settings WHERE id = 1;")
-            return cur.fetchone()
+            row = dict(cur.fetchone())
+    for key in ("subscription_termly_amount", "subscription_yearly_amount", "scheme_print_amount"):
+        row[key] = float(row[key])
+    return row
 
 
 def _normalize_msisdn(phone: str) -> str:
