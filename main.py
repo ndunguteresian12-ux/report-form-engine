@@ -1588,6 +1588,17 @@ async def register_new_tenant_pipeline(
     safe_password = admin_password[:72]
     hashed_password = get_password_hash(safe_password)
 
+    # New schools get one term free before a subscription payment is ever
+    # required — reuses the same termly duration mpesa_routes.py already
+    # grants a real termly payment, so the trial always matches whatever
+    # "one term" currently means without this needing its own separate
+    # constant to keep in sync. This only affects the SCHOOL subscription
+    # status; staff still pay individually to print/download a scheme of
+    # work regardless of trial or subscription status — that check never
+    # looks at schools.subscription_expires_at at all, by design.
+    from mpesa_routes import SUBSCRIPTION_PLAN_DAYS
+    free_trial_days = SUBSCRIPTION_PLAN_DAYS["termly"]
+
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT id FROM users WHERE email = %s;", (admin_email,))
@@ -1595,9 +1606,9 @@ async def register_new_tenant_pipeline(
                 raise HTTPException(status_code=400, detail="Registration Refused: Email already allocated.")
             
             cur.execute("""
-                INSERT INTO schools (name, sub_county, physical_address, logo_url, wallet_balance, theme_color, status, terms_accepted_at)
-                VALUES (%s, %s, %s, %s, 0.00, 'emerald', 'pending', NOW()) RETURNING id;
-            """, (school_name, sub_county, physical_address, logo_resolved_url))
+                INSERT INTO schools (name, sub_county, physical_address, logo_url, wallet_balance, theme_color, status, terms_accepted_at, subscription_expires_at)
+                VALUES (%s, %s, %s, %s, 0.00, 'emerald', 'pending', NOW(), NOW() + (%s || ' days')::INTERVAL) RETURNING id;
+            """, (school_name, sub_county, physical_address, logo_resolved_url, free_trial_days))
             new_school_id = cur.fetchone()['id']
 
             cur.execute("""
@@ -2451,9 +2462,28 @@ def superadmin_approve_school(school_id: int, request: Request):
         return auth_error
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE schools SET status = 'active' WHERE id = %s;", (school_id,))
+            # Approval is when a school actually becomes usable, so this is
+            # when its one-term free trial clock should start — not at
+            # registration, which would silently burn trial days while a
+            # school sits waiting for review. Only grants a trial if the
+            # school doesn't already have a subscription_expires_at (so
+            # re-approving a previously deactivated/reactivated school never
+            # overwrites a real paid subscription with a fresh free trial).
+            from mpesa_routes import SUBSCRIPTION_PLAN_DAYS
+            cur.execute("SELECT subscription_expires_at FROM schools WHERE id = %s;", (school_id,))
+            existing = cur.fetchone()
+            if existing and not existing[0]:
+                cur.execute("""
+                    UPDATE schools
+                    SET status = 'active',
+                        subscription_expires_at = NOW() + (%s || ' days')::INTERVAL,
+                        subscription_is_trial = TRUE
+                    WHERE id = %s;
+                """, (SUBSCRIPTION_PLAN_DAYS["termly"], school_id))
+            else:
+                cur.execute("UPDATE schools SET status = 'active' WHERE id = %s;", (school_id,))
             conn.commit()
-            log_audit_action(cur, request, school_id, "school_approved", "Approved school registration")
+            log_audit_action(cur, request, school_id, "school_approved", "Approved school registration — granted one-term free trial")
             conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
 

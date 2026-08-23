@@ -96,6 +96,31 @@ def bootstrap_mpesa_schema():
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE schools ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMP;")
 
+            # One-time backfill for schools that existed before this trial
+            # feature was added — they have subscription_expires_at = NULL,
+            # which would otherwise mean an abrupt cutoff to "no active
+            # subscription" the instant billing is enforced, unlike new
+            # signups which get a one-term trial automatically at creation
+            # (see the registration route in main.py). This grants the same
+            # one-term grace period retroactively, but the WHERE clause
+            # makes it safe to re-run on every deploy — it only ever
+            # touches a school that has NEVER had any subscription/trial
+            # value set, so it never overwrites a real paid subscription
+            # or a trial that's already been granted (including by this
+            # same backfill running again on the next deploy).
+            cur.execute("""
+                UPDATE schools
+                SET subscription_expires_at = NOW() + (%s || ' days')::INTERVAL
+                WHERE subscription_expires_at IS NULL;
+            """, (SUBSCRIPTION_PLAN_DAYS["termly"],))
+            # Distinguishes "free trial" from "actually paid" purely for
+            # display — both use subscription_expires_at as the single
+            # source of truth for whether printing/subscription features
+            # are unlocked, so is_school_subscription_active() and the
+            # print-paywall gating never need to know or care which kind
+            # of active period a school is in.
+            cur.execute("ALTER TABLE schools ADD COLUMN IF NOT EXISTS subscription_is_trial BOOLEAN NOT NULL DEFAULT FALSE;")
+
             # Single-row settings table — Super Admin edits these amounts,
             # nothing about pricing lives in code.
             cur.execute("""
@@ -716,7 +741,8 @@ async def mpesa_callback(request: Request):
                     days = txn["reference_id"] or 30
                     cur.execute("""
                         UPDATE schools
-                        SET subscription_expires_at = GREATEST(COALESCE(subscription_expires_at, NOW()), NOW()) + (%s || ' days')::INTERVAL
+                        SET subscription_expires_at = GREATEST(COALESCE(subscription_expires_at, NOW()), NOW()) + (%s || ' days')::INTERVAL,
+                            subscription_is_trial = FALSE
                         WHERE id = %s;
                     """, (days, txn["school_id"]))
                 elif txn["purpose"] == "wallet_topup":
@@ -962,6 +988,26 @@ def is_school_subscription_active(school_id: int) -> bool:
             cur.execute("SELECT subscription_expires_at FROM schools WHERE id = %s;", (school_id,))
             row = cur.fetchone()
     return bool(row and row["subscription_expires_at"] and row["subscription_expires_at"] > datetime.datetime.now())
+
+
+def subscription_status_label(school: dict) -> tuple:
+    """Given a school row (must include subscription_expires_at and
+    subscription_is_trial — both present on any 'SELECT * FROM schools'
+    row), returns (label_text, color_class) for consistent display
+    across the admin header badge, sidebar widget, and super admin
+    table. A free trial and a real paid subscription both unlock the
+    exact same features (is_school_subscription_active doesn't
+    distinguish them at all) — this label exists purely so an admin
+    understands *why* they currently have access, since a trial ending
+    soon needs a different next action (pay) than an active paid period
+    does (nothing)."""
+    expires_at = school.get('subscription_expires_at')
+    is_trial = school.get('subscription_is_trial')
+    if expires_at and expires_at > datetime.datetime.now():
+        if is_trial:
+            return (f"🎓 Free Trial — ends {expires_at.strftime('%d %b %Y')}", "bg-gradient-to-r from-amber-500 to-amber-600")
+        return (f"✅ Active until {expires_at.strftime('%d %b %Y')}", "bg-gradient-to-r from-emerald-500 to-emerald-600")
+    return ("⚠️ No active subscription", "bg-gradient-to-r from-rose-500 to-rose-600")
 
 
 def render_admin_print_toolbar_and_content(school_id: int, document_content_html: str, doc_label: str, button_color: str = "#4f46e5", max_height_px: int = 480):
