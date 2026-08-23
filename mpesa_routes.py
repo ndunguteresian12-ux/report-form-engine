@@ -964,6 +964,86 @@ def is_school_subscription_active(school_id: int) -> bool:
     return bool(row and row["subscription_expires_at"] and row["subscription_expires_at"] > datetime.datetime.now())
 
 
+def render_admin_print_toolbar_and_content(school_id: int, document_content_html: str, doc_label: str, button_color: str = "#4f46e5", max_height_px: int = 480):
+    """Every printable admin-portal document (rosters, merit lists, top
+    10 lists, grade distribution, subject analysis, class statements,
+    receipts, bulk report card batches) routes its toolbar + content
+    through this one function, so the "requires a subscription to
+    print" behavior only has to be changed in one place rather than
+    across nine separate route bodies.
+
+    Returns (toolbar_button_html, content_html, extra_style_html):
+      - toolbar_button_html: goes inside the existing .no-print div —
+        the real print button when subscribed, a "Subscribe to Print"
+        link instead when not.
+      - content_html: the actual document body — unchanged when
+        subscribed; when not, wrapped in a height-limited, overflow-
+        hidden container (default max_height_px=480, adjustable per
+        call — a dense multi-page batch like report cards can pass a
+        taller value so the preview shows a meaningful chunk rather
+        than a sliver of the first page) with a "Subscribe to unlock"
+        card underneath. This wrapping never parses or splits the
+        original HTML, so it's safe regardless of the document's
+        internal structure.
+      - extra_style_html: goes in <head> — empty when subscribed; when
+        not, a print-stylesheet rule that blanks the entire physical
+        printout except a lock message, so bypassing the disabled
+        button with Ctrl+P still doesn't produce the real document on
+        paper or as a browser-native PDF.
+
+    Honest limitation: this is a strong deterrent for the ordinary
+    "click print" / "Ctrl+P" path, not a cryptographic guarantee —
+    someone determined enough with browser dev tools could still strip
+    this out of the page's own HTML/CSS. There's no real PDF file or
+    server-side PDF library involved anywhere in this codebase; every
+    one of these pages has always been a browser-rendered HTML page
+    that "Save as PDF" captures via the browser's own print dialog."""
+    if is_school_subscription_active(school_id):
+        toolbar_button = f'<button onclick="window.print()" style="background:{button_color};color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>'
+        return toolbar_button, document_content_html, ""
+
+    toolbar_button = f'<a href="/billing/subscription/{school_id}" style="background:#f59e0b;color:white;padding:10px 18px;border-radius:8px;font-weight:bold;text-decoration:none;display:inline-block;">🔒 Subscribe to Print</a><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">This school\'s Elimu Hub subscription is inactive, so printing/saving and part of this document are locked.</p>'
+
+    extra_style_html = """
+    <style>
+        @media print {
+            body * { visibility: hidden !important; }
+            .eh-print-lock, .eh-print-lock * { visibility: visible !important; }
+            .eh-print-lock {
+                position: fixed !important; top: 0; left: 0; width: 100%; height: 100%;
+                display: flex !important; align-items: center; justify-content: center;
+                background: white !important; z-index: 999999;
+            }
+        }
+        .eh-print-lock { display: none; }
+    </style>
+    """
+
+    print_lock_div = f"""
+    <div class="eh-print-lock">
+        <div style="text-align:center; font-family: sans-serif; padding: 40px;">
+            <p style="font-size:26px; font-weight:900; margin:0 0 12px;">🔒 Subscription Required</p>
+            <p style="font-size:14px; color:#475569; margin:0;">This school does not have an active Elimu Hub subscription.<br>Visit /billing/subscription/{school_id} to unlock printing.</p>
+        </div>
+    </div>
+    """
+
+    content_html = f"""
+    <div style="position:relative; max-height:{max_height_px}px; overflow:hidden;">
+        {document_content_html}
+        <div style="position:absolute; bottom:0; left:0; right:0; height:240px; background:linear-gradient(to bottom, rgba(255,255,255,0), white 65%); pointer-events:none;"></div>
+    </div>
+    <div style="text-align:center; margin-top:16px; padding:22px; background:#fffbeb; border:2px dashed #f59e0b; border-radius:16px;">
+        <p style="font-weight:900; font-size:16px; margin:0 0 8px; color:#92400e;">🔒 Subscribe to unlock the rest of this {esc(doc_label)}</p>
+        <p style="font-size:12px; color:#94a3b8; margin:0 0 14px;">Your school doesn't currently have an active Elimu Hub subscription, so part of this document is hidden and printing/saving is disabled.</p>
+        <a href="/billing/subscription/{school_id}" style="background:#f59e0b;color:white;padding:10px 22px;border-radius:10px;font-weight:900;text-decoration:none;display:inline-block;">Subscribe Now</a>
+    </div>
+    {print_lock_div}
+    """
+
+    return toolbar_button, content_html, extra_style_html
+
+
 def has_scheme_print_unlock(copy_id: int, user_id: int, year: int) -> bool:
     """Call this before letting a teacher print/download a scheme copy.
     Scoped to the scheme's own year — paying for Grade 4 Term 2 Maths this

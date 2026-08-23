@@ -2917,6 +2917,22 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
 
     class_title = grade_name if stream == "SINGLE STREAM" else f"{grade_name} — {stream}"
 
+    from mpesa_routes import render_admin_print_toolbar_and_content
+    document_content_html = f"""
+        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #059669;padding-bottom:12px;">
+            {logo_html}
+            <div>
+                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">{esc(class_title)} — Class Roster ({len(roster_students)} students)</p>
+            </div>
+        </div>
+        <table>
+            <thead><tr><th style="text-align:center;">S.No</th><th>Adm No.</th><th>Full Name</th></tr></thead>
+            <tbody>{rows_html or "<tr><td colspan='3' style='padding:20px;text-align:center;color:#94a3b8;'>No students in this class.</td></tr>"}</tbody>
+        </table>
+    """
+    toolbar_button, content_html, extra_style_html = render_admin_print_toolbar_and_content(school_id, document_content_html, "class roster", "#059669")
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -2929,22 +2945,13 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
             table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
             th {{ text-align:left; padding:8px 12px; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:12px; text-transform:uppercase; color:#64748b; }}
         </style>
+        {extra_style_html}
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#059669;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
+            {toolbar_button}
         </div>
-        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #059669;padding-bottom:12px;">
-            {logo_html}
-            <div>
-                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">{esc(class_title)} — Class Roster ({len(roster_students)} students)</p>
-            </div>
-        </div>
-        <table>
-            <thead><tr><th style="text-align:center;">S.No</th><th>Adm No.</th><th>Full Name</th></tr></thead>
-            <tbody>{rows_html or "<tr><td colspan='3' style='padding:20px;text-align:center;color:#94a3b8;'>No students in this class.</td></tr>"}</tbody>
-        </table>
+        {content_html}
     </body>
     </html>
     """
@@ -3150,27 +3157,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         f"<td style='text-align:center;'>{f['avg_pts']:.4f} {f['level']}</td>" for f in subject_footer
     )
 
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
-        <title>Elimu Hub | Merit List — {esc(grade_name)}</title>
-        <style>
-            @page {{ size: landscape; margin: 10mm; }}
-            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; font-size: 11px; }}
-            @media print {{ .no-print {{ display: none !important; }} }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
-            th, td {{ padding: 4px 6px; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }}
-            th {{ text-align:left; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:9px; text-transform:uppercase; color:#64748b; }}
-            .header-fields td {{ border: none; padding: 2px 10px 2px 0; font-size: 11px; }}
-        </style>
-    </head>
-    <body>
-        <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <a href="/admin/reports/merit-list/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}{'&combined=1' if not combined else ''}" style="background:#0d9488;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">{'📄 Switch to Single Cycle (' + str(st['active_cycle']) + ')' if combined else '📊 Switch to Combined Term (Opener + Mid + End)'}</a>
-            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
-        </div>
+    from mpesa_routes import render_admin_print_toolbar_and_content
+    document_content_html = f"""
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
             <div>
@@ -3219,6 +3207,32 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             — Student performance level is calculated using the student's average points.<br>
             — "Prv Str Pos" / "Prv Ovr Pos" (previous exam positions) are not yet tracked by this system and are shown blank.
         </p>
+    """
+    toolbar_button, content_html, extra_style_html = render_admin_print_toolbar_and_content(school_id, document_content_html, "merit list", "#4f46e5")
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
+        <title>Elimu Hub | Merit List — {esc(grade_name)}</title>
+        <style>
+            @page {{ size: landscape; margin: 10mm; }}
+            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; font-size: 11px; }}
+            @media print {{ .no-print {{ display: none !important; }} }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
+            th, td {{ padding: 4px 6px; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }}
+            th {{ text-align:left; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:9px; text-transform:uppercase; color:#64748b; }}
+            .header-fields td {{ border: none; padding: 2px 10px 2px 0; font-size: 11px; }}
+        </style>
+        {extra_style_html}
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            <a href="/admin/reports/merit-list/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}{'&combined=1' if not combined else ''}" style="background:#0d9488;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">{'📄 Switch to Single Cycle (' + str(st['active_cycle']) + ')' if combined else '📊 Switch to Combined Term (Opener + Mid + End)'}</a>
+            {toolbar_button}
+        </div>
+        {content_html}
     </body>
     </html>
     """
@@ -3317,23 +3331,8 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
     stream_header = "<th style='text-align:center;'>Stream</th>" if whole_grade else ""
     colspan_count = 8 if whole_grade else 7
 
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
-        <title>Elimu Hub | Top 10 — {esc(class_title)}</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
-            @media print {{ .no-print {{ display: none !important; }} }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
-            th {{ text-align:left; padding:8px 12px; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:12px; text-transform:uppercase; color:#64748b; }}
-        </style>
-    </head>
-    <body>
-        <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
-        </div>
+    from mpesa_routes import render_admin_print_toolbar_and_content
+    document_content_html = f"""
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
             <div>
@@ -3352,6 +3351,28 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
             </thead>
             <tbody>{rows_html or "<tr><td colspan='" + str(colspan_count) + "' style='padding:20px;text-align:center;color:#94a3b8;'>No scores recorded yet for this stream.</td></tr>"}</tbody>
         </table>
+    """
+    toolbar_button, content_html, extra_style_html = render_admin_print_toolbar_and_content(school_id, document_content_html, "top 10 report", "#4f46e5")
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
+        <title>Elimu Hub | Top 10 — {esc(class_title)}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
+            @media print {{ .no-print {{ display: none !important; }} }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+            th {{ text-align:left; padding:8px 12px; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:12px; text-transform:uppercase; color:#64748b; }}
+        </style>
+        {extra_style_html}
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            {toolbar_button}
+        </div>
+        {content_html}
     </body>
     </html>
     """
@@ -3432,6 +3453,24 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
         </div>
         """
 
+    return _render_top_subject_page(school, class_title, logo_html, st, all_scores, subject_tables_html, school_id)
+
+
+def _render_top_subject_page(school, class_title, logo_html, st, all_scores, subject_tables_html, school_id):
+    from mpesa_routes import render_admin_print_toolbar_and_content
+    document_content_html = f"""
+        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
+            {logo_html}
+            <div>
+                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top 10 Per Subject — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
+            </div>
+        </div>
+        {"<p class='no-print' style='background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 14px;border-radius:8px;font-size:12px;margin-top:12px;'>⚠️ No scores found for the <b>" + esc(str(st['active_cycle'])) + "</b> cycle for this stream. This report only looks at whichever exam cycle is currently marked active in Settings (Assessment Phase). If scores were entered under a different cycle (e.g. Opener/Midterm), either switch Assessment Phase to match, or enter scores for the currently active cycle.</p>" if not all_scores else ""}
+        {subject_tables_html or "<p style='padding:20px;text-align:center;color:#94a3b8;'>No subjects configured for this level.</p>"}
+    """
+    toolbar_button, content_html, extra_style_html = render_admin_print_toolbar_and_content(school_id, document_content_html, "top student per subject report", "#4f46e5")
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -3444,20 +3483,13 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
             table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
             th {{ text-align:left; padding:8px 12px; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:12px; text-transform:uppercase; color:#64748b; }}
         </style>
+        {extra_style_html}
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
+            {toolbar_button}
         </div>
-        <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
-            {logo_html}
-            <div>
-                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top 10 Per Subject — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
-            </div>
-        </div>
-        {"<p class='no-print' style='background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 14px;border-radius:8px;font-size:12px;margin-top:12px;'>⚠️ No scores found for the <b>" + esc(str(st['active_cycle'])) + "</b> cycle for this stream. This report only looks at whichever exam cycle is currently marked active in Settings (Assessment Phase). If scores were entered under a different cycle (e.g. Opener/Midterm), either switch Assessment Phase to match, or enter scores for the currently active cycle.</p>" if not all_scores else ""}
-        {subject_tables_html or "<p style='padding:20px;text-align:center;color:#94a3b8;'>No subjects configured for this level.</p>"}
+        {content_html}
     </body>
     </html>
     """
@@ -3571,24 +3603,8 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
     class_wide_level_cells = "".join(f"<td style='text-align:center;'>{class_wide_summary['counts'][lvl]}</td>" for lvl in PLD_ORDER)
     level_header_cells = "".join(f"<th style='text-align:center;'>{lvl}</th>" for lvl in PLD_ORDER)
 
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
-        <title>Elimu Hub | Grade Distribution — {esc(grade_name)}</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; font-size: 11px; }}
-            @media print {{ .no-print {{ display: none !important; }} }}
-            table {{ width: 100%; border-collapse: collapse; }}
-            th, td {{ padding: 6px 8px; border-bottom: 1px solid #e2e8f0; }}
-            th {{ text-align:left; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
-        </style>
-    </head>
-    <body>
-        <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
-        </div>
+    from mpesa_routes import render_admin_print_toolbar_and_content
+    document_content_html = f"""
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
             <div>
@@ -3614,6 +3630,29 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
                 </tbody>
             </table>
         </div>
+    """
+    toolbar_button, content_html, extra_style_html = render_admin_print_toolbar_and_content(school_id, document_content_html, "grade distribution report", "#4f46e5")
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
+        <title>Elimu Hub | Grade Distribution — {esc(grade_name)}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; font-size: 11px; }}
+            @media print {{ .no-print {{ display: none !important; }} }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ padding: 6px 8px; border-bottom: 1px solid #e2e8f0; }}
+            th {{ text-align:left; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
+        </style>
+        {extra_style_html}
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            {toolbar_button}
+        </div>
+        {content_html}
     </body>
     </html>
     """
@@ -3886,23 +3925,8 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
 
     class_title = grade_name if stream == "SINGLE STREAM" else f"{grade_name} — {stream}"
 
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
-        <title>Elimu Hub | Subject Analysis — {esc(class_title)}</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
-            @media print {{ .no-print {{ display: none !important; }} }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
-            th {{ text-align:left; padding:8px 12px; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:12px; text-transform:uppercase; color:#64748b; }}
-        </style>
-    </head>
-    <body>
-        <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <button onclick="window.print()" style="background:#0d9488;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
-        </div>
+    from mpesa_routes import render_admin_print_toolbar_and_content
+    document_content_html = f"""
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #0d9488;padding-bottom:12px;">
             {logo_html}
             <div>
@@ -3919,6 +3943,28 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
             <tbody>{rows_html or "<tr><td colspan='8' style='padding:20px;text-align:center;color:#94a3b8;'>No subjects or scores found for this class.</td></tr>"}</tbody>
         </table>
         <p style="font-size:10px;color:#94a3b8;margin-top:12px;">EE = Exceeding Expectations · ME = Meeting Expectations · AE = Approaching Expectations · BE = Below Expectations. Counts reflect students with at least one score recorded for that subject.</p>
+    """
+    toolbar_button, content_html, extra_style_html = render_admin_print_toolbar_and_content(school_id, document_content_html, "subject analysis report", "#0d9488")
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
+        <title>Elimu Hub | Subject Analysis — {esc(class_title)}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; padding: 32px; color: #1e293b; }}
+            @media print {{ .no-print {{ display: none !important; }} }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 16px; }}
+            th {{ text-align:left; padding:8px 12px; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:12px; text-transform:uppercase; color:#64748b; }}
+        </style>
+        {extra_style_html}
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px;">
+            {toolbar_button}
+        </div>
+        {content_html}
     </body>
     </html>
     """
@@ -4781,6 +4827,16 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                 """)
 
             joined_report_pages = "\n".join(report_cards_html)
+
+            from mpesa_routes import render_admin_print_toolbar_and_content
+            toolbar_button, wrapped_pages, extra_style_html = render_admin_print_toolbar_and_content(
+                school_id,
+                f"{missing_marks_banner}{joined_report_pages}",
+                "batch of report cards",
+                "#0f172a",
+                max_height_px=900,
+            )
+
             return f"""
             <!DOCTYPE html>
             <html>
@@ -4822,13 +4878,13 @@ def output_batch_class_report_forms(school_id: int, grade_name: str, education_l
                         }}
                     }}
                 </style>
+                {extra_style_html}
             </head>
             <body style="background:#64748b; padding:30px 20px; margin:0;">
                 <div class="no-print" style="max-width:199mm; margin: 0 auto 20px auto; text-align:right;">
-                    <button onclick="window.print()" style="background:#0f172a; color:white; border:none; padding:11px 22px; font-weight:bold; font-size:13px; border-radius:6px; cursor:pointer; box-shadow:0 3px 6px rgba(0,0,0,0.15);">🖨️ Commit Print Batch to Paper</button>
+                    {toolbar_button}
                 </div>
-                {missing_marks_banner}
-                {joined_report_pages}
+                {wrapped_pages}
             </body>
             </html>
             """
