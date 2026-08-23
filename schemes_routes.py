@@ -101,8 +101,8 @@ def bootstrap_schemes_schema():
                     id SERIAL PRIMARY KEY,
                     master_id INTEGER REFERENCES scheme_masters(id) ON DELETE CASCADE,
                     sort_order INTEGER NOT NULL DEFAULT 0,
-                    week_number VARCHAR(20),
-                    lesson_number VARCHAR(20),
+                    week_number TEXT,
+                    lesson_number TEXT,
                     strand TEXT,
                     sub_strand TEXT,
                     learning_outcomes TEXT,
@@ -113,6 +113,19 @@ def bootstrap_schemes_schema():
                     reflection TEXT
                 );
             """)
+            # Widen existing deployments too — these were originally
+            # VARCHAR(20), which is too tight for whatever a real uploaded
+            # document sometimes puts in a "week"/"lesson" cell (a whole
+            # phrase, a merged cell, a misaligned column from the source
+            # document). Every other field in this table was always TEXT;
+            # these two never had a real reason to be shorter, and the
+            # mismatch caused uploads to crash with StringDataRightTruncation
+            # whenever a real document didn't fit the artificial limit.
+            # ALTER COLUMN TYPE to TEXT is always safe and lossless here —
+            # it only widens, never truncates existing data — and is a
+            # no-op to re-run on a database that's already been widened.
+            cur.execute("ALTER TABLE scheme_master_rows ALTER COLUMN week_number TYPE TEXT;")
+            cur.execute("ALTER TABLE scheme_master_rows ALTER COLUMN lesson_number TYPE TEXT;")
 
             # --- Per-school copies — created when a school "imports" a
             # master. Independent from that point on: editing a copy never
@@ -141,8 +154,8 @@ def bootstrap_schemes_schema():
                     id SERIAL PRIMARY KEY,
                     copy_id INTEGER REFERENCES scheme_copies(id) ON DELETE CASCADE,
                     sort_order INTEGER NOT NULL DEFAULT 0,
-                    week_number VARCHAR(20),
-                    lesson_number VARCHAR(20),
+                    week_number TEXT,
+                    lesson_number TEXT,
                     strand TEXT,
                     sub_strand TEXT,
                     learning_outcomes TEXT,
@@ -153,6 +166,14 @@ def bootstrap_schemes_schema():
                     reflection TEXT
                 );
             """)
+            # Same widening as scheme_master_rows above, and for the same
+            # reason — a copy is created by literally copying a master
+            # row's values, so if the master row's week_number/lesson_number
+            # can now be arbitrarily long, the copy table must accept the
+            # same length or every auto-propagation to a school would just
+            # move this exact crash one step later instead of fixing it.
+            cur.execute("ALTER TABLE scheme_copy_rows ALTER COLUMN week_number TYPE TEXT;")
+            cur.execute("ALTER TABLE scheme_copy_rows ALTER COLUMN lesson_number TYPE TEXT;")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_scheme_copies_school ON scheme_copies (school_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_scheme_copies_teacher ON scheme_copies (teacher_user_id);")
             conn.commit()

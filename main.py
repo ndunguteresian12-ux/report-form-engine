@@ -4410,7 +4410,17 @@ def educators_bulk_entry_grid(
 
 
 @app.get("/api/v1/reports/bulk-print/{school_id}", response_class=HTMLResponse)
-def output_batch_class_report_forms(school_id: int, grade_name: str, education_level: str, stream: str):
+def output_batch_class_report_forms(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
+    # This report contains full student names, admission numbers, and
+    # every subject score/performance level for an entire class — real
+    # student data. It previously had no session check at all, meaning
+    # anyone who guessed or was handed this URL could view any school's
+    # report cards without ever logging in. Matches the same auth check
+    # every other report route in this file already uses.
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     # Utilizing connection context manager/pool cleanly
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
