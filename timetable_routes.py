@@ -3282,6 +3282,78 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                     break
                 _try_fill_slot(day, period, allow_teacher_conflict=True)
 
+            # --- Phase 4: top up genuinely — every remaining teaching
+            # period gets something scheduled, matching how ASC Timetables
+            # behaves (lesson-per-week counts are a target for a subject's
+            # normal load, not a hard ceiling on how many times a slot in
+            # the week can ever hold it). Without this, any slot left over
+            # after every subject's own configured weekly quota is used up
+            # stays permanently blank — which happens any time a school's
+            # configured lesson counts don't happen to sum to exactly the
+            # number of real teaching periods in the week (an easy, common
+            # mismatch, and the actual root cause of "some slots never get
+            # filled"). This keeps every hard rule from earlier phases
+            # (a subject's own Time-Off, same-day/consecutive-day
+            # constraints) — those are never relaxed — but does allow a
+            # subject to be scheduled beyond its nominal weekly quota, and
+            # as an absolute last resort, to repeat on a day it already
+            # appeared on, rather than leaving a real period empty.
+            still_empty = [(day, period) for day in days for period in teaching_periods if (day, period['id']) not in filled]
+            if still_empty and free_subjects:
+                topup_queue = list(free_subjects)
+                ti = 0
+                for day, period in still_empty:
+                    used_today = used_today_by_day[day]
+                    last_subject_id = last_subject_by_day[day]
+                    chosen_subject = None
+
+                    # Tier 1: a subject that hasn't already appeared today.
+                    for _ in range(len(topup_queue)):
+                        candidate = topup_queue[ti % len(topup_queue)]
+                        ti += 1
+                        cid = candidate['id']
+                        if (cid, day, period['id']) in subject_unavailable:
+                            continue
+                        if cid in used_today:
+                            continue
+                        if any((cid, other) in same_day_forbidden for other in used_today):
+                            continue
+                        if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
+                            continue
+                        chosen_subject = candidate
+                        break
+
+                    # Tier 2: absolute last resort — allow repeating a
+                    # subject already used today, but subject Time-Off and
+                    # the same-day/consecutive-day rules are still hard
+                    # blocks even here, never relaxed.
+                    if chosen_subject is None:
+                        for _ in range(len(topup_queue)):
+                            candidate = topup_queue[ti % len(topup_queue)]
+                            ti += 1
+                            cid = candidate['id']
+                            if (cid, day, period['id']) in subject_unavailable:
+                                continue
+                            if any((cid, other) in same_day_forbidden for other in used_today):
+                                continue
+                            if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
+                                continue
+                            chosen_subject = candidate
+                            break
+
+                    if chosen_subject is None:
+                        continue  # every subject genuinely hard-blocked at this exact slot — leave it empty
+
+                    cid = chosen_subject['id']
+                    cand_teacher = teacher_for_subject.get(cid)
+                    if cand_teacher and (
+                        (cand_teacher, day, period['id']) in unavailable
+                        or cand_teacher in booked.get((day, period['id']), set())
+                    ):
+                        cand_teacher = None
+                    _place(day, period['id'], chosen_subject, cand_teacher)
+                    last_subject_by_day[day] = cid
+
             conn.commit()
 
     encoded_grade = urllib.parse.quote(grade_name)
