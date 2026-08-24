@@ -1003,6 +1003,54 @@ async def save_teacher_assignments(school_id: int, request: Request):
 # Availability picker, Teacher Timetable picker, Teacher Workload
 # ============================================================
 
+@router.post("/api/v1/timetable/sync-teachers/{school_id}")
+def sync_teacher_names_into_slots(school_id: int, request: Request, grade_name: str = Form(...), education_level: str = Form(...), stream: str = Form(...)):
+    """Updates ONLY which teacher is shown on each already-generated
+    timetable slot, to match the CURRENT teacher_subject_assignments for
+    this class — every day/period placement stays exactly where it
+    already was. This exists because saving an assignment change on its
+    own never touches timetable_slots at all (that table is only ever
+    written by Generate/Test & Generate or a manual per-cell edit), so
+    without this, the only way to pick up a reassigned teacher is a full
+    Test & Generate — which reshuffles every subject's day/period
+    placement across the whole class, not just the one subject whose
+    teacher changed. This is the lightweight alternative for the common
+    case: a teacher goes on leave, gets swapped, and nothing else about
+    the timetable should move.
+
+    Only touches slots holding a regular or custom academic subject —
+    co-curricular slots have no corresponding teacher_subject_assignments
+    row at all, so the join simply never matches them, leaving them
+    untouched automatically."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE timetable_slots ts
+                SET staff_user_id = tsa.staff_user_id
+                FROM teacher_subject_assignments tsa
+                WHERE ts.school_id = %s AND ts.grade_name = %s AND ts.education_level = %s AND ts.stream = %s
+                  AND tsa.school_id = ts.school_id AND tsa.grade_name = ts.grade_name
+                  AND tsa.education_level = ts.education_level AND tsa.stream = ts.stream
+                  AND (
+                        (ts.learning_area_id IS NOT NULL AND ts.learning_area_id = tsa.learning_area_id)
+                        OR
+                        (ts.custom_subject_id IS NOT NULL AND ts.custom_subject_id = tsa.custom_subject_id)
+                      );
+            """, (school_id, grade_name, education_level, stream))
+            synced_count = cur.rowcount
+            conn.commit()
+
+    encoded_grade = urllib.parse.quote(grade_name)
+    encoded_level = urllib.parse.quote(education_level)
+    encoded_stream = urllib.parse.quote(stream)
+    sync_result = "none" if synced_count == 0 else "ok"
+    return RedirectResponse(url=f"/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}&synced={sync_result}", status_code=303)
+
+
 @router.get("/timetable/availability/{school_id}", response_class=HTMLResponse)
 def teacher_availability_picker(school_id: int, request: Request):
     auth_error = require_school_session(request, school_id)
@@ -2330,7 +2378,7 @@ def delete_subject_constraint(
 # ============================================================
 
 @router.get("/timetable/grade/{school_id}", response_class=HTMLResponse)
-def timetable_grade_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str, test_issues: str = None):
+def timetable_grade_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str, test_issues: str = None, synced: str = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2481,6 +2529,18 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                 <p class="text-xs text-slate-400">{esc(school['name'] if school else '')} — {esc(education_level)}</p>
             </div>
             <div class="flex flex-wrap gap-2">
+                <form action="/api/v1/timetable/test-and-generate/{school_id}" method="post" onsubmit="return confirm('Test and generate the timetable for {esc(section_label)}? This reshuffles EVERY subject\\'s day/period placement for this class from scratch, using the current teacher assignments. If you only changed who teaches one subject and want to keep everything else exactly where it is, use Sync Teacher Names instead.');">
+                    <input type="hidden" name="grade_name" value="{esc(grade_name)}">
+                    <input type="hidden" name="education_level" value="{esc(education_level)}">
+                    <input type="hidden" name="stream" value="{esc(stream)}">
+                    <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🧪 Test &amp; Generate</button>
+                </form>
+                <form action="/api/v1/timetable/sync-teachers/{school_id}" method="post" onsubmit="return confirm('Sync teacher names for {esc(section_label)}? This updates which teacher shows on each already-scheduled subject to match the current Assignments — day/period placement is left exactly as it is.');">
+                    <input type="hidden" name="grade_name" value="{esc(grade_name)}">
+                    <input type="hidden" name="education_level" value="{esc(education_level)}">
+                    <input type="hidden" name="stream" value="{esc(stream)}">
+                    <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🔄 Sync Teacher Names</button>
+                </form>
                 <form action="/api/v1/timetable/new/{school_id}" method="post" onsubmit="return confirm('Start a brand-new BLANK timetable for {esc(section_label)}? This clears every period currently scheduled — you\\'ll build it up from scratch by hand. This cannot be undone.');">
                     <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                     <input type="hidden" name="education_level" value="{esc(education_level)}">
@@ -2492,6 +2552,8 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                 <a href="/timetable/dashboard/{school_id}" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">← Back</a>
             </div>
         </header>
+        {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4'>✅ Teacher names synced from current Assignments — day/period placement was left untouched.</div>" if synced == "ok" else ""}
+        {"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4'>⚠️ Nothing to sync — no timetable has been generated for this class yet. Use Test &amp; Generate first.</div>" if synced == "none" else ""}
         {test_issues_html}
         <div class="p-4 sm:p-8 max-w-6xl mx-auto overflow-x-auto">
             <table class="w-full border-collapse bg-white rounded-2xl overflow-hidden border shadow-xs text-xs" style="min-width:700px;">
