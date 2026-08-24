@@ -2062,26 +2062,26 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     <body class="bg-[#F7F8FB] text-slate-800 antialiased min-h-full flex flex-col relative">
         {TOAST_CONTAINER_HTML}
 
-        <header class="bg-white border-b border-slate-200/80 px-4 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 sticky top-0 z-40 backdrop-blur-md bg-white/90 shadow-2xs">
+        <header class="bg-indigo-950 px-4 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 sticky top-0 z-40 shadow-md">
             <div class="flex items-center space-x-4">
                 {logo_html}
                 <div>
-                    <h1 class="text-base font-bold text-slate-900 tracking-tight">{esc(school['name'])}</h1>
-                    <p class="text-xs text-slate-500">{esc(school['physical_address'])} • {esc(school['sub_county'])} Sub-County</p>
-                    {f'<p class="text-[11px] text-indigo-700 font-bold mt-0.5">Welcome, {esc(admin_name.split(" ")[0])}</p>' if admin_name else ''}
+                    <h1 class="text-base font-bold text-white tracking-tight">{esc(school['name'])}</h1>
+                    <p class="text-xs text-indigo-300">{esc(school['physical_address'])} • {esc(school['sub_county'])} Sub-County</p>
+                    {f'<p class="text-[11px] text-amber-300 font-bold mt-0.5">Welcome, {esc(admin_name.split(" ")[0])}</p>' if admin_name else ''}
                 </div>
             </div>
             <div class="flex items-center flex-wrap gap-2 text-xs font-semibold">
                 <span class="{('bg-gradient-to-r from-emerald-500 to-emerald-600' if school.get('subscription_expires_at') and school['subscription_expires_at'] > datetime.now() else 'bg-gradient-to-r from-rose-500 to-rose-600') if BILLING_ENFORCED else 'bg-gradient-to-r from-slate-500 to-slate-600'} text-white px-3 py-2 rounded-xl shadow-xs">{(('✅ Active until ' + school['subscription_expires_at'].strftime('%d %b %Y')) if school.get('subscription_expires_at') and school['subscription_expires_at'] > datetime.now() else '⚠️ No active subscription') if BILLING_ENFORCED else '💳 Subscriptions launching soon'}</span>
-                <span class="bg-gradient-to-r from-indigo-800 to-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
-                <a href="/timetable/dashboard/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 Timetable</a>
-                <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
-                <a href="/admin/audit-log/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📋 Activity Log</a>
-                <a href="/admin/school/profile/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🏫 School Profile</a>
-                <a href="/finance/dashboard/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-3 py-2 rounded-xl transition">💰 Finance</a>
-                <a href="/admin/class-teachers/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">🧑‍🏫 Class Teachers</a>
-                <a href="/schemes/manage/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📘 Schemes of Work</a>
-                <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
+                <span class="bg-gradient-to-r from-violet-500 to-violet-600 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
+                <a href="/timetable/dashboard/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📅 Timetable</a>
+                <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
+                <a href="/admin/audit-log/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📋 Activity Log</a>
+                <a href="/admin/school/profile/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🏫 School Profile</a>
+                <a href="/finance/dashboard/{school_id}" class="bg-amber-400 hover:bg-amber-300 text-indigo-950 px-3 py-2 rounded-xl transition font-bold">💰 Finance</a>
+                <a href="/admin/class-teachers/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🧑‍🏫 Class Teachers</a>
+                <a href="/schemes/manage/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📘 Schemes of Work</a>
+                <a href="/logout" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
 
@@ -2092,45 +2092,45 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         <div class="flex flex-col lg:flex-row flex-1 w-full max-w-[1600px] mx-auto">
 
             <!-- ============ LEFT SIDEBAR ============ -->
-            <aside class="w-full lg:w-80 shrink-0 lg:sticky lg:top-[73px] lg:h-[calc(100vh-73px)] lg:overflow-y-auto border-r border-slate-200/70 bg-white px-5 py-6 space-y-6">
+            <aside class="w-full lg:w-80 shrink-0 lg:sticky lg:top-[73px] lg:h-[calc(100vh-73px)] lg:overflow-y-auto bg-indigo-950 px-5 py-6 space-y-6">
 
                 <!-- Classes quick nav -->
                 <div>
-                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-indigo-700 flex items-center gap-1.5 mb-2.5">
-                        <span class="w-2 h-2 rounded-full bg-indigo-600"></span> Classes
+                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-indigo-300 flex items-center gap-1.5 mb-2.5">
+                        <span class="w-2 h-2 rounded-full bg-indigo-400"></span> Classes
                     </h2>
-                    <div class="space-y-1 max-h-40 overflow-y-auto pr-1">
+                    <div class="bg-white rounded-xl p-2.5 space-y-1 max-h-40 overflow-y-auto pr-1">
                         {"".join(f"<a href='/staff/bulk-entry/{school_id}?grade_name={urllib.parse.quote(c['grade_name'])}&stream={urllib.parse.quote('SINGLE STREAM' if (not c['stream'] or c['stream'].strip()=='' or c['stream'].upper()=='SINGLE STREAM') else c['stream'])}&education_level={urllib.parse.quote(c['education_level'])}' class='block text-xs font-semibold text-slate-600 hover:text-indigo-700 hover:bg-indigo-50 rounded-lg px-2.5 py-1.5 transition truncate'>{esc(c['grade_name'] if (not c['stream'] or c['stream'].strip()=='' or c['stream'].upper()=='SINGLE STREAM') else c['grade_name'] + ' — ' + c['stream'])}</a>" for c in classes) or "<p class='text-slate-400 text-xs italic px-2.5'>No classes yet.</p>"}
                     </div>
                 </div>
 
                 <!-- Staff -->
-                <div class="pt-5 border-t border-slate-100">
+                <div class="pt-5 border-t border-white/10">
                     <div class="flex items-center justify-between mb-2.5">
-                        <h2 class="text-[11px] font-bold uppercase tracking-wider text-violet-700 flex items-center gap-1.5">
-                            <span class="w-2 h-2 rounded-full bg-violet-600"></span> Staff
+                        <h2 class="text-[11px] font-bold uppercase tracking-wider text-violet-300 flex items-center gap-1.5">
+                            <span class="w-2 h-2 rounded-full bg-violet-400"></span> Staff
                         </h2>
                         <a href="/staff/register-panel/{school_id}" class="bg-violet-700 hover:bg-violet-800 text-white text-[10px] px-2.5 py-1 rounded-lg font-bold transition">+ Add</a>
                     </div>
-                    <div class="max-h-56 overflow-y-auto pr-1 space-y-0.5">
+                    <div class="bg-white rounded-xl p-2.5 max-h-56 overflow-y-auto pr-1 space-y-0.5">
                         {staff_panel_html or "<p class='text-slate-400 text-xs italic px-1 py-3'>No staff accounts yet.</p>"}
                     </div>
                 </div>
 
                 <!-- Class Rosters -->
-                <div class="pt-5 border-t border-slate-100">
-                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-teal-700 flex items-center gap-1.5 mb-2.5">
-                        <span class="w-2 h-2 rounded-full bg-teal-600"></span> Class Rosters
+                <div class="pt-5 border-t border-white/10">
+                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-teal-300 flex items-center gap-1.5 mb-2.5">
+                        <span class="w-2 h-2 rounded-full bg-teal-400"></span> Class Rosters
                     </h2>
-                    <div class="space-y-2 max-h-72 overflow-y-auto pr-1">
+                    <div class="bg-white rounded-xl p-2.5 space-y-2 max-h-72 overflow-y-auto pr-1">
                         {roster_sidebar_html or "<p class='text-slate-400 text-xs italic px-1 py-3'>No classes with students yet.</p>"}
                     </div>
                 </div>
 
                 <!-- Subscription Status -->
-                <div class="pt-5 border-t border-slate-100">
-                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-amber-700 flex items-center gap-1.5 mb-2.5">
-                        <span class="w-2 h-2 rounded-full bg-amber-500"></span> Subscription Status
+                <div class="pt-5 border-t border-white/10">
+                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-amber-300 flex items-center gap-1.5 mb-2.5">
+                        <span class="w-2 h-2 rounded-full bg-amber-400"></span> Subscription Status
                     </h2>
                     <div class="bg-gradient-to-br from-amber-50 to-white border border-amber-100 rounded-xl p-3 mb-3">
                         <p class="text-[10px] text-amber-700 font-bold uppercase tracking-wide">Status</p>
@@ -2140,10 +2140,11 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 </div>
 
                 <!-- Settings -->
-                <div class="pt-5 border-t border-slate-100">
-                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5 mb-2.5">
-                        <span class="w-2 h-2 rounded-full bg-slate-500"></span> Settings
+                <div class="pt-5 border-t border-white/10">
+                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5 mb-2.5">
+                        <span class="w-2 h-2 rounded-full bg-slate-400"></span> Settings
                     </h2>
+                    <div class="bg-white rounded-xl p-3">
                     <form action="/api/v1/settings/update/{school_id}" method="post" class="space-y-3">
                         <div class="grid grid-cols-3 gap-2">
                             <div>
@@ -2212,6 +2213,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                                 🔄 Advance All Classes 1 Year
                             </button>
                         </form>
+                    </div>
                     </div>
                 </div>
             </aside>
@@ -2844,8 +2846,8 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
         """)
     class_blocks_html = "".join(class_blocks)
 
-    welcome_html = f"<p class='text-[11px] text-indigo-700 font-bold'>Welcome, {esc(staff_name.split(' ')[0])}</p>" if staff_name else ""
-    identity_html = f"<p class='text-xs text-slate-500'>{esc(staff_email)}</p>" if staff_email else ""
+    welcome_html = f"<p class='text-[11px] text-amber-300 font-bold'>Welcome, {esc(staff_name.split(' ')[0])}</p>" if staff_name else ""
+    identity_html = f"<p class='text-xs text-indigo-300'>{esc(staff_email)}</p>" if staff_email else ""
 
     return HTMLResponse(f"""
     <!DOCTYPE html>
@@ -2862,18 +2864,18 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
     <body class="bg-[#F8FAFC] text-slate-800 antialiased min-h-full flex flex-col relative">
         {TOAST_CONTAINER_HTML}
 
-        <header class="bg-white border-b border-slate-200/80 px-8 py-4 flex justify-between items-center sticky top-0 z-40 backdrop-blur-md bg-white/90 shadow-2xs">
+        <header class="bg-indigo-950 px-8 py-4 flex justify-between items-center sticky top-0 z-40 shadow-md">
             <div class="flex items-center space-x-4">
                 {logo_html}
                 <div>
-                    <h1 class="text-base font-bold text-slate-900 tracking-tight">{esc(school['name'])}</h1>
+                    <h1 class="text-base font-bold text-white tracking-tight">{esc(school['name'])}</h1>
                     {welcome_html}
                     {identity_html}
                 </div>
             </div>
             <div class="flex items-center space-x-3 text-xs font-semibold">
                 <span class="bg-indigo-50 text-indigo-700 border border-indigo-100 px-3 py-2 rounded-xl">Staff Portal</span>
-                <span class="bg-indigo-900 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
+                <span class="bg-gradient-to-r from-violet-500 to-violet-600 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
                 <a href="/timetable/teachers/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📅 My Timetable</a>
                 <a href="/finance/staff/collect/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-3 py-2 rounded-xl transition">💰 Collect Fees</a>
                 <a href="/schemes/my-schemes/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📘 My Schemes of Work</a>
