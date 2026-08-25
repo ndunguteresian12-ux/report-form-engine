@@ -200,6 +200,21 @@ def bootstrap_finance_schema():
             conn.commit()
 
 
+def _next_term_year(term: str, year: int):
+    """Standard Kenyan school-calendar progression: Term 1 -> Term 2 ->
+    Term 3 -> Term 1 of the following year. Used to pre-fill sensible
+    defaults on the Carry Forward Balances form — the admin can still
+    override either side manually."""
+    order = ["Term 1", "Term 2", "Term 3"]
+    try:
+        idx = order.index(term)
+    except ValueError:
+        return "Term 1", year + 1
+    if idx == len(order) - 1:
+        return order[0], year + 1
+    return order[idx + 1], year
+
+
 def _ensure_default_category(cur, school_id: int) -> int:
     """Every school always has a 'School Fees' category, created lazily the
     first time it's needed. Returns its id."""
@@ -432,6 +447,7 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
             <div class="flex items-center gap-2 flex-wrap">
                 <a href="/finance/categories/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">🏷️ Fee Categories</a>
                 <a href="/finance/import/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">📥 Import History</a>
+                <a href="/finance/carry-forward/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-4 py-2 rounded-xl text-xs font-bold transition">🔁 Carry Forward Balances</a>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">← Back to Dashboard</a>
             </div>
         </header>
@@ -468,6 +484,147 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
     </body>
     </html>
     """
+
+
+# ============================================================
+# Carry Forward Balances — an overpayment or underpayment from one
+# term becomes the opening balance for the next, automatically.
+# ============================================================
+
+@router.get("/finance/carry-forward/{school_id}", response_class=HTMLResponse)
+def carry_forward_view(school_id: int, request: Request, done: str = None):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            school, active_term, active_year = _get_school_and_settings(cur, school_id)
+
+    default_to_term, default_to_year = _next_term_year(active_term, active_year)
+    term_choices = ["Term 1", "Term 2", "Term 3"]
+
+    from_term_options = "".join(f"<option value='{t}' {'selected' if t == active_term else ''}>{t}</option>" for t in term_choices)
+    to_term_options = "".join(f"<option value='{t}' {'selected' if t == default_to_term else ''}>{t}</option>" for t in term_choices)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Carry Forward Balances</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+                <h2 class="text-lg font-black text-slate-800">🔁 Carry Forward Balances</h2>
+                <p class="text-xs text-slate-500">
+                    For every student and every fee category, this computes each student's actual closing balance for the "From" term —
+                    <span class="font-mono bg-slate-100 px-1 rounded">fee amount + old opening balance − amount paid</span> —
+                    and sets that as their opening balance for the "To" term. If they <b>underpaid</b>, they'll start the new term already owing that amount.
+                    If they <b>overpaid</b>, that credit will reduce (or fully cover) what they owe next.
+                </p>
+                {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2.5 rounded-xl'>✅ Balances carried forward for " + esc(done) + " student/category combination(s).</div>" if done else ""}
+                <div class="bg-amber-50 border border-amber-200 text-amber-800 text-xs px-4 py-3 rounded-xl">
+                    ⚠️ <b>Run this before "Advance All Classes"</b>, not after — fee amounts are looked up by each student's <i>current</i> class. If you promote classes first, this will use their new grade's fee amount instead of the grade they were actually in during the "From" term, producing the wrong closing balance for anyone who was promoted.
+                </div>
+                <form action="/api/v1/finance/carry-forward/{school_id}" method="post" class="space-y-3" onsubmit="return confirm('Carry forward balances from the From term into the To term? This overwrites any existing opening balance already set for the To term, for every student and every fee category. This cannot be undone automatically (though you can re-run it, or edit individual balances afterward).');">
+                    <div class="grid grid-cols-2 gap-3">
+                        <div class="space-y-2">
+                            <p class="text-[11px] font-bold uppercase text-slate-400">From</p>
+                            <select name="from_term" class="w-full border border-slate-200 p-2 rounded-lg text-sm">{from_term_options}</select>
+                            <input type="number" name="from_year" value="{active_year}" class="w-full border border-slate-200 p-2 rounded-lg text-sm">
+                        </div>
+                        <div class="space-y-2">
+                            <p class="text-[11px] font-bold uppercase text-slate-400">To</p>
+                            <select name="to_term" class="w-full border border-slate-200 p-2 rounded-lg text-sm">{to_term_options}</select>
+                            <input type="number" name="to_year" value="{default_to_year}" class="w-full border border-slate-200 p-2 rounded-lg text-sm">
+                        </div>
+                    </div>
+                    <button type="submit" class="w-full bg-amber-500 hover:bg-amber-600 text-white py-2.5 rounded-xl text-sm font-bold transition">Carry Forward Balances</button>
+                </form>
+            </div>
+            <a href="/finance/dashboard/{school_id}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Finance</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/finance/carry-forward/{school_id}")
+async def carry_forward_balances(school_id: int, request: Request, from_term: str = Form(...), from_year: int = Form(...), to_term: str = Form(...), to_year: int = Form(...)):
+    """For every active student and every fee category, computes the
+    student's real closing balance for the From term (fee amount + old
+    opening balance - amount paid) and writes that as their opening
+    balance for the To term — positive if they underpaid (they now owe
+    that much more), negative if they overpaid (a credit that reduces
+    what they owe next). Reuses fee_opening_balances, the same table
+    the manual "brought forward" entry already uses, so every existing
+    balance display in the app picks this up automatically with no
+    other changes needed."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    if (from_term, from_year) == (to_term, to_year):
+        raise HTTPException(status_code=400, detail="From and To must be different terms.")
+
+    recorded_by = request.cookies.get("session_user_id")
+    note = f"Carried forward from {from_term} {from_year}"
+    combinations_written = 0
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM fee_categories WHERE school_id = %s;", (school_id,))
+            category_ids = [r['id'] for r in cur.fetchall()]
+
+            for cat_id in category_ids:
+                cur.execute("""
+                    SELECT s.id AS student_id,
+                           COALESCE(fs.amount, 0) AS fee_amount,
+                           COALESCE((SELECT amount FROM fee_opening_balances fob WHERE fob.student_id = s.id AND fob.fee_category_id = %s AND fob.term = %s AND fob.year = %s), 0) AS old_opening,
+                           COALESCE((SELECT SUM(fp.amount) FROM fee_payments fp WHERE fp.student_id = s.id AND fp.fee_category_id = %s AND fp.term = %s AND fp.year = %s), 0) AS paid
+                    FROM students s
+                    JOIN classes c ON s.class_id = c.id
+                    LEFT JOIN fee_structures fs ON fs.school_id = s.school_id AND fs.fee_category_id = %s AND fs.grade_name = c.grade_name AND fs.term = %s AND fs.year = %s
+                    WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
+                """, (cat_id, from_term, from_year, cat_id, from_term, from_year, cat_id, from_term, from_year, school_id))
+                rows = cur.fetchall()
+
+                for row in rows:
+                    closing = float(row['fee_amount']) + float(row['old_opening']) - float(row['paid'])
+                    student_id = row['student_id']
+
+                    if abs(closing) < 0.005:
+                        # Fully settled, no credit either — remove any
+                        # stale destination row rather than leave a 0.
+                        cur.execute("""
+                            DELETE FROM fee_opening_balances
+                            WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+                        """, (school_id, student_id, cat_id, to_term, to_year))
+                        continue
+
+                    cur.execute("""
+                        SELECT id FROM fee_opening_balances
+                        WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+                    """, (school_id, student_id, cat_id, to_term, to_year))
+                    existing_row = cur.fetchone()
+                    if existing_row:
+                        cur.execute("""
+                            UPDATE fee_opening_balances SET amount = %s, note = %s, recorded_by_user_id = %s, updated_at = NOW()
+                            WHERE id = %s;
+                        """, (closing, note, recorded_by, existing_row['id']))
+                    else:
+                        cur.execute("""
+                            INSERT INTO fee_opening_balances (school_id, student_id, fee_category_id, term, year, amount, note, recorded_by_user_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (school_id, student_id, cat_id, to_term, to_year, closing, note, recorded_by))
+                    combinations_written += 1
+
+            conn.commit()
+
+    return RedirectResponse(url=f"/finance/carry-forward/{school_id}?done={combinations_written}", status_code=303)
 
 
 # ============================================================
@@ -671,7 +828,8 @@ def finance_class_list(school_id: int, request: Request, grade_name: str, educat
         opening = float(s['opening_balance'])
         balance = fee_amount + opening - paid
         status_badge = (
-            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>Paid in full</span>" if balance <= 0 and fee_amount > 0 else
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 border border-sky-200'>Credit — KSh " + f"{abs(balance):,.0f}" + "</span>" if balance < 0 else
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>Paid in full</span>" if balance == 0 and fee_amount > 0 else
             "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Balance owing</span>" if balance > 0 else
             "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200'>No fee set</span>"
         )
@@ -680,7 +838,7 @@ def finance_class_list(school_id: int, request: Request, grade_name: str, educat
             <td class="p-3 font-mono text-xs text-slate-400">{esc(s['admission_number'])}</td>
             <td class="p-3 font-semibold text-slate-700">{esc(full_student_name(s))}</td>
             <td class="p-3 text-right">KSh {paid:,.0f}</td>
-            <td class="p-3 text-right font-bold {'text-rose-700' if balance > 0 else 'text-emerald-700'}">KSh {balance:,.0f}</td>
+            <td class="p-3 text-right font-bold {'text-rose-700' if balance > 0 else 'text-sky-700' if balance < 0 else 'text-emerald-700'}">KSh {balance:,.0f}</td>
             <td class="p-3 text-center">{status_badge}</td>
             <td class="p-3 text-right"><a href="/finance/student/{school_id}/{s['id']}?term={urllib.parse.quote(term)}&year={year}" class="text-indigo-700 hover:underline text-xs font-bold">Statement →</a></td>
         </tr>
@@ -1409,7 +1567,8 @@ def staff_collect_search(school_id: int, request: Request, search: str = None, g
         opening = float(s['opening_balance'])
         balance = fee_amount + opening - paid
         status_badge = (
-            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>Paid in full</span>" if balance <= 0 and fee_amount > 0 else
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-sky-50 text-sky-700 border border-sky-200'>Credit — KSh " + f"{abs(balance):,.0f}" + "</span>" if balance < 0 else
+            "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>Paid in full</span>" if balance == 0 and fee_amount > 0 else
             "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200'>Balance owing</span>" if balance > 0 else
             "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200'>No fee set</span>"
         )
