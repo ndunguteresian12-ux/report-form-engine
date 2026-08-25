@@ -249,6 +249,33 @@ def bootstrap_timetable_schema():
             """)
             conn.commit()
 
+            # "Linked classes" — e.g. Mathematics for Grade 8V and Grade 8J
+            # should always land at the same day/period as each other, so
+            # if one teacher is absent the other can combine both classes
+            # into one room. Matches ASC Timetables' parallel/linked class
+            # concept. Deliberately a separate table from subject_sync_rules
+            # (which locks a subject to one fixed time SCHOOL-WIDE) — this
+            # is a pairing between two SPECIFIC classes, and the two
+            # classes named can be in different grades and even different
+            # education levels (their own separate bell schedules), which
+            # is exactly Francis's real example: Grade 9V and Grade 8J.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS class_link_rules (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    custom_subject_id INTEGER REFERENCES timetable_custom_subjects(id) ON DELETE CASCADE,
+                    class_a_grade_name VARCHAR(100) NOT NULL,
+                    class_a_education_level VARCHAR(100) NOT NULL,
+                    class_a_stream VARCHAR(100) NOT NULL,
+                    class_b_grade_name VARCHAR(100) NOT NULL,
+                    class_b_education_level VARCHAR(100) NOT NULL,
+                    class_b_stream VARCHAR(100) NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+            """)
+            conn.commit()
+
 
 def get_school_days(cur, school_id: int):
     """Returns the school's active weekdays in order, e.g.
@@ -406,6 +433,8 @@ def timetable_workspace_hub(school_id: int, request: Request):
                 <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods &amp; Days</a>
                 <a href="/timetable/availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🧑‍🏫 Teacher Availability</a>
                 <a href="/timetable/subject-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
+                <a href="/timetable/sync-rules/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Same-Time Subject Rules</a>
+                <a href="/timetable/class-links/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🔗 Linked Classes</a>
                 <a href="/timetable/view/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🔀 Whole/Teachers/Subjects View</a>
                 <a href="/timetable/collision-check/{school_id}" class="bg-rose-600 hover:bg-rose-700 text-white px-3.5 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🔍 Check for Collisions</a>
                 <a href="/timetable/teacher-workload/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">📊 Teacher Workload</a>
@@ -2217,6 +2246,164 @@ def save_subject_sync_rule(school_id: int, learning_area_id: int, request: Reque
     return RedirectResponse(url=f"/timetable/sync-rules/{school_id}", status_code=303)
 
 
+@router.get("/timetable/class-links/{school_id}", response_class=HTMLResponse)
+def class_link_rules_view(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Every class currently in the school, for the two class pickers.
+            cur.execute("""
+                SELECT DISTINCT c.grade_name, c.education_level, s.stream
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                ORDER BY c.grade_name ASC, s.stream ASC;
+            """, (school_id,))
+            classes = cur.fetchall()
+
+            # Every subject — regular and custom, combined in one encoded
+            # list exactly like the Teaching Assignments picker does
+            # (custom subject ids offset by CUSTOM_SUBJECT_ID_OFFSET so
+            # both kinds share one dropdown/value space).
+            cur.execute("SELECT id, name, education_level FROM learning_areas ORDER BY education_level ASC, name ASC;")
+            subjects = [{'choice_id': r['id'], 'name': r['name'], 'education_level': r['education_level']} for r in cur.fetchall()]
+            cur.execute("SELECT id, name, education_level FROM timetable_custom_subjects WHERE school_id = %s ORDER BY education_level ASC, name ASC;", (school_id,))
+            subjects += [{'choice_id': r['id'] + CUSTOM_SUBJECT_ID_OFFSET, 'name': r['name'] + ' (custom)', 'education_level': r['education_level']} for r in cur.fetchall()]
+
+            cur.execute("""
+                SELECT clr.*,
+                       la.name AS learning_area_name,
+                       cs.name AS custom_subject_name
+                FROM class_link_rules clr
+                LEFT JOIN learning_areas la ON clr.learning_area_id = la.id
+                LEFT JOIN timetable_custom_subjects cs ON clr.custom_subject_id = cs.id
+                WHERE clr.school_id = %s
+                ORDER BY clr.created_at DESC;
+            """, (school_id,))
+            rules = cur.fetchall()
+
+    class_options = "".join(
+        f"<option value='{esc(c['grade_name'])}|{esc(c['education_level'])}|{esc(c['stream'])}'>{esc(_section_label(c['grade_name'], c['stream']))} ({esc(c['education_level'])})</option>"
+        for c in classes
+    )
+    subject_options = "".join(
+        f"<option value='{s['choice_id']}'>{esc(s['name'])} — {esc(s['education_level'])}</option>" for s in subjects
+    )
+
+    rows_html = ""
+    for r in rules:
+        subject_name = r['learning_area_name'] or r['custom_subject_name'] or "Unknown subject"
+        rows_html += f"""
+        <tr class="border-b text-sm">
+            <td class="p-3">
+                <p class="font-bold text-slate-800">{esc(subject_name)}</p>
+            </td>
+            <td class="p-3 text-slate-600">{esc(_section_label(r['class_a_grade_name'], r['class_a_stream']))} <span class="text-slate-400">({esc(r['class_a_education_level'])})</span></td>
+            <td class="p-3 text-slate-600">{esc(_section_label(r['class_b_grade_name'], r['class_b_stream']))} <span class="text-slate-400">({esc(r['class_b_education_level'])})</span></td>
+            <td class="p-3">
+                <form action="/api/v1/timetable/class-links/delete/{school_id}/{r['id']}" method="post" onsubmit="return confirm('Remove this link? The two classes will no longer be forced to the same time for this subject the next time either is generated.');">
+                    <button type="submit" class="text-rose-600 hover:text-rose-800 text-xs font-bold">Remove</button>
+                </form>
+            </td>
+        </tr>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Linked Classes</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-4xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">🔗 Linked Classes</h2>
+                <p class="text-xs text-slate-400 mb-4">
+                    Force two specific classes to have the same subject scheduled at the exact same day and period — e.g. Mathematics for Grade 8V and Grade 8J always at the same time. Useful so one teacher can combine both classes if a colleague is absent. The two classes can be different grades and even different education levels.
+                </p>
+                <p class="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mb-4">
+                    ⚠️ After adding or changing a link, run <b>Test &amp; Generate</b> (or <b>Sync Teacher Names</b>, if only the teacher changed) on <b>both</b> linked classes. Whichever class is generated first sets the time; the other one then matches it. If you only regenerate one of the two afterward, they can drift apart again until you regenerate the other too.
+                </p>
+                <form action="/api/v1/timetable/class-links/save/{school_id}" method="post" class="grid grid-cols-1 sm:grid-cols-3 gap-2 items-end bg-slate-50 border border-slate-200 rounded-xl p-3">
+                    <div>
+                        <label class="text-[11px] font-semibold text-slate-500 block mb-1">Subject</label>
+                        <select name="subject_choice" required class="w-full border border-slate-200 bg-white p-2 rounded-lg text-xs">{subject_options}</select>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-semibold text-slate-500 block mb-1">Class A</label>
+                        <select name="class_a" required class="w-full border border-slate-200 bg-white p-2 rounded-lg text-xs">{class_options}</select>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-semibold text-slate-500 block mb-1">Class B</label>
+                        <select name="class_b" required class="w-full border border-slate-200 bg-white p-2 rounded-lg text-xs">{class_options}</select>
+                    </div>
+                    <div class="sm:col-span-3">
+                        <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold px-4 py-2 rounded-lg transition">+ Add Link</button>
+                    </div>
+                </form>
+            </div>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead><tr class="border-b-2 text-[11px] uppercase text-slate-400"><th class="p-3">Subject</th><th class="p-3">Class A</th><th class="p-3">Class B</th><th class="p-3"></th></tr></thead>
+                        <tbody>{rows_html or "<tr><td colspan='4' class='p-6 text-center text-slate-400 italic text-xs'>No linked classes yet.</td></tr>"}</tbody>
+                    </table>
+                </div>
+                <div class="pt-4">
+                    <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back</a>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/class-links/save/{school_id}")
+def save_class_link_rule(school_id: int, request: Request, subject_choice: int = Form(...), class_a: str = Form(...), class_b: str = Form(...)):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    a_grade, a_level, a_stream = class_a.split("|")
+    b_grade, b_level, b_stream = class_b.split("|")
+
+    if (a_grade, a_level, a_stream) == (b_grade, b_level, b_stream):
+        raise HTTPException(status_code=400, detail="Class A and Class B must be two different classes.")
+
+    is_custom = subject_choice >= CUSTOM_SUBJECT_ID_OFFSET
+    learning_area_id = None if is_custom else subject_choice
+    custom_subject_id = (subject_choice - CUSTOM_SUBJECT_ID_OFFSET) if is_custom else None
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO class_link_rules
+                    (school_id, learning_area_id, custom_subject_id,
+                     class_a_grade_name, class_a_education_level, class_a_stream,
+                     class_b_grade_name, class_b_education_level, class_b_stream)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """, (school_id, learning_area_id, custom_subject_id, a_grade, a_level, a_stream, b_grade, b_level, b_stream))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/class-links/{school_id}", status_code=303)
+
+
+@router.post("/api/v1/timetable/class-links/delete/{school_id}/{rule_id}")
+def delete_class_link_rule(school_id: int, rule_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM class_link_rules WHERE id = %s AND school_id = %s;", (rule_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/class-links/{school_id}", status_code=303)
+
+
 @router.get("/timetable/constraints/{school_id}", response_class=HTMLResponse)
 def subject_constraints_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
     auth_error = require_school_session(request, school_id)
@@ -2302,7 +2489,7 @@ def subject_constraints_view(school_id: int, request: Request, grade_name: str, 
             </form>
 
             <div class="mt-6 pt-4 border-t">
-                <a href="/timetable/linked-constraints/{school_id}" class="text-xs text-indigo-700 font-bold hover:underline">🔗 Need two subjects across different classes to run at the exact same time? Set that up here →</a>
+                <a href="/timetable/class-links/{school_id}" class="text-xs text-indigo-700 font-bold hover:underline">🔗 Need a subject to run at the exact same time for two specific classes (e.g. so they can combine if a teacher is absent)? Set that up here →</a>
             </div>
         </div>
     </body>
@@ -3066,6 +3253,107 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 subj['id']: sum(1 for (d, pid) in total_week_slots if (subj['id'], d, pid) not in subject_unavailable)
                 for subj in free_subjects
             }
+
+            # --- Phase -1: Linked Classes — e.g. Mathematics for Grade 8V
+            # and Grade 8J must land at the exact same day/period as each
+            # other, so one teacher can combine both classes into one room
+            # if a colleague is absent. This is the highest-priority
+            # placement of all, running even before the zero-slack Phase 0
+            # below — it's an explicit, deliberate pairing an admin set up
+            # on purpose, not a general scheduling preference to balance
+            # against others.
+            #
+            # The two linked classes can be in different education levels
+            # with entirely different bell schedules (this is Francis's
+            # actual example: Grade 9V and Grade 8J) — matching is done by
+            # real clock time via this_level_period_times/_time_ranges_
+            # overlap (already computed above for cross-level teacher
+            # conflicts), never by period_id, since two different levels'
+            # period ids are unrelated database rows even when they cover
+            # the exact same time of day.
+            #
+            # Whichever of the two linked classes is generated FIRST sets
+            # the time; regenerating the other one looks up whatever it
+            # already has and matches it. If the partner class hasn't been
+            # generated yet, this class schedules normally for now — the
+            # link takes effect the next time the OTHER class is
+            # (re)generated and looks back at this one. That's an inherent
+            # limit of generating one class at a time rather than the
+            # whole school in one pass; if a link ever drifts apart,
+            # regenerating both linked classes again (in either order)
+            # re-syncs them.
+            cur.execute("""
+                SELECT learning_area_id, custom_subject_id,
+                       class_a_grade_name, class_a_education_level, class_a_stream,
+                       class_b_grade_name, class_b_education_level, class_b_stream
+                FROM class_link_rules
+                WHERE school_id = %s
+                  AND (
+                    (class_a_grade_name = %s AND class_a_education_level = %s AND class_a_stream = %s)
+                    OR
+                    (class_b_grade_name = %s AND class_b_education_level = %s AND class_b_stream = %s)
+                  );
+            """, (school_id, grade_name, education_level, stream, grade_name, education_level, stream))
+            link_rules_for_me = cur.fetchall()
+
+            for rule in link_rules_for_me:
+                my_subject_id = rule['learning_area_id'] if rule['learning_area_id'] is not None else (rule['custom_subject_id'] + CUSTOM_SUBJECT_ID_OFFSET)
+                if remaining.get(my_subject_id, 0) <= 0:
+                    continue  # this subject doesn't apply to my own class at all, or its quota is already 0
+
+                is_a = (rule['class_a_grade_name'], rule['class_a_education_level'], rule['class_a_stream']) == (grade_name, education_level, stream)
+                if is_a:
+                    partner_grade, partner_level, partner_stream = rule['class_b_grade_name'], rule['class_b_education_level'], rule['class_b_stream']
+                else:
+                    partner_grade, partner_level, partner_stream = rule['class_a_grade_name'], rule['class_a_education_level'], rule['class_a_stream']
+
+                partner_periods = get_periods_for_level(cur, school_id, partner_level)
+                partner_period_times = {
+                    p['id']: (_parse_time_to_minutes(p['start_time']), _parse_time_to_minutes(p['end_time']))
+                    for p in partner_periods
+                }
+
+                cur.execute("""
+                    SELECT day_of_week, period_id FROM timetable_slots
+                    WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s
+                      AND (learning_area_id = %s OR custom_subject_id = %s)
+                    ORDER BY day_of_week, period_id;
+                """, (school_id, partner_grade, partner_level, partner_stream,
+                      rule['learning_area_id'], rule['custom_subject_id']))
+                partner_slots = cur.fetchall()
+
+                subj_obj = next((s for s in subjects if s['id'] == my_subject_id), None)
+                if subj_obj is None:
+                    continue
+
+                for pslot in partner_slots:
+                    if remaining.get(my_subject_id, 0) <= 0:
+                        break  # my own weekly quota for this subject is already fully placed
+
+                    partner_start, partner_end = partner_period_times.get(pslot['period_id'], (None, None))
+                    if partner_start is None:
+                        continue  # partner's period record is missing/malformed — skip just this one occurrence
+
+                    # Find MY OWN period, whose clock time overlaps the
+                    # partner's slot (not necessarily the same period_id).
+                    my_period_id = None
+                    for pid, (my_start, my_end) in this_level_period_times.items():
+                        if pid in teaching_period_ids and _time_ranges_overlap(my_start, my_end, partner_start, partner_end):
+                            my_period_id = pid
+                            break
+                    if my_period_id is None:
+                        continue  # no matching time-of-day period exists in my own level for this occurrence
+
+                    day = pslot['day_of_week']
+                    if day not in days or (day, my_period_id) in filled:
+                        continue  # something else already holds this slot for me — leave this occurrence unsynced
+
+                    chosen_teacher = teacher_for_subject.get(my_subject_id)
+                    if chosen_teacher and chosen_teacher in booked.get((day, my_period_id), set()):
+                        chosen_teacher = None  # conflict — place anyway, teacherless, flagged for manual fix same as elsewhere
+
+                    _place(day, my_period_id, subj_obj, chosen_teacher)
+                    last_subject_by_day[day] = my_subject_id
 
             # --- Phase 0: a subject with ZERO SLACK — exactly as many valid
             # slots in the whole week as lessons it still needs, like PPI
