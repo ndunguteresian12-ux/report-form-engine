@@ -1554,9 +1554,9 @@ def scheme_copy_print(school_id: int, copy_id: int, request: Request):
             @page {{ size: A4 landscape; margin: 8mm; }}
             body {{ font-family: Arial, sans-serif; color: #1e293b; padding: 16px; font-size: 14px; }}
             @media print {{ .no-print {{ display: none !important; }} body {{ padding: 0; }} }}
-            table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 10px; table-layout: fixed; }}
             th {{ background: #f1f5f9; border: 1px solid #cbd5e1; padding: 8px; font-size: 13px; text-transform: uppercase; }}
-            td {{ font-size: 13px; line-height: 1.4; }}
+            td {{ font-size: 13px; line-height: 1.4; vertical-align: top; word-wrap: break-word; overflow-wrap: break-word; }}
         </style>
     </head>
     <body>
@@ -1585,9 +1585,9 @@ def scheme_copy_print(school_id: int, copy_id: int, request: Request):
         <table>
             <thead>
                 <tr>
-                    <th>Wk</th><th>Lsn</th><th>Strand</th><th>Sub-Strand</th><th>Learning Outcomes</th>
-                    <th>Learning Experiences</th><th>Key Inquiry Question(s)</th><th>Learning Resources</th>
-                    <th>Assessment Methods</th><th>Reflection</th>
+                    <th style="width:3%;">Wk</th><th style="width:3%;">Lsn</th><th style="width:8%;">Strand</th><th style="width:9%;">Sub-Strand</th><th style="width:15%;">Learning Outcomes</th>
+                    <th style="width:16%;">Learning Experiences</th><th style="width:10%;">Key Inquiry Question(s)</th><th style="width:13%;">Learning Resources</th>
+                    <th style="width:12%;">Assessment Methods</th><th style="width:11%;">Reflection</th>
                 </tr>
             </thead>
             <tbody>{rows_html or "<tr><td colspan='10' style='padding:20px;text-align:center;color:#94a3b8;'>No lessons added yet.</td></tr>"}</tbody>
