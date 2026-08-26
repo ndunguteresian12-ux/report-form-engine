@@ -551,7 +551,7 @@ def carry_forward_view(school_id: int, request: Request, done: str = None):
 
 
 @router.post("/api/v1/finance/carry-forward/{school_id}")
-async def carry_forward_balances(school_id: int, request: Request, from_term: str = Form(...), from_year: int = Form(...), to_term: str = Form(...), to_year: int = Form(...)):
+def run_carry_forward_balances(cur, school_id: int, from_term: str, from_year: int, to_term: str, to_year: int, recorded_by=None, note_prefix: str = "Carried forward"):
     """For every active student and every fee category, computes the
     student's real closing balance for the From term (fee amount + old
     opening balance - amount paid) and writes that as their opening
@@ -560,7 +560,85 @@ async def carry_forward_balances(school_id: int, request: Request, from_term: st
     what they owe next). Reuses fee_opening_balances, the same table
     the manual "brought forward" entry already uses, so every existing
     balance display in the app picks this up automatically with no
-    other changes needed."""
+    other changes needed.
+
+    Takes an already-open cursor rather than opening its own connection,
+    so callers elsewhere (e.g. main.py's Settings save and Advance All
+    Classes routes) can run this as part of their own transaction —
+    important for Advance All Classes specifically, since fee amounts
+    are looked up via each student's CURRENT class, and this must run
+    with the OLD class assignments still in place, before promotion
+    changes them.
+
+    Returns the number of student/category combinations written."""
+    if (from_term, from_year) == (to_term, to_year):
+        return 0
+
+    note = f"{note_prefix} from {from_term} {from_year}"
+    combinations_written = 0
+
+    cur.execute("SELECT id FROM fee_categories WHERE school_id = %s;", (school_id,))
+    category_ids = [r[0] if not isinstance(r, dict) else r['id'] for r in cur.fetchall()]
+
+    for cat_id in category_ids:
+        cur.execute("""
+            SELECT s.id AS student_id,
+                   COALESCE(fs.amount, 0) AS fee_amount,
+                   COALESCE((SELECT amount FROM fee_opening_balances fob WHERE fob.student_id = s.id AND fob.fee_category_id = %s AND fob.term = %s AND fob.year = %s), 0) AS old_opening,
+                   COALESCE((SELECT SUM(fp.amount) FROM fee_payments fp WHERE fp.student_id = s.id AND fp.fee_category_id = %s AND fp.term = %s AND fp.year = %s), 0) AS paid
+            FROM students s
+            JOIN classes c ON s.class_id = c.id
+            LEFT JOIN fee_structures fs ON fs.school_id = s.school_id AND fs.fee_category_id = %s AND fs.grade_name = c.grade_name AND fs.term = %s AND fs.year = %s
+            WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
+        """, (cat_id, from_term, from_year, cat_id, from_term, from_year, cat_id, from_term, from_year, school_id))
+        rows = cur.fetchall()
+
+        for row in rows:
+            # Works whether the caller's cursor is a plain tuple cursor
+            # (main.py sometimes uses one) or a RealDictCursor.
+            student_id = row['student_id'] if isinstance(row, dict) else row[0]
+            fee_amount = row['fee_amount'] if isinstance(row, dict) else row[1]
+            old_opening = row['old_opening'] if isinstance(row, dict) else row[2]
+            paid = row['paid'] if isinstance(row, dict) else row[3]
+
+            closing = float(fee_amount) + float(old_opening) - float(paid)
+
+            if abs(closing) < 0.005:
+                # Fully settled, no credit either — remove any stale
+                # destination row rather than leave a 0 behind.
+                cur.execute("""
+                    DELETE FROM fee_opening_balances
+                    WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+                """, (school_id, student_id, cat_id, to_term, to_year))
+                continue
+
+            cur.execute("""
+                SELECT id FROM fee_opening_balances
+                WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+            """, (school_id, student_id, cat_id, to_term, to_year))
+            existing_row = cur.fetchone()
+            if existing_row:
+                existing_id = existing_row['id'] if isinstance(existing_row, dict) else existing_row[0]
+                cur.execute("""
+                    UPDATE fee_opening_balances SET amount = %s, note = %s, recorded_by_user_id = %s, updated_at = NOW()
+                    WHERE id = %s;
+                """, (closing, note, recorded_by, existing_id))
+            else:
+                cur.execute("""
+                    INSERT INTO fee_opening_balances (school_id, student_id, fee_category_id, term, year, amount, note, recorded_by_user_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                """, (school_id, student_id, cat_id, to_term, to_year, closing, note, recorded_by))
+            combinations_written += 1
+
+    return combinations_written
+
+
+@router.post("/api/v1/finance/carry-forward/{school_id}")
+async def carry_forward_balances(school_id: int, request: Request, from_term: str = Form(...), from_year: int = Form(...), to_term: str = Form(...), to_year: int = Form(...)):
+    """Manual trigger for run_carry_forward_balances — kept available for
+    ad-hoc re-runs and corrections, even though the common cases (a new
+    term or a new year via Advance All Classes) now trigger this
+    automatically from main.py."""
     auth_error = require_admin_session(request, school_id)
     if auth_error:
         return auth_error
@@ -571,57 +649,10 @@ async def carry_forward_balances(school_id: int, request: Request, from_term: st
         raise HTTPException(status_code=400, detail="From and To must be different terms.")
 
     recorded_by = request.cookies.get("session_user_id")
-    note = f"Carried forward from {from_term} {from_year}"
-    combinations_written = 0
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM fee_categories WHERE school_id = %s;", (school_id,))
-            category_ids = [r['id'] for r in cur.fetchall()]
-
-            for cat_id in category_ids:
-                cur.execute("""
-                    SELECT s.id AS student_id,
-                           COALESCE(fs.amount, 0) AS fee_amount,
-                           COALESCE((SELECT amount FROM fee_opening_balances fob WHERE fob.student_id = s.id AND fob.fee_category_id = %s AND fob.term = %s AND fob.year = %s), 0) AS old_opening,
-                           COALESCE((SELECT SUM(fp.amount) FROM fee_payments fp WHERE fp.student_id = s.id AND fp.fee_category_id = %s AND fp.term = %s AND fp.year = %s), 0) AS paid
-                    FROM students s
-                    JOIN classes c ON s.class_id = c.id
-                    LEFT JOIN fee_structures fs ON fs.school_id = s.school_id AND fs.fee_category_id = %s AND fs.grade_name = c.grade_name AND fs.term = %s AND fs.year = %s
-                    WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
-                """, (cat_id, from_term, from_year, cat_id, from_term, from_year, cat_id, from_term, from_year, school_id))
-                rows = cur.fetchall()
-
-                for row in rows:
-                    closing = float(row['fee_amount']) + float(row['old_opening']) - float(row['paid'])
-                    student_id = row['student_id']
-
-                    if abs(closing) < 0.005:
-                        # Fully settled, no credit either — remove any
-                        # stale destination row rather than leave a 0.
-                        cur.execute("""
-                            DELETE FROM fee_opening_balances
-                            WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
-                        """, (school_id, student_id, cat_id, to_term, to_year))
-                        continue
-
-                    cur.execute("""
-                        SELECT id FROM fee_opening_balances
-                        WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
-                    """, (school_id, student_id, cat_id, to_term, to_year))
-                    existing_row = cur.fetchone()
-                    if existing_row:
-                        cur.execute("""
-                            UPDATE fee_opening_balances SET amount = %s, note = %s, recorded_by_user_id = %s, updated_at = NOW()
-                            WHERE id = %s;
-                        """, (closing, note, recorded_by, existing_row['id']))
-                    else:
-                        cur.execute("""
-                            INSERT INTO fee_opening_balances (school_id, student_id, fee_category_id, term, year, amount, note, recorded_by_user_id)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-                        """, (school_id, student_id, cat_id, to_term, to_year, closing, note, recorded_by))
-                    combinations_written += 1
-
+            combinations_written = run_carry_forward_balances(cur, school_id, from_term, from_year, to_term, to_year, recorded_by)
             conn.commit()
 
     return RedirectResponse(url=f"/finance/carry-forward/{school_id}?done={combinations_written}", status_code=303)
@@ -1149,14 +1180,14 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
             <details class="bg-white rounded-2xl border shadow-xs">
                 <summary class="p-4 cursor-pointer text-sm font-bold text-slate-700 select-none">⚙️ Set Brought-Forward Balance (arrears from before this system)</summary>
                 <div class="p-4 pt-0">
-                    <p class="text-xs text-slate-400 mb-3">For a student who already owed money before this school started using Elimu Hub — enter it here so their true total balance is accurate. This is added on top of the normal fee, not a payment.</p>
+                    <p class="text-xs text-slate-400 mb-3">For a student who already owed money — or already had credit from overpaying — before this school started using Elimu Hub. Enter a positive number for arrears owed, or a negative number (e.g. <span class="font-mono">-500</span>) for a pre-existing credit that should reduce what they owe. This is added on top of the normal fee, not a payment.</p>
                     <form action="/api/v1/finance/opening-balance/save/{school_id}/{student_id}" method="post" class="space-y-2">
                         <input type="hidden" name="term" value="{esc(term)}"><input type="hidden" name="year" value="{year}">
                         {"".join(f'''
                         <div class="flex items-center gap-2 flex-wrap">
                             <span class="text-xs font-semibold text-slate-600 w-32 shrink-0">{esc(c["name"])}</span>
                             <span class="text-slate-400 text-xs">KSh</span>
-                            <input type="number" name="opening_{c['id']}" value="{opening_by_category.get(c['id'], {}).get('amount', '') or ''}" min="0" step="0.01" placeholder="0" class="border p-2 rounded-lg w-32 text-right text-sm">
+                            <input type="number" name="opening_{c['id']}" value="{opening_by_category.get(c['id'], {}).get('amount', '') or ''}" step="0.01" placeholder="0" class="border p-2 rounded-lg w-32 text-right text-sm">
                             <input type="text" name="note_{c['id']}" value="{esc(opening_by_category.get(c['id'], {}).get('note') or '')}" placeholder="Note (optional)" class="border p-2 rounded-lg flex-1 min-w-[140px] text-xs">
                         </div>
                         ''' for c in categories)}
@@ -1292,8 +1323,12 @@ async def save_opening_balance(school_id: int, student_id: int, request: Request
                     amount = float(raw_amount)
                 except ValueError:
                     continue
-                if amount < 0:
-                    continue
+                # Negative is allowed and meaningful here — it represents
+                # a pre-existing credit (e.g. a student who overpaid at
+                # their previous school, or before this school adopted
+                # Elimu Hub), not just arrears. It's subtracted from what
+                # the student owes exactly the same way an automatically
+                # carried-forward credit is (see run_carry_forward_balances).
 
                 # Check-then-update-or-insert rather than ON CONFLICT — same
                 # lesson learned earlier with fee_structures: safer than

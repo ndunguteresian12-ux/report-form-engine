@@ -5220,6 +5220,19 @@ def update_settings_endpoint(
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            # Read what term/year this school was on BEFORE the update, so
+            # that if it's actually changing, any student's over/under-
+            # payment from the old term automatically becomes their
+            # opening balance for the new one — no separate manual step
+            # needed for the common within-year case (Term 1 -> Term 2 -> 
+            # Term 3). Year-end promotion has its own hook in
+            # promote_school_classes below, since that one needs to run
+            # carry-forward BEFORE class assignments change, not after.
+            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+            existing_settings_row = cur.fetchone()
+            old_term = existing_settings_row[0] if existing_settings_row else None
+            old_year = existing_settings_row[1] if existing_settings_row else None
+
             cur.execute("""
                 INSERT INTO school_settings (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream, head_teacher_name)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -5238,7 +5251,17 @@ def update_settings_endpoint(
             conn.commit()
             log_audit_action(cur, request, school_id, "settings_updated", f"Term={active_term}, Year={active_year}, Cycle={active_cycle}, Theme={theme_color}, SingleStream={is_single_stream_bool}")
             conn.commit()
-            
+
+            # Term/year actually changed -> carry every student's real
+            # over/under-payment from the old term into the new one,
+            # automatically.
+            if old_term and old_year and (old_term, old_year) != (active_term, active_year):
+                from finance_routes import run_carry_forward_balances
+                carried_count = run_carry_forward_balances(cur, school_id, old_term, old_year, active_term, active_year, request.cookies.get("session_user_id"))
+                conn.commit()
+                log_audit_action(cur, request, school_id, "fee_balances_carried_forward", f"{old_term} {old_year} -> {active_term} {active_year}: {carried_count} balance(s) carried")
+                conn.commit()
+
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
 @app.post("/api/v1/students/add/{school_id}")
@@ -5895,6 +5918,42 @@ def promote_school_classes(school_id: int, request: Request):
     
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            # Carry forward every student's real over/under-payment from
+            # the CURRENT term into the next one, BEFORE promotion changes
+            # anyone's class — fee amounts are looked up via each
+            # student's current class, so this must run first, using
+            # everyone's still-correct (pre-promotion) grade, or it would
+            # use each student's new (already-promoted) grade's fee amount
+            # instead of the grade they were actually billed at.
+            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings_row = cur.fetchone()
+            if settings_row:
+                old_term, old_year = settings_row[0], settings_row[1]
+                from finance_routes import run_carry_forward_balances, _next_term_year
+                next_term, next_year = _next_term_year(old_term, old_year)
+                recorded_by = request.cookies.get("session_user_id")
+                carried_count = run_carry_forward_balances(
+                    cur, school_id, old_term, old_year, next_term, next_year,
+                    recorded_by, note_prefix="Carried forward (class promotion)"
+                )
+                conn.commit()
+                log_audit_action(cur, request, school_id, "fee_balances_carried_forward", f"{old_term} {old_year} -> {next_term} {next_year} (promotion): {carried_count} balance(s) carried")
+                conn.commit()
+
+                # Roll the school's active term/year forward to match, in
+                # the SAME transaction as the carry-forward above. Without
+                # this, a Settings save done afterward would see the term
+                # as still "changing" from old -> new and recompute the
+                # exact same carry-forward a second time — but by then
+                # every student's class already reflects their NEW
+                # (promoted) grade, so that second run would silently
+                # overwrite the correct value just written above with a
+                # wrong one. Keeping both updates together in one place
+                # closes that gap structurally rather than relying on
+                # anyone clicking things in a particular order.
+                cur.execute("UPDATE school_settings SET active_term = %s, active_year = %s WHERE school_id = %s;", (next_term, next_year, school_id))
+                conn.commit()
+
             # Step 1: Safely graduate Grade 9 out of the active pool
             cur.execute("""
                 UPDATE students 
