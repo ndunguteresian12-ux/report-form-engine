@@ -133,6 +133,23 @@ def bootstrap_timetable_schema():
                     UNIQUE(school_id, grade_name, education_level, stream, learning_area_id)
                 );
 
+                ALTER TABLE teacher_subject_assignments ADD COLUMN IF NOT EXISTS double_lessons_count INTEGER NOT NULL DEFAULT 0;
+
+                -- One-time, safe-to-re-run backfill: a school that already
+                -- had "requires double" checked before this feature existed
+                -- gets exactly one double (double_lessons_count = 1) —
+                -- exactly matching what "requires_double = TRUE" already
+                -- meant in the generator, so no existing live school's
+                -- timetable behavior changes just from this migration. The
+                -- WHERE guard makes this a no-op on any row an admin has
+                -- already set a real double count on, so it's safe even if
+                -- this runs again on every future deploy. Covers both
+                -- regular subjects (learning_area_id) and custom subjects
+                -- (custom_subject_id) since both live in this one table.
+                UPDATE teacher_subject_assignments
+                SET double_lessons_count = 1
+                WHERE requires_double = TRUE AND double_lessons_count = 0;
+
                 CREATE TABLE IF NOT EXISTS timetable_slots (
                     id SERIAL PRIMARY KEY,
                     school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
@@ -575,7 +592,7 @@ def validate_timetable_setup(cur, school_id: int, grade_name: str, education_lev
         return errors, warnings
 
     cur.execute("""
-        SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
+        SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double, double_lessons_count FROM teacher_subject_assignments
         WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
     """, (school_id, grade_name, education_level, stream))
     assignments = {r['learning_area_id']: r for r in cur.fetchall()}
@@ -597,8 +614,11 @@ def validate_timetable_setup(cur, school_id: int, grade_name: str, education_lev
             warnings.append(f"'{sub['name']}' has a teacher assigned but 0 lessons per week set — it won't be scheduled. Set a lessons-per-week value under Teaching Assignments.")
             continue
         total_required_slots += lessons
-        if a['requires_double'] and not has_consecutive_pair:
-            errors.append(f"'{sub['name']}' is set to require a double lesson, but {education_level} has no two consecutive teaching periods anywhere in the day — a double lesson literally cannot be placed. Either add consecutive periods or turn off 'requires double' for this subject.")
+        doubles = a.get('double_lessons_count') or 0
+        if doubles > 0 and not has_consecutive_pair:
+            errors.append(f"'{sub['name']}' is set for {doubles} double lesson(s) per week, but {education_level} has no two consecutive teaching periods anywhere in the day — a double lesson literally cannot be placed. Either add consecutive periods or set doubles/week to 0 for this subject.")
+        elif doubles * 2 > lessons:
+            errors.append(f"'{sub['name']}' is set for {doubles} double lesson(s) per week, which needs {doubles * 2} lessons just for the doubles, but only {lessons} lesson(s)/week are configured in total. Reduce the number of doubles or increase lessons/week for this subject.")
 
     if total_required_slots > total_available_slots:
         errors.append(
@@ -889,7 +909,7 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
             staff_members = cur.fetchall()
 
             cur.execute("""
-                SELECT learning_area_id, custom_subject_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
+                SELECT learning_area_id, custom_subject_id, staff_user_id, lessons_per_week, requires_double, double_lessons_count FROM teacher_subject_assignments
                 WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
             """, (school_id, grade_name, education_level, stream))
             all_assignments = cur.fetchall()
@@ -899,7 +919,7 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
     def _assignment_row(field_prefix, item_id, item_name, existing):
         assigned_id = existing.get('staff_user_id')
         lessons_per_week = existing.get('lessons_per_week', 1)
-        requires_double = existing.get('requires_double', False)
+        double_lessons_count = existing.get('double_lessons_count', 0) or 0
         options = "<option value=''>— Unassigned —</option>" + "".join(
             f"<option value='{m['id']}' {'selected' if m['id'] == assigned_id else ''}>{esc(m['full_name'] or m['email'])}</option>"
             for m in staff_members
@@ -911,9 +931,8 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
             <div class="flex items-center gap-2 shrink-0">
                 <label class="text-[10px] font-bold text-slate-500">Lessons/wk</label>
                 <input type="number" name="lessons_{field_prefix}_{item_id}" value="{lessons_per_week}" min="0" max="20" class="border p-1.5 rounded-lg text-xs w-14 text-center">
-                <label class="text-[10px] font-bold text-slate-500 flex items-center gap-1">
-                    <input type="checkbox" name="double_{field_prefix}_{item_id}" value="1" {'checked' if requires_double else ''} class="w-3.5 h-3.5"> Needs double
-                </label>
+                <label class="text-[10px] font-bold text-slate-500">Doubles/wk</label>
+                <input type="number" name="doubles_{field_prefix}_{item_id}" value="{double_lessons_count}" min="0" max="10" class="border p-1.5 rounded-lg text-xs w-14 text-center" title="How many of this subject's weekly lessons should be back-to-back double periods (e.g. 2 doubles + 1 single = 5 lessons/week). The rest are single lessons.">
             </div>
         </div>
         """
@@ -975,7 +994,14 @@ async def save_teacher_assignments(school_id: int, request: Request):
                         lessons_per_week = max(0, min(20, int(form.get(f"lessons_teachercustom_{custom_subject_id}", 1) or 1)))
                     except ValueError:
                         lessons_per_week = 1
-                    requires_double = form.get(f"double_teachercustom_{custom_subject_id}") is not None
+                    try:
+                        double_lessons_count = max(0, min(10, int(form.get(f"doubles_teachercustom_{custom_subject_id}", 0) or 0)))
+                    except ValueError:
+                        double_lessons_count = 0
+                    # Kept in sync purely for backward compatibility with
+                    # any other code path still reading the old boolean —
+                    # double_lessons_count is the real source of truth now.
+                    requires_double = double_lessons_count > 0
 
                     # Check-then-update-or-insert rather than ON CONFLICT —
                     # this targets a partial unique index (only enforced
@@ -992,14 +1018,14 @@ async def save_teacher_assignments(school_id: int, request: Request):
                     existing_row = cur.fetchone()
                     if existing_row:
                         cur.execute("""
-                            UPDATE teacher_subject_assignments SET staff_user_id = %s, lessons_per_week = %s, requires_double = %s
+                            UPDATE teacher_subject_assignments SET staff_user_id = %s, lessons_per_week = %s, requires_double = %s, double_lessons_count = %s
                             WHERE id = %s;
-                        """, (staff_user_id, lessons_per_week, requires_double, existing_row[0]))
+                        """, (staff_user_id, lessons_per_week, requires_double, double_lessons_count, existing_row[0]))
                     else:
                         cur.execute("""
-                            INSERT INTO teacher_subject_assignments (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
-                        """, (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double))
+                            INSERT INTO teacher_subject_assignments (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count))
                     continue
 
                 if not key.startswith("teacher_"):
@@ -1011,14 +1037,18 @@ async def save_teacher_assignments(school_id: int, request: Request):
                     lessons_per_week = max(0, min(20, int(form.get(f"lessons_teacher_{learning_area_id}", 1) or 1)))
                 except ValueError:
                     lessons_per_week = 1
-                requires_double = form.get(f"double_teacher_{learning_area_id}") is not None
+                try:
+                    double_lessons_count = max(0, min(10, int(form.get(f"doubles_teacher_{learning_area_id}", 0) or 0)))
+                except ValueError:
+                    double_lessons_count = 0
+                requires_double = double_lessons_count > 0
 
                 cur.execute("""
-                    INSERT INTO teacher_subject_assignments (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO teacher_subject_assignments (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (school_id, learning_area_id, grade_name, education_level, stream)
-                    DO UPDATE SET staff_user_id = EXCLUDED.staff_user_id, lessons_per_week = EXCLUDED.lessons_per_week, requires_double = EXCLUDED.requires_double;
-                """, (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double))
+                    DO UPDATE SET staff_user_id = EXCLUDED.staff_user_id, lessons_per_week = EXCLUDED.lessons_per_week, requires_double = EXCLUDED.requires_double, double_lessons_count = EXCLUDED.double_lessons_count;
+                """, (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count))
             conn.commit()
 
     encoded_grade = urllib.parse.quote(grade_name)
@@ -3049,23 +3079,28 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             subjects = subjects + custom_subjects
 
             cur.execute("""
-                SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
+                SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double, double_lessons_count FROM teacher_subject_assignments
                 WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND learning_area_id IS NOT NULL;
             """, (school_id, grade_name, education_level, stream))
             assignment_rows = cur.fetchall()
             teacher_for_subject = {r['learning_area_id']: r['staff_user_id'] for r in assignment_rows}
             lessons_per_week_for_subject = {r['learning_area_id']: r['lessons_per_week'] for r in assignment_rows}
-            requires_double_for_subject = {r['learning_area_id']: r['requires_double'] for r in assignment_rows}
+            # double_lessons_count is the real source of truth (how MANY
+            # double lessons per week, entered manually) — requires_double
+            # is only kept around for any other code path that might still
+            # read the old boolean; it's always kept in sync as
+            # double_lessons_count > 0 wherever this is saved.
+            double_count_for_subject = {r['learning_area_id']: (r['double_lessons_count'] or 0) for r in assignment_rows}
 
             cur.execute("""
-                SELECT custom_subject_id, staff_user_id, lessons_per_week, requires_double FROM teacher_subject_assignments
+                SELECT custom_subject_id, staff_user_id, lessons_per_week, requires_double, double_lessons_count FROM teacher_subject_assignments
                 WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND custom_subject_id IS NOT NULL;
             """, (school_id, grade_name, education_level, stream))
             for r in cur.fetchall():
                 offset_id = r['custom_subject_id'] + CUSTOM_SUBJECT_ID_OFFSET
                 teacher_for_subject[offset_id] = r['staff_user_id']
                 lessons_per_week_for_subject[offset_id] = r['lessons_per_week']
-                requires_double_for_subject[offset_id] = r['requires_double']
+                double_count_for_subject[offset_id] = (r['double_lessons_count'] or 0)
 
             if not subjects or not teaching_periods:
                 raise HTTPException(status_code=400, detail="No subjects or teaching periods configured — nothing to generate.")
@@ -3400,20 +3435,26 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 if lcid in remaining:
                     remaining[lcid] = max(0, remaining[lcid] - 1)
 
-            # --- Phase 2: subjects needing at least one double lesson (e.g.
-            # for practicals) get a genuine back-to-back pair placed first,
-            # before anything else competes for those slots. ---
+            # --- Phase 2: subjects needing double lessons (e.g. for
+            # practicals) get their genuine back-to-back pairs placed
+            # first, before anything else competes for those slots. A
+            # subject can now need MORE THAN ONE double per week (e.g.
+            # English: 2 doubles + 1 single = 5 lessons/week) — each
+            # double still goes on its own distinct day, same as before,
+            # just repeated for however many doubles were configured. ---
             for subj in free_subjects:
                 sid = subj['id']
-                if not requires_double_for_subject.get(sid) or remaining.get(sid, 0) < 2:
+                doubles_needed = double_count_for_subject.get(sid, 0)
+                if doubles_needed <= 0 or remaining.get(sid, 0) < 2:
                     continue
                 cand_teacher = teacher_for_subject.get(sid)
-                placed = False
+                doubles_placed = 0
                 for day in days:
-                    if placed:
+                    if doubles_placed >= doubles_needed or remaining.get(sid, 0) < 2:
                         break
                     if sid in used_today_by_day[day]:
-                        continue  # already has a lesson today — keep doubles on their own day
+                        continue  # already has a lesson today — keep each double on its own day
+                    placed_today = False
                     for p1, p2 in consecutive_period_pairs:
                         if (day, p1['id']) in filled or (day, p2['id']) in filled:
                             continue
@@ -3427,11 +3468,15 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                         _place(day, p1['id'], subj, cand_teacher)
                         _place(day, p2['id'], subj, cand_teacher)
                         last_subject_by_day[day] = sid
-                        placed = True
+                        doubles_placed += 1
+                        placed_today = True
                         break
-                # If no clean double slot exists anywhere, the subject simply
-                # falls through to Phase 3 as ordinary single lessons instead
-                # of forcing a bad placement.
+                    if not placed_today:
+                        continue
+                # If fewer clean double slots exist than were requested,
+                # whatever's left of this subject's quota simply falls
+                # through to Phase 3 as ordinary single lessons instead of
+                # forcing a bad placement.
 
             # --- Phase 3: fill remaining empty slots with each subject's
             # remaining single lessons, up to its weekly quota — once a
