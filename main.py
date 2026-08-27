@@ -2432,6 +2432,7 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
             <div class="flex items-center gap-2">
                 <a href="/superadmin/schemes/list" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">📘 Schemes of Work</a>
                 <a href="/superadmin/billing/settings" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">💰 Billing Settings</a>
+                <a href="/superadmin/db-diagnostic" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">🔍 DB Diagnostic</a>
                 <form action="/api/v1/superadmin/backup-now" method="post" onsubmit="return confirm('Trigger an on-demand database backup now? This runs in the background via GitHub Actions and does not affect any school\\'s live data.');">
                     <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded-xl text-xs font-bold transition">💾 Backup Now</button>
                 </form>
