@@ -2034,7 +2034,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
-                    <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
+                    <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
                     <a href='/admin/reports/subject-analysis/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-amber-600 hover:bg-amber-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Subj. Analysis</a>
                     <a href='/admin/reports/grade-distribution/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}' target='_blank' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Grade Distribution</a>
                     <a href='/admin/reports/top10/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-rose-600 hover:bg-rose-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Top 10</a>
@@ -2263,6 +2263,65 @@ def logout():
     response.delete_cookie("session_role")
     response.delete_cookie("session_user_id")
     return response
+
+
+@app.get("/superadmin/db-diagnostic", response_class=HTMLResponse)
+def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
+    """Shows exactly what the CURRENTLY RUNNING app's own database
+    connection sees for a given table's columns — not what any Neon
+    console session might show, which could be looking at a completely
+    different project/branch than what DATABASE_URL on Render actually
+    points to. This is the only way to be certain the live app and
+    whatever database you just edited are actually the same database."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT current_database(), current_user, inet_server_addr();")
+            conn_info = cur.fetchone()
+
+            cur.execute("""
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_name = %s
+                ORDER BY ordinal_position;
+            """, (table,))
+            columns = cur.fetchall()
+
+    rows_html = "".join(
+        f"<tr class='border-b text-xs'><td class='p-2 font-mono font-bold'>{esc(c['column_name'])}</td><td class='p-2 text-slate-500'>{esc(c['data_type'])}</td><td class='p-2'>{esc(c['is_nullable'])}</td></tr>"
+        for c in columns
+    )
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | DB Diagnostic</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+                <h2 class="text-lg font-black text-slate-800">🔍 Live Database Diagnostic</h2>
+                <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs font-mono space-y-1">
+                    <p><b>Connected database:</b> {esc(str(conn_info['current_database']))}</p>
+                    <p><b>Connected as:</b> {esc(str(conn_info['current_user']))}</p>
+                    <p><b>Server address:</b> {esc(str(conn_info['inet_server_addr']))}</p>
+                </div>
+                <p class="text-xs text-slate-400">Compare the database name above against the Neon project/branch you ran your ALTER TABLE commands on — if they don't match, that's exactly why the fix didn't take effect.</p>
+                <form method="get" action="/superadmin/db-diagnostic" class="flex gap-2">
+                    <input type="text" name="table" value="{esc(table)}" class="flex-1 border border-slate-200 p-2 rounded-lg text-xs">
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold px-4 py-2 rounded-lg">Check Table</button>
+                </form>
+                <table class="w-full text-left border-collapse">
+                    <thead><tr class="border-b-2 text-[11px] uppercase text-slate-400"><th class="p-2">Column</th><th class="p-2">Type</th><th class="p-2">Nullable</th></tr></thead>
+                    <tbody>{rows_html or f"<tr><td colspan='3' class='p-4 text-center text-slate-400 italic text-xs'>No table named '{esc(table)}' found in this database.</td></tr>"}</tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
 
 @app.get("/superadmin/dashboard", response_class=HTMLResponse)
@@ -2850,7 +2909,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
-                    <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
+                    <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
                     <a href='/admin/reports/subject-analysis/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-amber-600 hover:bg-amber-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Subj. Analysis</a>
                     <a href='/admin/reports/grade-distribution/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}' target='_blank' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Grade Distribution</a>
                     <a href='/admin/reports/top10/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-rose-600 hover:bg-rose-700 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Top 10</a>
@@ -3004,7 +3063,7 @@ def print_class_roster(school_id: int, grade_name: str, education_level: str, st
 
 
 @app.get("/admin/reports/merit-list/{school_id}", response_class=HTMLResponse)
-def print_merit_list(school_id: int, grade_name: str, education_level: str, request: Request, combined: str = None):
+def print_merit_list(school_id: int, grade_name: str, education_level: str, request: Request, combined: str = None, stream: str = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -3020,16 +3079,23 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
 
-            # Whole grade, every stream combined — matches how this report is
-            # actually used at the school (one merit list per grade, not per stream).
+            # Whole grade, every stream combined, when no stream is given —
+            # this is the ORIGINAL behavior, kept exactly as-is for any
+            # existing link/bookmark that never passes ?stream=. When a
+            # stream IS given, this becomes a per-class (single stream)
+            # merit list instead — same "SINGLE STREAM" placeholder
+            # convention every other per-class report in this file already
+            # uses, so a school with no real sub-streams still gets every
+            # student in the grade matched correctly.
             cur.execute("""
                 SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name, s.stream
                 FROM students s
                 JOIN classes c ON s.class_id = c.id
                 WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
+                  AND (%s IS NULL OR %s = 'SINGLE STREAM' OR s.stream = %s)
                   AND (s.status IS NULL OR s.status != 'GRADUATED')
                 ORDER BY s.admission_number ASC;
-            """, (school_id, grade_name, education_level))
+            """, (school_id, grade_name, education_level, stream, stream, stream))
             students = cur.fetchall()
 
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
@@ -3149,7 +3215,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
         logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
 
-    exam_code = f"{grade_name.replace(' ', '').upper()}{st.get('active_year', 2026)}{str(st['active_cycle']).upper().replace(' ', '')}"
+    class_title = grade_name if (not stream or stream == "SINGLE STREAM") else f"{grade_name} — {stream}"
+    exam_code = f"{grade_name.replace(' ', '').upper()}{'' if (not stream or stream == 'SINGLE STREAM') else stream.replace(' ', '').upper()}{st.get('active_year', 2026)}{str(st['active_cycle']).upper().replace(' ', '')}"
 
     subject_header_cells = "".join(f"<th style='text-align:center;'>{esc(abbreviate_subject(sub['name']))}</th>" for sub in subjects)
 
@@ -3203,18 +3270,21 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         f"<td style='text-align:center;'>{f['avg_pts']:.4f} {f['level']}</td>" for f in subject_footer
     )
 
+    is_single_stream_view = bool(stream) and stream != "SINGLE STREAM"
+    scope_label = f" — {esc(stream)} ONLY" if is_single_stream_view else " — WHOLE GRADE (ALL STREAMS)"
+
     from mpesa_routes import render_admin_print_toolbar_and_content
     document_content_html = f"""
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
             <div>
                 <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:13px;font-weight:bold;">REPORT: STUDENTS' PERFORMANCE MERIT LIST{' — COMBINED TERM (OPENER + MID-TERM + END TERM)' if combined else ''}</p>
+                <p style="margin:2px 0 0;font-size:13px;font-weight:bold;">REPORT: STUDENTS' PERFORMANCE MERIT LIST{scope_label}{' — COMBINED TERM (OPENER + MID-TERM + END TERM)' if combined else ''}</p>
             </div>
         </div>
         <table class="header-fields" style="margin-top:8px;">
             <tr>
-                <td><b>CLASS:</b> {esc(grade_name)}</td>
+                <td><b>CLASS:</b> {esc(class_title)}</td>
                 <td><b>TERM:</b> {esc(str(st['active_term']))}</td>
                 <td><b>YEAR:</b> {esc(str(st.get('active_year', 2026)))}</td>
                 <td><b>EXAM NAME:</b> {'COMBINED (ALL CYCLES)' if combined else esc(str(st['active_cycle']).upper())}</td>
@@ -3275,7 +3345,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
-            <a href="/admin/reports/merit-list/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}{'&combined=1' if not combined else ''}" style="background:#0d9488;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">{'📄 Switch to Single Cycle (' + str(st['active_cycle']) + ')' if combined else '📊 Switch to Combined Term (Opener + Mid + End)'}</a>
+            <a href="/admin/reports/merit-list/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}{'&combined=1' if not combined else ''}{'&stream=' + urllib.parse.quote(stream) if stream else ''}" style="background:#0d9488;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">{'📄 Switch to Single Cycle (' + str(st['active_cycle']) + ')' if combined else '📊 Switch to Combined Term (Opener + Mid + End)'}</a>
+            {f'<a href="/admin/reports/merit-list/{school_id}?grade_name=' + urllib.parse.quote(grade_name) + '&education_level=' + urllib.parse.quote(education_level) + ('&combined=1' if combined else '') + '" style="background:#7c3aed;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">🏫 Switch to Whole Grade (All Streams)</a>' if is_single_stream_view else ''}
             {toolbar_button}
         </div>
         {content_html}
