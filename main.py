@@ -768,6 +768,20 @@ def bootstrap_database_schema():
                     UNIQUE(student_id, learning_area_id, cycle_name)
                 );
 
+                -- Purely for display/re-editing: when marks are entered as
+                -- e.g. "56 out of 70" rather than directly as a percentage,
+                -- these two capture exactly what was typed so reopening the
+                -- entry grid shows "56" again, not the converted "80.0".
+                -- raw_score remains the single source of truth for every
+                -- report/ranking/grading calculation everywhere else in the
+                -- app, always a 0-100 percentage exactly as before — these
+                -- columns are NULL on every pre-existing row and on any
+                -- entry still made the classic direct-percentage way, so
+                -- nothing downstream needs to change or even know this
+                -- exists.
+                ALTER TABLE student_scores ADD COLUMN IF NOT EXISTS entered_marks NUMERIC(6, 2);
+                ALTER TABLE student_scores ADD COLUMN IF NOT EXISTS entered_out_of NUMERIC(6, 2);
+
                 -- Some Junior School subjects (English, Kiswahili, Integrated
                 -- Science) are assessed as two separate papers, each with its
                 -- own "out of" max — e.g. Paper 1 out of 30, Paper 2 out of
@@ -4320,11 +4334,24 @@ def educators_bulk_entry_grid(
                     paper2_max = float(first_p2_max)
             elif selected_area_id:
                 cur.execute("""
-                    SELECT student_id, raw_score FROM student_scores 
+                    SELECT student_id, raw_score, entered_marks, entered_out_of FROM student_scores 
                     WHERE learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;
                 """, (selected_area_id, cycle_name, active_term, active_year))
                 for scr in cur.fetchall():
-                    score_map[scr['student_id']] = float(scr['raw_score'])
+                    score_map[scr['student_id']] = {
+                        'raw_score': float(scr['raw_score']),
+                        'entered_marks': float(scr['entered_marks']) if scr['entered_marks'] is not None else None,
+                        'entered_out_of': float(scr['entered_out_of']) if scr['entered_out_of'] is not None else None,
+                    }
+
+            # "Out of" is one shared value for the whole grid, entered once
+            # — same UX as Paper 1/Paper 2's "out of" above. Reuse whatever
+            # was last used for this subject/cycle if every existing entry
+            # agrees on it; default to 100 (a plain percentage) otherwise,
+            # which is exactly today's existing behavior for a school that
+            # never touches this new field at all.
+            out_of_values = {v['entered_out_of'] for v in score_map.values() if v.get('entered_out_of') is not None}
+            shared_out_of = out_of_values.pop() if len(out_of_values) == 1 else 100.0
 
     subject_options = "".join([f"<option value='{sub['id']}' {'selected' if sub['id'] == selected_area_id else ''}>{sub['name']}</option>" for sub in subjects])
 
@@ -4343,8 +4370,19 @@ def educators_bulk_entry_grid(
             </div>
             """
         else:
-            existing_val = score_map.get(s['id'], "")
-            input_html = f'<input type="number" inputmode="decimal" step="0.01" min="0" max="100" name="score_{s["id"]}" value="{existing_val}" class="border-2 p-2.5 rounded-xl w-24 shrink-0 focus:border-emerald-600 font-bold text-center text-base" placeholder="-%">'
+            existing = score_map.get(s['id'])
+            # Show whatever was actually typed (e.g. "56") rather than the
+            # converted percentage, so reopening this grid doesn't silently
+            # rewrite what the teacher entered. Falls back to raw_score for
+            # any older entry made before this "out of" feature existed
+            # (entered_marks is NULL on those rows).
+            if existing and existing.get('entered_marks') is not None:
+                existing_val = existing['entered_marks']
+            elif existing:
+                existing_val = existing['raw_score']
+            else:
+                existing_val = ""
+            input_html = f'<input type="number" inputmode="decimal" step="0.01" min="0" max="{shared_out_of:.0f}" name="score_{s["id"]}" value="{existing_val}" class="border-2 p-2.5 rounded-xl w-24 shrink-0 focus:border-emerald-600 font-bold text-center text-base" placeholder="-">'
 
         student_rows += f"""
         <div class="student-row flex items-center justify-between gap-3 p-3.5 border-b last:border-0" data-search="{esc(search_key)}">
@@ -4409,13 +4447,18 @@ def educators_bulk_entry_grid(
                     <input type="number" name="paper2_max" value="{paper2_max:.0f}" min="1" class="border-2 border-indigo-200 p-1.5 rounded-lg w-16 text-center font-bold">
                 </label>
                 <span class="text-indigo-400 italic">The two papers are combined into one percentage automatically on save.</span>
-            </div>''' if is_paper_mode else ""}
+            </div>''' if is_paper_mode else f'''<div class="p-3.5 bg-indigo-50 border-b border-indigo-100 flex flex-wrap items-center gap-3 text-xs">
+                <label class="flex items-center gap-1.5 font-semibold text-indigo-700">This exam is out of
+                    <input type="number" name="out_of" value="{shared_out_of:.0f}" min="1" onchange="document.querySelectorAll('input[name^=score_]').forEach(el => el.max = this.value)" class="border-2 border-indigo-200 p-1.5 rounded-lg w-20 text-center font-bold">
+                </label>
+                <span class="text-indigo-400 italic">Enter each learner's raw marks below — converted to a percentage automatically on save. Leave as 100 if you're entering a percentage directly, exactly as before.</span>
+            </div>'''}
 
             <div class="p-3 border-b bg-white">
                 <input type="text" id="studentSearchBox" oninput="filterStudentRows(this.value)" placeholder="🔎 Search by name or admission number..." class="w-full border-2 p-2.5 rounded-xl text-sm focus:border-emerald-600" autocomplete="off">
             </div>
             <div class="px-3.5 py-2.5 bg-slate-50 text-slate-500 text-[10px] font-bold uppercase tracking-wider border-b flex justify-between">
-                <span>Learner</span><span>{"Paper 1 / Paper 2" if is_paper_mode else "Score %"}</span>
+                <span>Learner</span><span>{"Paper 1 / Paper 2" if is_paper_mode else ("Score %" if shared_out_of == 100 else f"Marks (out of {shared_out_of:.0f})")}</span>
             </div>
             <div id="studentRowsContainer">{student_rows or "<p class='text-center p-6 text-slate-400 italic text-xs'>No registered class matching criterion.</p>"}</div>
             <p id="noSearchResults" class="hidden text-center p-6 text-slate-400 italic text-xs">No learners match that search.</p>
@@ -5835,6 +5878,13 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
         return RedirectResponse(url=f"/staff/bulk-entry/{school_id}?{redirect_params}", status_code=303)
 
     skipped_entries = 0
+    try:
+        out_of = float(form_data.get("out_of") or 100)
+    except ValueError:
+        out_of = 100.0
+    if out_of <= 0:
+        out_of = 100.0
+
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             for key, val in form_data.items():
@@ -5845,14 +5895,24 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
                 # one bad row doesn't abort the whole batch commit.
                 try:
                     target_student_id = int(key.split("_")[1])
-                    raw_score = float(val)
+                    entered_marks = float(val)
                 except (IndexError, ValueError):
                     skipped_entries += 1
                     continue
 
-                if not (0 <= raw_score <= 100):
+                if not (0 <= entered_marks <= out_of):
                     skipped_entries += 1
                     continue
+
+                # "Out of 100" is a plain percentage already — this is
+                # exactly today's existing behavior for any school that
+                # never touches the new "out of" field at all. Anything
+                # else (e.g. out of 70) converts to a percentage here;
+                # raw_score stays the single 0-100 figure every report,
+                # ranking, and grade calculation elsewhere already expects,
+                # so nothing downstream needs to know this conversion
+                # happened.
+                raw_score = round(entered_marks / out_of * 100, 2) if out_of != 100 else entered_marks
 
                 cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (target_student_id, school_id))
                 if cur.fetchone():
@@ -5862,12 +5922,15 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
                     """, (target_student_id, learning_area_id, cycle_name, active_term, active_year))
                     existing_row = cur.fetchone()
                     if existing_row:
-                        cur.execute("UPDATE student_scores SET raw_score = %s WHERE id = %s;", (raw_score, existing_row[0]))
+                        cur.execute("""
+                            UPDATE student_scores SET raw_score = %s, entered_marks = %s, entered_out_of = %s
+                            WHERE id = %s;
+                        """, (raw_score, entered_marks, out_of, existing_row[0]))
                     else:
                         cur.execute("""
-                            INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score, term, year)
-                            VALUES (%s, %s, %s, %s, %s, %s);
-                        """, (target_student_id, learning_area_id, cycle_name, raw_score, active_term, active_year))
+                            INSERT INTO student_scores (student_id, learning_area_id, cycle_name, raw_score, entered_marks, entered_out_of, term, year)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (target_student_id, learning_area_id, cycle_name, raw_score, entered_marks, out_of, active_term, active_year))
                 else:
                     skipped_entries += 1
             conn.commit()
