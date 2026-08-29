@@ -26,6 +26,7 @@ periods and subjects, fetch everything else.
 """
 
 import urllib.parse
+import json
 from fastapi import APIRouter, Request, HTTPException, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -100,6 +101,20 @@ def bootstrap_timetable_schema():
     school data already in it."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS timetable_generation_issues (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    grade_name VARCHAR(100) NOT NULL,
+                    education_level VARCHAR(100) NOT NULL,
+                    stream VARCHAR(100) NOT NULL,
+                    issues_json TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(school_id, grade_name, education_level, stream)
+                );
+            """)
+            conn.commit()
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS timetable_settings (
                     school_id INTEGER PRIMARY KEY REFERENCES schools(id) ON DELETE CASCADE,
@@ -2638,6 +2653,13 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
             """, (school_id, grade_name, education_level, stream))
             slot_map = {(r['day_of_week'], r['period_id']): r for r in cur.fetchall()}
 
+            cur.execute("""
+                SELECT issues_json FROM timetable_generation_issues
+                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
+            """, (school_id, grade_name, education_level, stream))
+            issues_row = cur.fetchone()
+            generation_shortfalls = json.loads(issues_row['issues_json']) if issues_row else []
+
     encoded_grade = urllib.parse.quote(grade_name)
     encoded_level = urllib.parse.quote(education_level)
     encoded_stream = urllib.parse.quote(stream)
@@ -2728,6 +2750,24 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                 <ul class="list-disc list-inside space-y-1 text-xs">{warning_items}</ul>
             </div>
             """
+
+    # Persistent, until the next (re)generation clears or replaces it —
+    # unlike test_issues above (a one-time query-param message from a
+    # single Test & Generate click), this comes from the database, so it
+    # keeps showing up every time this page loads until the underlying
+    # shortfall is actually resolved and this class is regenerated again.
+    if generation_shortfalls:
+        shortfall_items = "".join(
+            f"<li class='mb-1.5'><b>{esc(sf['subject'])}</b> is short {sf['short_by']} lesson(s) this week — {esc(sf['detail'])}</li>"
+            for sf in generation_shortfalls
+        )
+        test_issues_html += f"""
+        <div class="bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4">
+            <p class="font-bold mb-1.5">🎯 This timetable is short of the exact lesson counts configured — {len(generation_shortfalls)} subject(s) affected:</p>
+            <ul class="list-disc list-inside space-y-1 text-xs">{shortfall_items}</ul>
+            <p class="text-xs mt-2 italic">To fix this, relax whichever rule is named above for the affected subject(s), or reduce another subject's lessons-per-week to free up room, then run Test &amp; Generate again.</p>
+        </div>
+        """
 
     return f"""
     <!DOCTYPE html>
@@ -3258,8 +3298,17 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             # touched yet) — but a subject explicitly set to 0 lessons/week
             # means "don't schedule this for this class" and must be
             # respected exactly as 0, not silently forced back up to 1.
+            #
+            # Initialized for EVERY subject (both free_subjects AND locked
+            # ones in locked_placements) — not just free_subjects. A locked
+            # (sync-rule) subject still needs a real entry here: _place()
+            # unconditionally decrements remaining[subject['id']], so a
+            # subject missing from this dict would raise a KeyError the
+            # first time a Same-Time Subject Rule actually got used.
             remaining = {}
-            for subj in free_subjects:
+            for subj in subjects:
+                if lessons_per_week_for_subject.get(subj['id']) == 0:
+                    continue
                 configured = lessons_per_week_for_subject.get(subj['id'])
                 remaining[subj['id']] = 1 if configured is None else max(0, configured)
             filled = {}       # (day, period_id) -> subject already placed there
@@ -3422,7 +3471,12 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                         last_subject_by_day[day] = sid
 
             # --- Phase 1: place locked "same time" subjects first — these
-            # always win their slot outright, not drawn from the queue. ---
+            # always win their slot outright, not drawn from the queue.
+            # _place() already decrements remaining[] by exactly 1 for this
+            # placement — no separate manual decrement needed (an earlier
+            # version double-counted this, silently under-allocating any
+            # subject that also had a lessons_per_week > 1 configured
+            # alongside its Same-Time rule). ---
             for (day, period_id), locked_subject in locked_placements.items():
                 if day not in days or period_id not in teaching_period_ids:
                     continue
@@ -3432,8 +3486,6 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                     chosen_teacher = None  # conflict — place subject anyway, flagged for manual fix
                 _place(day, period_id, locked_subject, chosen_teacher)
                 last_subject_by_day[day] = lcid
-                if lcid in remaining:
-                    remaining[lcid] = max(0, remaining[lcid] - 1)
 
             # --- Phase 2: subjects needing double lessons (e.g. for
             # practicals) get their genuine back-to-back pairs placed
@@ -3615,77 +3667,86 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                     break
                 _try_fill_slot(day, period, allow_teacher_conflict=True)
 
-            # --- Phase 4: top up genuinely — every remaining teaching
-            # period gets something scheduled, matching how ASC Timetables
-            # behaves (lesson-per-week counts are a target for a subject's
-            # normal load, not a hard ceiling on how many times a slot in
-            # the week can ever hold it). Without this, any slot left over
-            # after every subject's own configured weekly quota is used up
-            # stays permanently blank — which happens any time a school's
-            # configured lesson counts don't happen to sum to exactly the
-            # number of real teaching periods in the week (an easy, common
-            # mismatch, and the actual root cause of "some slots never get
-            # filled"). This keeps every hard rule from earlier phases
-            # (a subject's own Time-Off, same-day/consecutive-day
-            # constraints) — those are never relaxed — but does allow a
-            # subject to be scheduled beyond its nominal weekly quota, and
-            # as an absolute last resort, to repeat on a day it already
-            # appeared on, rather than leaving a real period empty.
-            still_empty = [(day, period) for day in days for period in teaching_periods if (day, period['id']) not in filled]
-            if still_empty and free_subjects:
-                topup_queue = list(free_subjects)
-                ti = 0
-                for day, period in still_empty:
+            # --- Phase 4 has been replaced: it used to force-fill every
+            # remaining empty period by scheduling subjects BEYOND their
+            # configured weekly quota (e.g. giving Mathematics a 6th
+            # lesson when only 5 were configured, just to avoid a blank
+            # period). That's exactly the "system is allocating more
+            # lessons for a subject... and fewer than the allocated
+            # lessons to another" symptom — precision matters more than
+            # zero gaps. A period that can't be filled by a subject still
+            # within its own configured quota is now left genuinely
+            # empty, and exactly which subjects came up short — and why —
+            # is computed below and surfaced to the admin, matching how a
+            # professional scheduler like ASC Timetables reports an
+            # over-constrained setup instead of silently patching it.
+            conn.commit()
+
+            # --- Shortfall diagnostics: for every subject that still needs
+            # at least one more lesson than it actually got, explain WHY —
+            # concretely, per still-empty slot in the week, which specific
+            # rule blocked it there. This is what lets an admin see exactly
+            # which rule would need to be relaxed to reach a full, exact
+            # schedule, rather than just being told "something didn't fit." ---
+            shortfalls = []
+            still_empty_final = [(day, period) for day in days for period in teaching_periods if (day, period['id']) not in filled]
+            for subj in free_subjects:
+                sid = subj['id']
+                short_by = remaining.get(sid, 0)
+                if short_by <= 0:
+                    continue
+
+                reasons = []
+                for day, period in still_empty_final:
                     used_today = used_today_by_day[day]
                     last_subject_id = last_subject_by_day[day]
-                    chosen_subject = None
+                    if (sid, day, period['id']) in subject_unavailable:
+                        reasons.append(f"{day} {period['label']}: blocked by '{subj['name']}' Subject Time-Off (marked Not Available)")
+                        continue
+                    if sid in used_today:
+                        reasons.append(f"{day} {period['label']}: '{subj['name']}' is already scheduled once that day, and every additional slot that day is blocked by another rule")
+                        continue
+                    same_day_conflict = next((other for other in used_today if (sid, other) in same_day_forbidden), None)
+                    if same_day_conflict is not None:
+                        conflict_name = next((s['name'] for s in subjects if s['id'] == same_day_conflict), "another subject")
+                        reasons.append(f"{day} {period['label']}: blocked by a Same-Day-Forbidden rule against '{conflict_name}', already scheduled that day")
+                        continue
+                    if last_subject_id is not None and (sid, last_subject_id) in consecutive_forbidden:
+                        conflict_name = next((s['name'] for s in subjects if s['id'] == last_subject_id), "the previous lesson")
+                        reasons.append(f"{day} {period['label']}: blocked by a Consecutive-Forbidden rule against '{conflict_name}', in the period right before it")
+                        continue
+                    cand_teacher = teacher_for_subject.get(sid)
+                    if cand_teacher and (cand_teacher, day, period['id']) in unavailable:
+                        reasons.append(f"{day} {period['label']}: the assigned teacher is marked Not Available at that time (Teacher Availability)")
+                        continue
+                    # A slot that reaches here without a hard block should
+                    # actually already be filled by the fair passes above —
+                    # if it's not, something more unusual blocked it than
+                    # this diagnostic can name specifically.
+                    reasons.append(f"{day} {period['label']}: no hard rule blocks it, but the fair-placement pass didn't reach it — try regenerating, or check for a teacher clash with another subject already using that slot")
 
-                    # Tier 1: a subject that hasn't already appeared today.
-                    for _ in range(len(topup_queue)):
-                        candidate = topup_queue[ti % len(topup_queue)]
-                        ti += 1
-                        cid = candidate['id']
-                        if (cid, day, period['id']) in subject_unavailable:
-                            continue
-                        if cid in used_today:
-                            continue
-                        if any((cid, other) in same_day_forbidden for other in used_today):
-                            continue
-                        if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
-                            continue
-                        chosen_subject = candidate
-                        break
+                if not still_empty_final:
+                    shortfalls.append({
+                        'subject': subj['name'],
+                        'short_by': short_by,
+                        'detail': "Every period in the week is already filled by other subjects — there's nowhere left to place it. To fit the missing lesson(s), either add more teaching periods, reduce another subject's lessons-per-week, or relax a Same-Day/Consecutive-Forbidden rule.",
+                    })
+                else:
+                    shortfalls.append({
+                        'subject': subj['name'],
+                        'short_by': short_by,
+                        'detail': "; ".join(reasons[:6]) + (f" (+{len(reasons) - 6} more empty period(s) checked)" if len(reasons) > 6 else ""),
+                    })
 
-                    # Tier 2: absolute last resort — allow repeating a
-                    # subject already used today, but subject Time-Off and
-                    # the same-day/consecutive-day rules are still hard
-                    # blocks even here, never relaxed.
-                    if chosen_subject is None:
-                        for _ in range(len(topup_queue)):
-                            candidate = topup_queue[ti % len(topup_queue)]
-                            ti += 1
-                            cid = candidate['id']
-                            if (cid, day, period['id']) in subject_unavailable:
-                                continue
-                            if any((cid, other) in same_day_forbidden for other in used_today):
-                                continue
-                            if last_subject_id is not None and (cid, last_subject_id) in consecutive_forbidden:
-                                continue
-                            chosen_subject = candidate
-                            break
-
-                    if chosen_subject is None:
-                        continue  # every subject genuinely hard-blocked at this exact slot — leave it empty
-
-                    cid = chosen_subject['id']
-                    cand_teacher = teacher_for_subject.get(cid)
-                    if cand_teacher and (
-                        (cand_teacher, day, period['id']) in unavailable
-                        or cand_teacher in booked.get((day, period['id']), set())
-                    ):
-                        cand_teacher = None
-                    _place(day, period['id'], chosen_subject, cand_teacher)
-                    last_subject_by_day[day] = cid
+            if shortfalls:
+                cur.execute("""
+                    INSERT INTO timetable_generation_issues (school_id, grade_name, education_level, stream, issues_json, created_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (school_id, grade_name, education_level, stream)
+                    DO UPDATE SET issues_json = EXCLUDED.issues_json, created_at = NOW();
+                """, (school_id, grade_name, education_level, stream, json.dumps(shortfalls)))
+            else:
+                cur.execute("DELETE FROM timetable_generation_issues WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;", (school_id, grade_name, education_level, stream))
 
             conn.commit()
 

@@ -1468,7 +1468,7 @@ def view_receipt(school_id: int, payment_id: int, request: Request):
                 <span style="font-weight:800; font-size:15px; color:{'#be123c' if balance_after > 0 else '#047857'};">KSh {balance_after:,.2f}</span>
             </div>
 
-            <p style="margin-top:20px; font-size:10px; color:#94a3b8; text-align:center;">Recorded by {esc(payment['recorded_by_name'] or 'Staff')} — Elimu Hub Finance</p>
+            <p style="margin-top:20px; font-size:10px; color:#94a3b8; text-align:center;">Recorded by {esc(school['name'])} Finance — Elimu Hub</p>
         </div>
     """
     # Deliberately a shorter preview window than other documents (220px vs
