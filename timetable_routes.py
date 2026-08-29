@@ -2727,7 +2727,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
     test_issues_html = ""
     if test_issues:
         try:
-            import base64, json
+            import base64
             decoded = json.loads(base64.b64decode(test_issues).decode("utf-8"))
             errors_list = decoded.get("errors", [])
             warnings_list = decoded.get("warnings", [])
@@ -2845,7 +2845,7 @@ def test_and_generate_timetable(school_id: int, request: Request, grade_name: st
             errors, warnings = validate_timetable_setup(cur, school_id, grade_name, education_level, stream)
 
     if errors:
-        import base64, json
+        import base64
         payload = base64.b64encode(json.dumps({"errors": errors, "warnings": warnings}).encode("utf-8")).decode("ascii")
         return RedirectResponse(
             url=f"/timetable/grade/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}&stream={urllib.parse.quote(stream)}&test_issues={payload}",
@@ -2858,7 +2858,7 @@ def test_and_generate_timetable(school_id: int, request: Request, grade_name: st
     # up alongside the newly-generated timetable.
     response = generate_draft_timetable(school_id, request, grade_name, education_level, stream)
     if warnings and isinstance(response, RedirectResponse):
-        import base64, json
+        import base64
         warn_payload = base64.b64encode(json.dumps({"errors": [], "warnings": warnings}).encode("utf-8")).decode("ascii")
         separator = "&" if "?" in response.headers["location"] else "?"
         response.headers["location"] = response.headers["location"] + f"{separator}test_issues={warn_payload}"
@@ -2908,7 +2908,7 @@ def test_and_generate_whole_level(school_id: int, request: Request, education_le
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             collisions = _find_timetable_collisions(cur, school_id, education_level)
 
-    import base64, json
+    import base64
     payload = base64.b64encode(json.dumps({
         'education_level': education_level,
         'class_results': class_results,
@@ -2977,7 +2977,7 @@ def test_and_generate_whole_school(school_id: int, request: Request):
             # two different levels at the same real time.
             collisions = _find_timetable_collisions(cur, school_id, None)
 
-    import base64, json
+    import base64
     payload = base64.b64encode(json.dumps({
         'education_level': 'Whole School',
         'class_results': all_class_results,
@@ -3005,7 +3005,7 @@ def timetable_level_report(school_id: int, request: Request, report: str):
     if auth_error:
         return auth_error
 
-    import base64, json
+    import base64
     try:
         data = json.loads(base64.b64decode(report).decode("utf-8"))
     except Exception:
