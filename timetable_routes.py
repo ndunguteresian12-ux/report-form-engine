@@ -2786,12 +2786,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                 <p class="text-xs text-slate-400">{esc(school['name'] if school else '')} — {esc(education_level)}</p>
             </div>
             <div class="flex flex-wrap gap-2">
-                <form action="/api/v1/timetable/test-and-generate/{school_id}" method="post" onsubmit="return confirm('Test and generate the timetable for {esc(section_label)}? This reshuffles EVERY subject\\'s day/period placement for this class from scratch, using the current teacher assignments. If you only changed who teaches one subject and want to keep everything else exactly where it is, use Sync Teacher Names instead.');">
-                    <input type="hidden" name="grade_name" value="{esc(grade_name)}">
-                    <input type="hidden" name="education_level" value="{esc(education_level)}">
-                    <input type="hidden" name="stream" value="{esc(stream)}">
-                    <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🧪 Test &amp; Generate</button>
-                </form>
+                <a href="/timetable/dashboard/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-4 py-2 rounded-xl text-xs font-bold transition" title="Generation now only runs per education level or for the whole school — that's the only way teacher/room collisions across classes get checked properly.">🧪 Generate from Timetable Workspace →</a>
                 <form action="/api/v1/timetable/sync-teachers/{school_id}" method="post" onsubmit="return confirm('Sync teacher names for {esc(section_label)}? This updates which teacher shows on each already-scheduled subject to match the current Assignments — day/period placement is left exactly as it is.');">
                     <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                     <input type="hidden" name="education_level" value="{esc(education_level)}">
@@ -3489,46 +3484,134 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
 
             # --- Phase 2: subjects needing double lessons (e.g. for
             # practicals) get their genuine back-to-back pairs placed
-            # first, before anything else competes for those slots. A
-            # subject can now need MORE THAN ONE double per week (e.g.
-            # English: 2 doubles + 1 single = 5 lessons/week) — each
-            # double still goes on its own distinct day, same as before,
-            # just repeated for however many doubles were configured. ---
-            for subj in free_subjects:
-                sid = subj['id']
-                doubles_needed = double_count_for_subject.get(sid, 0)
-                if doubles_needed <= 0 or remaining.get(sid, 0) < 2:
-                    continue
-                cand_teacher = teacher_for_subject.get(sid)
-                doubles_placed = 0
-                for day in days:
-                    if doubles_placed >= doubles_needed or remaining.get(sid, 0) < 2:
-                        break
-                    if sid in used_today_by_day[day]:
-                        continue  # already has a lesson today — keep each double on its own day
-                    placed_today = False
-                    for p1, p2 in consecutive_period_pairs:
-                        if (day, p1['id']) in filled or (day, p2['id']) in filled:
+            # first, before anything else competes for those slots. This
+            # is a real backtracking search across ALL subjects needing
+            # doubles at once — not the naive "handle one subject fully,
+            # then move to the next" approach a first version of this had,
+            # which could fail to find a valid arrangement even when one
+            # existed (classic greedy-scheduling failure: the first
+            # subject processed grabs whichever slots it finds first,
+            # potentially leaving a later subject with no clean day left,
+            # even though a different combination would have fit everyone).
+            # With multiple subjects each needing multiple doubles per
+            # week (e.g. Math ×2, English ×2, CRE ×1), this is exactly the
+            # case that needs genuine search rather than first-fit.
+            subjects_needing_doubles = [
+                (subj, double_count_for_subject.get(subj['id'], 0))
+                for subj in free_subjects
+                if double_count_for_subject.get(subj['id'], 0) > 0 and remaining.get(subj['id'], 0) >= 2
+            ]
+
+            if subjects_needing_doubles:
+                # Candidate (day, p1_id, p2_id) slots for each subject,
+                # computed once up front — every hard constraint EXCEPT
+                # cross-subject collisions (which the search resolves
+                # dynamically, since two different subjects' doubles can't
+                # both claim the same periods on the same day).
+                double_candidates = {}
+                for subj, needed in subjects_needing_doubles:
+                    sid = subj['id']
+                    cand_teacher = teacher_for_subject.get(sid)
+                    options = []
+                    for day in days:
+                        if sid in used_today_by_day[day]:
+                            continue  # already has a lesson today from an earlier phase — keep doubles on their own day
+                        for p1, p2 in consecutive_period_pairs:
+                            if (day, p1['id']) in filled or (day, p2['id']) in filled:
+                                continue
+                            if (sid, day, p1['id']) in subject_unavailable or (sid, day, p2['id']) in subject_unavailable:
+                                continue
+                            if cand_teacher and (
+                                (cand_teacher, day, p1['id']) in unavailable or (cand_teacher, day, p2['id']) in unavailable
+                                or cand_teacher in booked.get((day, p1['id']), set()) or cand_teacher in booked.get((day, p2['id']), set())
+                            ):
+                                continue
+                            options.append((day, p1['id'], p2['id']))
+                    double_candidates[sid] = options
+
+                # Most-constrained-subject-first ordering (fewest candidate
+                # slots tried first) — a standard, well-proven heuristic
+                # that makes backtracking search dramatically faster by
+                # resolving the tightest constraints before the looser ones.
+                needed_map = {subj['id']: needed for subj, needed in subjects_needing_doubles}
+                subj_by_id = {subj['id']: subj for subj, needed in subjects_needing_doubles}
+                order = sorted(needed_map.keys(), key=lambda sid: len(double_candidates[sid]))
+
+                assignment = {sid: [] for sid in order}
+                used_slot_globally = set()  # (day, period_id) already claimed by some subject's double this search
+                search_steps = [0]
+                STEP_CAP = 200_000  # defensive cap — real school timetables are nowhere near this; exists purely so a pathological edge case degrades gracefully instead of hanging
+
+                def _try_pick(sid, still_needed, options, start_idx, days_used_by_this_subject, next_i):
+                    if search_steps[0] > STEP_CAP:
+                        return False
+                    search_steps[0] += 1
+                    if still_needed == 0:
+                        return _backtrack(next_i)
+                    for j in range(start_idx, len(options)):
+                        day, p1_id, p2_id = options[j]
+                        if day in days_used_by_this_subject:
                             continue
-                        if (sid, day, p1['id']) in subject_unavailable or (sid, day, p2['id']) in subject_unavailable:
+                        if (day, p1_id) in used_slot_globally or (day, p2_id) in used_slot_globally:
                             continue
-                        if cand_teacher and (
-                            (cand_teacher, day, p1['id']) in unavailable or (cand_teacher, day, p2['id']) in unavailable
-                            or cand_teacher in booked.get((day, p1['id']), set()) or cand_teacher in booked.get((day, p2['id']), set())
-                        ):
-                            continue
-                        _place(day, p1['id'], subj, cand_teacher)
-                        _place(day, p2['id'], subj, cand_teacher)
-                        last_subject_by_day[day] = sid
-                        doubles_placed += 1
-                        placed_today = True
-                        break
-                    if not placed_today:
-                        continue
-                # If fewer clean double slots exist than were requested,
-                # whatever's left of this subject's quota simply falls
-                # through to Phase 3 as ordinary single lessons instead of
-                # forcing a bad placement.
+                        assignment[sid].append((day, p1_id, p2_id))
+                        used_slot_globally.add((day, p1_id))
+                        used_slot_globally.add((day, p2_id))
+                        days_used_by_this_subject.add(day)
+                        if _try_pick(sid, still_needed - 1, options, j + 1, days_used_by_this_subject, next_i):
+                            return True
+                        assignment[sid].pop()
+                        used_slot_globally.discard((day, p1_id))
+                        used_slot_globally.discard((day, p2_id))
+                        days_used_by_this_subject.discard(day)
+                    return False
+
+                def _backtrack(i):
+                    if i == len(order):
+                        return True
+                    sid = order[i]
+                    return _try_pick(sid, needed_map[sid], double_candidates[sid], 0, set(), i + 1)
+
+                found_full_solution = _backtrack(0)
+
+                if found_full_solution:
+                    for sid, slots in assignment.items():
+                        subj = subj_by_id[sid]
+                        cand_teacher = teacher_for_subject.get(sid)
+                        for day, p1_id, p2_id in slots:
+                            _place(day, p1_id, subj, cand_teacher)
+                            _place(day, p2_id, subj, cand_teacher)
+                            last_subject_by_day[day] = sid
+                else:
+                    # No arrangement satisfies every subject's doubles at
+                    # once (a genuinely over-constrained request, or the
+                    # step cap was hit on an unusually large setup) — fall
+                    # back to placing as many as fit, most-constrained
+                    # subject first, so the class still gets a usable
+                    # timetable instead of zero doubles. Whatever doesn't
+                    # fit shows up in the shortfall diagnostics below,
+                    # naming exactly which subject and how many lessons
+                    # short — same as any other placement shortfall.
+                    for sid in order:
+                        subj = subj_by_id[sid]
+                        cand_teacher = teacher_for_subject.get(sid)
+                        placed_for_this_subject = 0
+                        days_used = set()
+                        for day, p1_id, p2_id in double_candidates[sid]:
+                            if placed_for_this_subject >= needed_map[sid]:
+                                break
+                            if day in days_used:
+                                continue
+                            if (day, p1_id) in filled or (day, p2_id) in filled:
+                                continue
+                            _place(day, p1_id, subj, cand_teacher)
+                            _place(day, p2_id, subj, cand_teacher)
+                            last_subject_by_day[day] = sid
+                            days_used.add(day)
+                            placed_for_this_subject += 1
+                # Whatever's left of any subject's quota after its doubles
+                # (whether from the full solution or the fallback) simply
+                # falls through to Phase 3 as ordinary single lessons.
 
             # --- Phase 3: fill remaining empty slots with each subject's
             # remaining single lessons, up to its weekly quota — once a
