@@ -94,6 +94,41 @@ def get_subject_color(name: str):
     return SUBJECT_COLOR_PALETTE[stable_index]
 
 
+def _widen_unique_constraint(cur, table_name, old_columns, new_columns):
+    """Finds whatever unique constraint currently covers exactly
+    old_columns on table_name — regardless of its auto-generated name,
+    which Postgres decides and isn't safe to guess — and replaces it with
+    one covering new_columns instead (adding plan_id). Wrapped by the
+    caller in a try/except: this touches constraints on live tables, and
+    a startup migration must never be able to crash the whole app if
+    something about a specific school's data doesn't match what this
+    expects."""
+    cur.execute("""
+        SELECT tc.constraint_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_name = kcu.table_name
+        WHERE tc.table_name = %s AND tc.constraint_type = 'UNIQUE'
+        GROUP BY tc.constraint_name
+        HAVING array_agg(kcu.column_name ORDER BY kcu.column_name) = %s;
+    """, (table_name, sorted(old_columns)))
+    row = cur.fetchone()
+    if row:
+        cur.execute(f'ALTER TABLE {table_name} DROP CONSTRAINT "{row[0]}";')
+
+    # Only add the new constraint if nothing already covers exactly
+    # new_columns — makes this safe to re-run on every future deploy.
+    cur.execute("""
+        SELECT tc.constraint_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_name = kcu.table_name
+        WHERE tc.table_name = %s AND tc.constraint_type = 'UNIQUE'
+        GROUP BY tc.constraint_name
+        HAVING array_agg(kcu.column_name ORDER BY kcu.column_name) = %s;
+    """, (table_name, sorted(new_columns)))
+    if not cur.fetchone():
+        cur.execute(f"ALTER TABLE {table_name} ADD CONSTRAINT {table_name}_{'_'.join(new_columns)}_key UNIQUE ({', '.join(new_columns)});")
+
+
 def bootstrap_timetable_schema():
     """Creates/upgrades every table this module owns. Purely additive —
     CREATE TABLE IF NOT EXISTS and ADD COLUMN IF NOT EXISTS throughout, so
@@ -101,6 +136,37 @@ def bootstrap_timetable_schema():
     school data already in it."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            # --- Timetable Plans: lets a school hold several independent,
+            # fully separate timetables per education level (a normal
+            # weekday one, plus e.g. a weekend program) — each with its own
+            # periods, days, teacher assignments, subject rules, and
+            # generated slots, none of which affect any other plan. Exactly
+            # one plan per education level is "active" (is_active = TRUE):
+            # that's the one every existing report, print view, and staff
+            # dashboard shows, so building out a second plan never touches
+            # what's currently live until an admin explicitly switches which
+            # one is active.
+            #
+            # active_days is a simple comma-separated list of real day
+            # names (any of the 7, in any combination/order) — replacing
+            # the old days_per_week count, which could only ever express
+            # "the first N days starting from Monday" and could never
+            # represent something like a Saturday+Sunday-only plan.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS timetable_plans (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    education_level VARCHAR(100) NOT NULL,
+                    name VARCHAR(150) NOT NULL,
+                    active_days VARCHAR(200) NOT NULL DEFAULT 'Monday,Tuesday,Wednesday,Thursday,Friday',
+                    is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_timetable_plans_lookup ON timetable_plans (school_id, education_level);
+            """)
+            conn.commit()
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS timetable_generation_issues (
                     id SERIAL PRIMARY KEY,
@@ -3749,6 +3815,70 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 if not queue:
                     break
                 _try_fill_slot(day, period, allow_teacher_conflict=True)
+
+            # --- Pass C: genuinely last resort — a subject still short of
+            # its exact configured weekly quota after Pass A and B may
+            # repeat on a day it's already scheduled. This is exactly the
+            # real shortfall a tight week with multiple doubles creates:
+            # e.g. English's 2 configured doubles use up 2 of the 5 days,
+            # and if the other 3 days end up completely filled by other
+            # subjects before English's 5th (single) lesson gets a turn,
+            # the ONLY way left to reach its exact configured count is a
+            # second lesson on a day it already has one. Subject Time-Off
+            # and the Same-Day/Consecutive-Forbidden rules stay hard,
+            # non-negotiable blocks even here — only "not twice in a day"
+            # is being relaxed, and only for a subject still short after
+            # every fairer option has already been tried. The repeat is
+            # never placed immediately next to that subject's existing
+            # lesson that day, so this can never accidentally create an
+            # unconfigured double lesson.
+            period_index_by_id = {p['id']: idx for idx, p in enumerate(teaching_periods)}
+
+            def _adjacent_period_ids(period_id):
+                idx = period_index_by_id.get(period_id)
+                if idx is None:
+                    return []
+                neighbors = []
+                if idx > 0:
+                    neighbors.append(teaching_periods[idx - 1]['id'])
+                if idx < len(teaching_periods) - 1:
+                    neighbors.append(teaching_periods[idx + 1]['id'])
+                return neighbors
+
+            for day, period in all_week_slots:
+                if (day, period['id']) in filled:
+                    continue
+                still_short = [s for s in free_subjects if remaining.get(s['id'], 0) > 0]
+                if not still_short:
+                    continue
+                used_today = used_today_by_day[day]
+                last_subject_id = last_subject_by_day[day]
+                still_short.sort(key=lambda s: -remaining.get(s['id'], 0))  # most lessons still missing gets first claim
+                chosen = None
+                for candidate in still_short:
+                    cid = candidate['id']
+                    if (cid, day, period['id']) in subject_unavailable:
+                        continue
+                    other_subjects_today = used_today - {cid}
+                    if any((cid, other) in same_day_forbidden for other in other_subjects_today):
+                        continue
+                    if last_subject_id is not None and cid != last_subject_id and (cid, last_subject_id) in consecutive_forbidden:
+                        continue
+                    if any(filled.get((day, nb_id), {}).get('id') == cid for nb_id in _adjacent_period_ids(period['id'])):
+                        continue  # would sit directly next to this subject's other lesson that day — skip rather than accidentally create an unconfigured double
+                    chosen = candidate
+                    break
+                if chosen is None:
+                    continue
+                cid = chosen['id']
+                cand_teacher = teacher_for_subject.get(cid)
+                if cand_teacher and (
+                    cand_teacher in booked.get((day, period['id']), set())
+                    or (cand_teacher, day, period['id']) in unavailable
+                ):
+                    cand_teacher = None
+                _place(day, period['id'], chosen, cand_teacher)
+                last_subject_by_day[day] = cid
 
             # --- Phase 4 has been replaced: it used to force-fill every
             # remaining empty period by scheduling subjects BEYOND their
