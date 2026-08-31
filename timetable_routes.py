@@ -2724,7 +2724,17 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                 WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
             """, (school_id, grade_name, education_level, stream))
             issues_row = cur.fetchone()
-            generation_shortfalls = json.loads(issues_row['issues_json']) if issues_row else []
+            # issues_json is either the new {"shortfalls": [...], "relaxed": [...]}
+            # shape, or an old bare list from before "relaxed" existed —
+            # handle both so nothing breaks for a school whose last
+            # generation ran before this change.
+            _parsed_issues = json.loads(issues_row['issues_json']) if issues_row else []
+            if isinstance(_parsed_issues, dict):
+                generation_shortfalls = _parsed_issues.get('shortfalls', [])
+                generation_relaxed = _parsed_issues.get('relaxed', [])
+            else:
+                generation_shortfalls = _parsed_issues
+                generation_relaxed = []
 
     encoded_grade = urllib.parse.quote(grade_name)
     encoded_level = urllib.parse.quote(education_level)
@@ -2832,6 +2842,16 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
             <p class="font-bold mb-1.5">🎯 This timetable is short of the exact lesson counts configured — {len(generation_shortfalls)} subject(s) affected:</p>
             <ul class="list-disc list-inside space-y-1 text-xs">{shortfall_items}</ul>
             <p class="text-xs mt-2 italic">To fix this, relax whichever rule is named above for the affected subject(s), or reduce another subject's lessons-per-week to free up room, then run Test &amp; Generate again.</p>
+        </div>
+        """
+
+    if generation_relaxed:
+        relaxed_items = "".join(f"<li class='mb-1'>{esc(note)}</li>" for note in generation_relaxed)
+        test_issues_html += f"""
+        <div class="bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4">
+            <p class="font-bold mb-1.5">⚖️ {len(generation_relaxed)} lesson(s) needed a Same-Day or Consecutive-Forbidden rule relaxed to hit the exact configured count — Subject Time-Off, Teacher Availability, and teacher double-booking were never touched:</p>
+            <ul class="list-disc list-inside space-y-1 text-xs">{relaxed_items}</ul>
+            <p class="text-xs mt-2 italic">Worth a quick look to confirm each of these is acceptable — if not, adjust that subject's lessons-per-week or the rule involved and regenerate.</p>
         </div>
         """
 
@@ -3880,6 +3900,82 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 _place(day, period['id'], chosen, cand_teacher)
                 last_subject_by_day[day] = cid
 
+            # --- Pass D: the absolute final resort. Same-Day-Forbidden and
+            # Consecutive-Forbidden are PREFERENCES an admin set between
+            # two subjects — real, worth respecting, but not physical
+            # impossibilities, so they're what this pass is allowed to
+            # override to close a genuine shortfall. Three things stay
+            # hard and non-negotiable here exactly as in every pass before
+            # it: Subject Time-Off (a subject's own "Not Available" rule),
+            # Teacher Availability (a teacher's own "Not Available" rule),
+            # and — the one true physical impossibility — ever placing the
+            # same teacher in two different classes at the identical day
+            # and period. If the only way to place this subject here would
+            # require its teacher to be in two places at once, the subject
+            # is scheduled anyway but with no teacher shown (exactly how
+            # every other phase already handles a genuine teacher
+            # conflict), never as a real collision. Every relaxation used
+            # here is recorded and shown to the admin afterward — nothing
+            # about this is silent.
+            relaxed_placements = []
+
+            for day, period in all_week_slots:
+                if (day, period['id']) in filled:
+                    continue
+                still_short = [s for s in free_subjects if remaining.get(s['id'], 0) > 0]
+                if not still_short:
+                    continue
+                used_today = used_today_by_day[day]
+                last_subject_id = last_subject_by_day[day]
+                still_short.sort(key=lambda s: -remaining.get(s['id'], 0))
+
+                chosen, broke_rule = None, None
+                for candidate in still_short:
+                    cid = candidate['id']
+                    # The one guard that's never lifted, even here: never
+                    # sit this subject directly next to its own other
+                    # lesson that day — that would silently create an
+                    # unconfigured double/triple, which is a different
+                    # problem from the one this pass exists to solve.
+                    if any(filled.get((day, nb_id), {}).get('id') == cid for nb_id in _adjacent_period_ids(period['id'])):
+                        continue
+
+                    # Subject Time-Off is a hard block here too — not
+                    # something this pass is allowed to override, only
+                    # Same-Day/Consecutive-Forbidden are.
+                    if (cid, day, period['id']) in subject_unavailable:
+                        continue
+
+                    cand_teacher_check = teacher_for_subject.get(cid)
+                    if cand_teacher_check and (cand_teacher_check, day, period['id']) in unavailable:
+                        continue  # Teacher Availability is hard here too — never overridden
+
+                    other_subjects_today = used_today - {cid}
+                    blocked_by_same_day = any((cid, other) in same_day_forbidden for other in other_subjects_today)
+                    blocked_by_consecutive = last_subject_id is not None and cid != last_subject_id and (cid, last_subject_id) in consecutive_forbidden
+
+                    if not (blocked_by_same_day or blocked_by_consecutive):
+                        continue  # not actually blocked by either of these here — an earlier pass would already have placed it
+
+                    chosen = candidate
+                    broke_rule = "a Same-Day-Forbidden rule" if blocked_by_same_day else "a Consecutive-Forbidden rule"
+                    break
+
+                if chosen is None:
+                    continue
+
+                cid = chosen['id']
+                cand_teacher = teacher_for_subject.get(cid)
+                collided = bool(cand_teacher and cand_teacher in booked.get((day, period['id']), set()))
+                if collided:
+                    cand_teacher = None  # never an actual double-booking — schedule teacherless instead
+                _place(day, period['id'], chosen, cand_teacher)
+                last_subject_by_day[day] = cid
+                note = f"{day} {period['label']}: placed '{chosen['name']}' by relaxing {broke_rule}"
+                if collided:
+                    note += " (its usual teacher was also busy at this exact time, so no teacher is shown here — never double-booked)"
+                relaxed_placements.append(note)
+
             # --- Phase 4 has been replaced: it used to force-fill every
             # remaining empty period by scheduling subjects BEYOND their
             # configured weekly quota (e.g. giving Mathematics a 6th
@@ -3951,13 +4047,20 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                         'detail': "; ".join(reasons[:6]) + (f" (+{len(reasons) - 6} more empty period(s) checked)" if len(reasons) > 6 else ""),
                     })
 
-            if shortfalls:
+            # issues_json now stores {"shortfalls": [...], "relaxed": [...]}
+            # rather than a bare list — relaxed_placements (from Pass D)
+            # records every lesson that only fit by overriding a Subject
+            # Time-Off / Same-Day / Consecutive preference, so the admin
+            # can see exactly where and why, even though the lesson itself
+            # did get placed. The read side handles both this new shape
+            # and the old bare-list shape from before this existed.
+            if shortfalls or relaxed_placements:
                 cur.execute("""
                     INSERT INTO timetable_generation_issues (school_id, grade_name, education_level, stream, issues_json, created_at)
                     VALUES (%s, %s, %s, %s, %s, NOW())
                     ON CONFLICT (school_id, grade_name, education_level, stream)
                     DO UPDATE SET issues_json = EXCLUDED.issues_json, created_at = NOW();
-                """, (school_id, grade_name, education_level, stream, json.dumps(shortfalls)))
+                """, (school_id, grade_name, education_level, stream, json.dumps({"shortfalls": shortfalls, "relaxed": relaxed_placements})))
             else:
                 cur.execute("DELETE FROM timetable_generation_issues WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;", (school_id, grade_name, education_level, stream))
 
