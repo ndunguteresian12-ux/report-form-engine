@@ -3346,22 +3346,25 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             'overall_level': overall_level,
         })
 
-    # Rank by total POINTS (not marks) — points reflect performance level
-    # (EE1..BE2) per subject, which is the correct CBC ranking basis. Total
-    # marks is the tie-breaker: two students tied on points still share the
-    # same official rank (correct CBC convention), but sorting is now
-    # deterministic by marks too, so the higher-marks student is never
-    # displayed below a tied-but-lower-marks student purely because of
-    # incidental admission-number ordering.
+    # Rank by total POINTS first, then total MARKS as the tie-breaker —
+    # two students are only genuinely tied (sharing a rank number) if
+    # they're IDENTICAL on both. Marks fully resolves any points-tie into
+    # distinct, consecutive ranks (1st, 2nd, ...), rather than the two
+    # students sharing a rank number while marks only reordered which one
+    # happened to print first — that mismatch (same rank shown, but
+    # displayed in marks order) was the actual bug: it could look like
+    # the lower-marks student outranked the higher-marks one, since nothing
+    # about the printed rank number reflected the marks difference at all.
     def _rank_by_total_points(rows):
         ranked = sorted(rows, key=lambda r: (r['total_points'], r['total_marks']), reverse=True)
         positions = {}
-        last_points = None
+        last_key = None
         last_pos = 0
         for i, r in enumerate(ranked, start=1):
-            if r['total_points'] != last_points:
+            current_key = (r['total_points'], r['total_marks'])
+            if current_key != last_key:
                 last_pos = i
-                last_points = r['total_points']
+                last_key = current_key
             positions[r['student']['id']] = last_pos
         return positions
 
@@ -3601,7 +3604,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
             'overall_level': overall_level,
         })
 
-    top10 = sorted(computed, key=lambda r: r['total_points'], reverse=True)[:10]
+    top10 = sorted(computed, key=lambda r: (r['total_points'], r['total_marks']), reverse=True)[:10]
 
     logo_src = school.get('logo_url')
     logo_html = ""
@@ -4839,6 +4842,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                         s.stream,
                         c.grade_name,
                         COALESCE(AVG(sa.subject_avg), 0) AS final_calculated_mean,
+                        COALESCE(SUM(sa.subject_avg), 0) AS total_marks,
                         COALESCE(SUM(
                             CASE
                                 WHEN sa.subject_avg >= 90 THEN 8
@@ -4865,7 +4869,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                         *,
                         RANK() OVER (
                             PARTITION BY grade_name, stream 
-                            ORDER BY total_points DESC
+                            ORDER BY total_points DESC, total_marks DESC
                         ) AS stream_position,
                         COUNT(*) OVER (
                             PARTITION BY grade_name, stream
@@ -4873,7 +4877,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                         
                         RANK() OVER (
                             PARTITION BY grade_name 
-                            ORDER BY total_points DESC
+                            ORDER BY total_points DESC, total_marks DESC
                         ) AS grade_position,
                         COUNT(*) OVER (
                             PARTITION BY grade_name
