@@ -708,6 +708,7 @@ def timetable_workspace_hub(school_id: int, request: Request):
                 <p class="text-[11px] text-slate-400 mt-1">Use this instead of a single level's button if any teacher teaches across more than one education level (e.g. Lower and Upper Primary) — it checks for conflicts across all levels together, not just within one.</p>
             </div>
             <div class="flex gap-2 flex-wrap mt-4">
+                <a href="/timetable/plans/{school_id}" class="bg-indigo-700 hover:bg-indigo-800 text-white px-3.5 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🗂 Timetable Plans</a>
                 <a href="/timetable/subjects-config/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🎨 Subjects</a>
                 <a href="/timetable/custom-subjects/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">➕ Custom Subjects</a>
                 <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods &amp; Days</a>
@@ -736,6 +737,366 @@ def timetable_workspace_hub(school_id: int, request: Request):
 # (learning_areas) are fetched from the shared curriculum data already
 # used everywhere else in Elimu Hub — never re-entered here.
 # ============================================================
+
+@router.get("/timetable/plans/{school_id}", response_class=HTMLResponse)
+def timetable_plans_view(request: Request, school_id: int, created: str = None):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT * FROM timetable_plans WHERE school_id = %s ORDER BY education_level ASC, is_active DESC, created_at ASC;", (school_id,))
+            plans = cur.fetchall()
+
+    plans_by_level = {}
+    for p in plans:
+        plans_by_level.setdefault(p['education_level'], []).append(p)
+
+    ALL_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    default_days = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"}
+
+    level_sections_html = ""
+    for level in EDUCATION_LEVELS:
+        level_plans = plans_by_level.get(level, [])
+        plan_cards = ""
+        for p in level_plans:
+            days_display = p['active_days'].replace(",", ", ")
+            badge = (
+                "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200'>ACTIVE — visible to staff now</span>"
+                if p['is_active'] else
+                "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200'>Draft — not visible to staff</span>"
+            )
+
+            actions = ""
+            if not p['is_active']:
+                actions += f"""
+                <form action="/api/v1/timetable/plans/set-active/{school_id}/{p['id']}" method="post" class="inline" onsubmit="return confirm('Make {esc(p['name'])!r} the active plan for {esc(level)}? Staff, reports, and printing will immediately switch to showing this plan instead of whichever one is active now.');">
+                    <button type="submit" class="text-xs font-bold text-emerald-700 hover:underline">Set Active</button>
+                </form>
+                """
+            actions += f"""
+            <a href="/timetable/plans/duplicate/{school_id}/{p['id']}" class="text-xs font-bold text-indigo-700 hover:underline ml-3">Save As Copy</a>
+            """
+            if not p['is_active']:
+                actions += f"""
+                <form action="/api/v1/timetable/plans/delete/{school_id}/{p['id']}" method="post" class="inline ml-3" onsubmit="return confirm('Delete {esc(p['name'])!r} permanently? Every period, teacher assignment, and generated slot belonging to this plan will be deleted too. This cannot be undone.');">
+                    <button type="submit" class="text-xs font-bold text-rose-600 hover:underline">Delete</button>
+                </form>
+                """
+
+            plan_cards += f"""
+            <div class="border border-slate-200 rounded-xl p-3 flex items-center justify-between flex-wrap gap-2">
+                <div>
+                    <p class="text-sm font-bold text-slate-800">{esc(p['name'])} {badge}</p>
+                    <p class="text-[11px] text-slate-400 mt-0.5">Days: {esc(days_display)}</p>
+                </div>
+                <div>{actions}</div>
+            </div>
+            """
+
+        day_checkboxes = "".join(
+            f"<label class='flex items-center gap-1 text-xs'><input type='checkbox' name='days' value='{d}' {'checked' if d in default_days else ''}> {d}</label>"
+            for d in ALL_DAYS
+        )
+
+        level_sections_html += f"""
+        <div class="bg-white p-5 rounded-2xl border shadow-xs space-y-3">
+            <h3 class="text-sm font-black text-slate-800">{esc(level)}</h3>
+            <div class="space-y-2">
+                {plan_cards or "<p class='text-xs text-slate-400 italic'>No plans yet for this level — the first one you create can be set active.</p>"}
+            </div>
+            <details class="pt-2 border-t border-slate-100">
+                <summary class="text-xs font-bold text-indigo-700 cursor-pointer">+ Create a new plan for {esc(level)}</summary>
+                <form action="/api/v1/timetable/plans/create/{school_id}" method="post" class="mt-3 space-y-2">
+                    <input type="hidden" name="education_level" value="{esc(level)}">
+                    <input type="text" name="name" placeholder="e.g. Weekend Program" required class="w-full border border-slate-200 p-2 rounded-lg text-xs">
+                    <div class="flex flex-wrap gap-3 bg-slate-50 p-2.5 rounded-lg">{day_checkboxes}</div>
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold px-4 py-2 rounded-lg">Create Plan</button>
+                </form>
+            </details>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Timetable Plans</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-3xl mx-auto space-y-4">
+            <a href="/timetable/dashboard/{school_id}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Timetable Workspace</a>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">🗂 Timetable Plans — {esc(school['name'])}</h2>
+                <p class="text-xs text-slate-400 mt-1">Create several independent timetables per education level — a normal weekday one, plus e.g. a weekend program — each with its own days, periods, teacher assignments, and rules. Only the plan marked ACTIVE is what staff, reports, and printing actually show.</p>
+            </div>
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2.5 rounded-xl'>✅ Done.</div>" if created else ""}
+            {level_sections_html}
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/plans/create/{school_id}")
+async def create_timetable_plan(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form_data = await request.form()
+    education_level = (form_data.get("education_level") or "").strip()
+    name = (form_data.get("name") or "").strip()[:150]
+    days_selected = form_data.getlist("days")
+
+    if not education_level or not name:
+        raise HTTPException(status_code=400, detail="A plan needs both a name and an education level.")
+
+    all_days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    ordered_days = [d for d in all_days_order if d in days_selected]
+    active_days_str = ",".join(ordered_days) if ordered_days else "Monday,Tuesday,Wednesday,Thursday,Friday"
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO timetable_plans (school_id, education_level, name, active_days, is_active)
+                VALUES (%s, %s, %s, %s, FALSE);
+            """, (school_id, education_level, name, active_days_str))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/plans/{school_id}?created=1", status_code=303)
+
+
+@router.post("/api/v1/timetable/plans/set-active/{school_id}/{plan_id}")
+def set_active_timetable_plan(school_id: int, plan_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT education_level FROM timetable_plans WHERE id = %s AND school_id = %s;", (plan_id, school_id))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Plan not found.")
+            education_level = row[0]
+
+            # Exactly one active plan per (school, education_level) —
+            # switch the old one off before switching the new one on.
+            cur.execute("UPDATE timetable_plans SET is_active = FALSE WHERE school_id = %s AND education_level = %s;", (school_id, education_level))
+            cur.execute("UPDATE timetable_plans SET is_active = TRUE, updated_at = NOW() WHERE id = %s;", (plan_id,))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/plans/{school_id}", status_code=303)
+
+
+@router.post("/api/v1/timetable/plans/delete/{school_id}/{plan_id}")
+def delete_timetable_plan(school_id: int, plan_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT is_active FROM timetable_plans WHERE id = %s AND school_id = %s;", (plan_id, school_id))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Plan not found.")
+            if row[0]:
+                raise HTTPException(status_code=400, detail="Can't delete the active plan — set a different plan active first, or create a new one, before deleting this.")
+
+            # Every dependent table's plan_id column was created with
+            # ON DELETE CASCADE — deleting this one row automatically
+            # deletes every period, assignment, slot, and rule that
+            # belongs only to this plan.
+            cur.execute("DELETE FROM timetable_plans WHERE id = %s;", (plan_id,))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/plans/{school_id}", status_code=303)
+
+
+@router.get("/timetable/plans/duplicate/{school_id}/{plan_id}", response_class=HTMLResponse)
+def duplicate_timetable_plan_form(school_id: int, plan_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM timetable_plans WHERE id = %s AND school_id = %s;", (plan_id, school_id))
+            source_plan = cur.fetchone()
+            if not source_plan:
+                raise HTTPException(status_code=404, detail="Plan not found.")
+
+    source_days = set(source_plan['active_days'].split(","))
+    all_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    day_checkboxes = "".join(
+        f"<label class='flex items-center gap-1 text-xs'><input type='checkbox' name='days' value='{d}' {'checked' if d in source_days else ''}> {d}</label>"
+        for d in all_days
+    )
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Save As Copy</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-md mx-auto space-y-4">
+            <a href="/timetable/plans/{school_id}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Plans</a>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+                <h2 class="text-lg font-black text-slate-800">Save "{esc(source_plan['name'])}" As a Copy</h2>
+                <p class="text-xs text-slate-400">Creates a brand new, fully independent plan for {esc(source_plan['education_level'])} — every period, teacher assignment, subject rule, and already-generated slot from "{esc(source_plan['name'])}" is copied over. Editing the new copy afterward never touches the original.</p>
+                <form method="post" action="/api/v1/timetable/plans/duplicate/{school_id}/{plan_id}" class="space-y-3">
+                    <div>
+                        <label class="text-[11px] font-semibold text-slate-500 block mb-1">New plan name</label>
+                        <input type="text" name="name" value="{esc(source_plan['name'])} (Copy)" required class="w-full border border-slate-200 p-2.5 rounded-lg text-sm">
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-semibold text-slate-500 block mb-1">Days for the new copy</label>
+                        <div class="flex flex-wrap gap-3 bg-slate-50 p-2.5 rounded-lg">{day_checkboxes}</div>
+                    </div>
+                    <button type="submit" class="w-full bg-indigo-700 hover:bg-indigo-800 text-white text-sm font-bold py-2.5 rounded-xl transition">Create Copy</button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/timetable/plans/duplicate/{school_id}/{plan_id}")
+async def duplicate_timetable_plan(school_id: int, plan_id: int, request: Request):
+    """Copies every row belonging to one plan into a brand new one. Done
+    in dependency order — timetable_periods and timetable_custom_subjects
+    are copied FIRST, building an old-id -> new-id map for each, since
+    everything else (slots, availability, sync rules, assignments, linked
+    classes) references those two tables' own ids and must be rewritten
+    to point at the new copies, not the originals."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form_data = await request.form()
+    new_name = (form_data.get("name") or "").strip()[:150]
+    days_selected = form_data.getlist("days")
+    if not new_name:
+        raise HTTPException(status_code=400, detail="The new plan needs a name.")
+
+    all_days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    ordered_days = [d for d in all_days_order if d in days_selected]
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM timetable_plans WHERE id = %s AND school_id = %s;", (plan_id, school_id))
+            source_plan = cur.fetchone()
+            if not source_plan:
+                raise HTTPException(status_code=404, detail="Plan not found.")
+
+            active_days_str = ",".join(ordered_days) if ordered_days else source_plan['active_days']
+
+            cur.execute("""
+                INSERT INTO timetable_plans (school_id, education_level, name, active_days, is_active)
+                VALUES (%s, %s, %s, %s, FALSE) RETURNING id;
+            """, (school_id, source_plan['education_level'], new_name, active_days_str))
+            new_plan_id = cur.fetchone()['id']
+
+            # --- Step 1: timetable_periods — build old_id -> new_id map ---
+            cur.execute("SELECT * FROM timetable_periods WHERE plan_id = %s;", (plan_id,))
+            period_id_map = {}
+            for row in cur.fetchall():
+                cur.execute("""
+                    INSERT INTO timetable_periods (school_id, education_level, label, short_label, start_time, end_time, period_order, period_type, is_teaching_period, plan_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+                """, (row['school_id'], row['education_level'], row['label'], row['short_label'], row['start_time'], row['end_time'], row['period_order'], row['period_type'], row['is_teaching_period'], new_plan_id))
+                period_id_map[row['id']] = cur.fetchone()['id']
+
+            # --- Step 2: timetable_custom_subjects — build old_id -> new_id map ---
+            cur.execute("SELECT * FROM timetable_custom_subjects WHERE plan_id = %s;", (plan_id,))
+            custom_subject_id_map = {}
+            for row in cur.fetchall():
+                cur.execute("""
+                    INSERT INTO timetable_custom_subjects (school_id, education_level, name, plan_id)
+                    VALUES (%s, %s, %s, %s) RETURNING id;
+                """, (row['school_id'], row['education_level'], row['name'], new_plan_id))
+                custom_subject_id_map[row['id']] = cur.fetchone()['id']
+
+            # --- Step 3: teacher_subject_assignments (remap custom_subject_id) ---
+            cur.execute("SELECT * FROM teacher_subject_assignments WHERE plan_id = %s;", (plan_id,))
+            for row in cur.fetchall():
+                new_custom_id = custom_subject_id_map.get(row['custom_subject_id']) if row['custom_subject_id'] else None
+                cur.execute("""
+                    INSERT INTO teacher_subject_assignments (school_id, grade_name, education_level, stream, learning_area_id, staff_user_id, lessons_per_week, requires_double, double_lessons_count, custom_subject_id, plan_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                """, (row['school_id'], row['grade_name'], row['education_level'], row['stream'], row['learning_area_id'], row['staff_user_id'], row['lessons_per_week'], row['requires_double'], row['double_lessons_count'], new_custom_id, new_plan_id))
+
+            # --- Step 4: timetable_slots (remap period_id, custom_subject_id) ---
+            cur.execute("SELECT * FROM timetable_slots WHERE plan_id = %s;", (plan_id,))
+            for row in cur.fetchall():
+                new_period_id = period_id_map.get(row['period_id'])
+                if new_period_id is None:
+                    continue  # source slot's period was somehow not copied — skip rather than insert a dangling reference
+                new_custom_id = custom_subject_id_map.get(row['custom_subject_id']) if row['custom_subject_id'] else None
+                cur.execute("""
+                    INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, custom_subject_id, co_curricular_activity_id, staff_user_id, plan_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                """, (row['school_id'], row['grade_name'], row['education_level'], row['stream'], row['day_of_week'], new_period_id, row['learning_area_id'], new_custom_id, row['co_curricular_activity_id'], row['staff_user_id'], new_plan_id))
+
+            # --- Step 5: teacher_availability (remap period_id) ---
+            cur.execute("SELECT * FROM teacher_availability WHERE plan_id = %s;", (plan_id,))
+            for row in cur.fetchall():
+                new_period_id = period_id_map.get(row['period_id'])
+                if new_period_id is None:
+                    continue
+                cur.execute("""
+                    INSERT INTO teacher_availability (school_id, staff_user_id, day_of_week, period_id, status, plan_id)
+                    VALUES (%s, %s, %s, %s, %s, %s);
+                """, (row['school_id'], row['staff_user_id'], row['day_of_week'], new_period_id, row['status'], new_plan_id))
+
+            # --- Step 6: subject_availability (remap period_id, custom_subject_id) ---
+            cur.execute("SELECT * FROM subject_availability WHERE plan_id = %s;", (plan_id,))
+            for row in cur.fetchall():
+                new_period_id = period_id_map.get(row['period_id'])
+                if new_period_id is None:
+                    continue
+                new_custom_id = custom_subject_id_map.get(row['custom_subject_id']) if row['custom_subject_id'] else None
+                cur.execute("""
+                    INSERT INTO subject_availability (school_id, learning_area_id, day_of_week, period_id, status, custom_subject_id, plan_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                """, (row['school_id'], row['learning_area_id'], row['day_of_week'], new_period_id, row['status'], new_custom_id, new_plan_id))
+
+            # --- Step 7: subject_sync_rules (remap period_id — can be NULL) ---
+            cur.execute("SELECT * FROM subject_sync_rules WHERE plan_id = %s;", (plan_id,))
+            for row in cur.fetchall():
+                new_period_id = period_id_map.get(row['period_id']) if row['period_id'] else None
+                cur.execute("""
+                    INSERT INTO subject_sync_rules (school_id, learning_area_id, day_of_week, period_id, plan_id)
+                    VALUES (%s, %s, %s, %s, %s);
+                """, (row['school_id'], row['learning_area_id'], row['day_of_week'], new_period_id, new_plan_id))
+
+            # --- Step 8: subject_constraints (no period/custom-subject reference) ---
+            cur.execute("SELECT * FROM subject_constraints WHERE plan_id = %s;", (plan_id,))
+            for row in cur.fetchall():
+                cur.execute("""
+                    INSERT INTO subject_constraints (school_id, grade_name, education_level, stream, subject_a_id, subject_b_id, constraint_type, plan_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                """, (row['school_id'], row['grade_name'], row['education_level'], row['stream'], row['subject_a_id'], row['subject_b_id'], row['constraint_type'], new_plan_id))
+
+            # --- Step 9: class_link_rules (remap custom_subject_id) ---
+            cur.execute("SELECT * FROM class_link_rules WHERE plan_id = %s;", (plan_id,))
+            for row in cur.fetchall():
+                new_custom_id = custom_subject_id_map.get(row['custom_subject_id']) if row['custom_subject_id'] else None
+                cur.execute("""
+                    INSERT INTO class_link_rules (school_id, learning_area_id, custom_subject_id, class_a_grade_name, class_a_education_level, class_a_stream, class_b_grade_name, class_b_education_level, class_b_stream, plan_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                """, (row['school_id'], row['learning_area_id'], new_custom_id, row['class_a_grade_name'], row['class_a_education_level'], row['class_a_stream'], row['class_b_grade_name'], row['class_b_education_level'], row['class_b_stream'], new_plan_id))
+
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/plans/{school_id}?created=1", status_code=303)
+
 
 @router.get("/timetable/subjects-config/{school_id}", response_class=HTMLResponse)
 def subjects_config_view(school_id: int, request: Request, education_level: str = "Upper Primary"):
