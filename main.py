@@ -2404,6 +2404,7 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             <p class="text-xs font-bold {'text-emerald-800' if has_staff_category_column else 'text-rose-800'}">
                 {'✅ fee_categories.collectible_by_staff column exists' if has_staff_category_column else '❌ fee_categories.collectible_by_staff column does not exist — this deployment is running an older finance_routes.py.'}
             </p>
+            {'' if has_staff_category_column else '<a href="/superadmin/db-diagnostic?table=fee_categories" class="text-[11px] font-bold text-rose-700 underline">Fix this now →</a>'}
         </div>
     </div>
     """
@@ -2429,6 +2430,7 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
                 </div>
                 <p class="text-xs text-slate-400">Compare the database name above against the Neon project/branch you ran your ALTER TABLE commands on — if they don't match, that's exactly why the fix didn't take effect.</p>
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-student-scores' onsubmit=\"return confirm('Add entered_marks/entered_out_of columns to student_scores on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add entered_marks / entered_out_of to student_scores now</button></form>" if table == "student_scores" and not any(c['column_name'] == 'entered_marks' for c in columns) else ""}
+                {"<form method='post' action='/superadmin/db-diagnostic/fix-fee-categories' onsubmit=\"return confirm('Add collectible_by_staff column to fee_categories on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add collectible_by_staff to fee_categories now</button></form>" if table == "fee_categories" and not any(c['column_name'] == 'collectible_by_staff' for c in columns) else ""}
                 <form method="get" action="/superadmin/db-diagnostic" class="flex gap-2">
                     <input type="text" name="table" value="{esc(table)}" class="flex-1 border border-slate-200 p-2 rounded-lg text-xs">
                     <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold px-4 py-2 rounded-lg">Check Table</button>
@@ -2462,6 +2464,24 @@ def fix_student_scores_columns(request: Request):
             conn.commit()
 
     return RedirectResponse(url="/superadmin/db-diagnostic?table=student_scores", status_code=303)
+
+
+@app.post("/superadmin/db-diagnostic/fix-fee-categories")
+def fix_fee_categories_columns(request: Request):
+    """Same self-service pattern as fix_student_scores_columns above —
+    adds fee_categories.collectible_by_staff directly through the live
+    app's own connection, bypassing any doubt about whether a given push
+    actually reached this specific database. Safe to run repeatedly."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE fee_categories ADD COLUMN IF NOT EXISTS collectible_by_staff BOOLEAN NOT NULL DEFAULT TRUE;")
+            conn.commit()
+
+    return RedirectResponse(url="/superadmin/db-diagnostic?table=fee_categories", status_code=303)
 
 
 @app.get("/superadmin/dashboard", response_class=HTMLResponse)
