@@ -1,6 +1,7 @@
 import os
 import re
 import uuid
+import json
 import random
 import secrets
 import urllib.parse
@@ -3101,6 +3102,124 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
     welcome_html = f"<p class='text-[11px] text-amber-300 font-bold'>Welcome, {esc(staff_name.split(' ')[0])}</p>" if staff_name else ""
     identity_html = f"<p class='text-xs text-indigo-300'>{esc(staff_email)}</p>" if staff_email else ""
 
+    # --- Performance Milestone Graphs: line charts tracking average marks
+    # across this term's assessment cycles (Opener -> Midterm -> End Term)
+    # — one chart per subject (comparing subjects side by side), and one
+    # comparison chart per grade that has more than one stream (e.g.
+    # Grade 8A vs Grade 8B), so a teacher can see whether performance is
+    # trending up or down as the term progresses. Scoped to exactly the
+    # classes/subjects this teacher can already see elsewhere on this
+    # dashboard — a subject-only teacher never sees another subject's
+    # data here either, reusing the same access-control helpers already
+    # used for marks entry, not a separate, looser check.
+    CYCLE_ORDER = ['Opener', 'Midterm', 'End Term']
+    subject_series = {}          # subject_name -> {cycle_name: [scores]}
+    stream_series_by_grade = {}  # grade_name -> {stream_label: {cycle_name: [scores]}}
+
+    if classes:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                for c in classes:
+                    grade_name_q, education_level_q, stream_q = c['grade_name'], c['education_level'], c['stream']
+                    cur.execute("""
+                        SELECT la.id AS learning_area_id, la.name AS subject_name, sc.cycle_name, sc.raw_score
+                        FROM student_scores sc
+                        JOIN learning_areas la ON sc.learning_area_id = la.id
+                        JOIN students s ON sc.student_id = s.id
+                        JOIN classes cl ON s.class_id = cl.id
+                        WHERE s.school_id = %s AND cl.grade_name = %s AND cl.education_level = %s
+                          AND (%s = 'SINGLE STREAM' OR s.stream = %s)
+                          AND sc.term = %s AND sc.year = %s
+                          AND sc.cycle_name IN ('Opener', 'Midterm', 'End Term')
+                          AND (s.status IS NULL OR s.status != 'GRADUATED');
+                    """, (school_id, grade_name_q, education_level_q, stream_q, stream_q, st['active_term'], st.get('active_year', 2026)))
+                    rows = cur.fetchall()
+
+                    # None = class (homeroom) teacher, unrestricted for
+                    # their own class; a subject-only teacher only ever
+                    # contributes their own assigned subject's scores here.
+                    allowed_subject_ids_for_class = None
+                    if is_restricted_staff:
+                        allowed_subject_ids_for_class = get_teacher_learning_area_ids(cur, school_id, effective_user_id, grade_name_q, education_level_q, stream_q)
+
+                    stream_label = "Whole Class" if (not stream_q or stream_q.upper() == "SINGLE STREAM") else f"{grade_name_q} {stream_q}"
+
+                    for row in rows:
+                        if allowed_subject_ids_for_class is not None and row['learning_area_id'] not in allowed_subject_ids_for_class:
+                            continue
+                        subject_series.setdefault(row['subject_name'], {cyc: [] for cyc in CYCLE_ORDER})[row['cycle_name']].append(float(row['raw_score']))
+                        stream_series_by_grade.setdefault(grade_name_q, {}).setdefault(stream_label, {cyc: [] for cyc in CYCLE_ORDER})[row['cycle_name']].append(float(row['raw_score']))
+
+    def _avg_or_none(values):
+        return round(sum(values) / len(values), 1) if values else None
+
+    subject_chart_datasets = [
+        {"label": subj, "data": [_avg_or_none(cycles[cyc]) for cyc in CYCLE_ORDER]}
+        for subj, cycles in subject_series.items()
+    ]
+
+    # A comparison chart only makes sense for a grade with 2+ streams —
+    # a single-stream grade has nothing to compare against.
+    stream_comparison_charts = []
+    for grade_name_g, streams in stream_series_by_grade.items():
+        if len(streams) < 2:
+            continue
+        stream_comparison_charts.append({
+            "grade_name": grade_name_g,
+            "datasets": [
+                {"label": stream_lbl, "data": [_avg_or_none(cycles[cyc]) for cyc in CYCLE_ORDER]}
+                for stream_lbl, cycles in streams.items()
+            ],
+        })
+
+    subject_chart_html = ""
+    if subject_chart_datasets:
+        subject_chart_html = f"""
+        <div class="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📈 Subject Performance Milestones — {esc(st['active_term'])}</h3>
+            <canvas id="subjectMilestoneChart" height="90"></canvas>
+        </div>
+        """
+
+    stream_charts_html = "".join(f"""
+        <div class="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📊 {esc(chart['grade_name'])} — Stream Comparison ({esc(st['active_term'])})</h3>
+            <canvas id="streamChart{i}" height="90"></canvas>
+        </div>
+        """ for i, chart in enumerate(stream_comparison_charts))
+
+    milestone_charts_script = ""
+    if subject_chart_datasets or stream_comparison_charts:
+        chart_js_calls = []
+        if subject_chart_datasets:
+            chart_js_calls.append(f"""
+            new Chart(document.getElementById('subjectMilestoneChart'), {{
+                type: 'line',
+                data: {{ labels: {json.dumps(CYCLE_ORDER)}, datasets: {json.dumps(subject_chart_datasets)}.map((d, i) => ({{
+                    ...d, fill: false, tension: 0.3, borderWidth: 2,
+                    borderColor: ['#4f46e5','#059669','#d97706','#dc2626','#0891b2','#7c3aed','#db2777'][i % 7],
+                    backgroundColor: ['#4f46e5','#059669','#d97706','#dc2626','#0891b2','#7c3aed','#db2777'][i % 7],
+                }})) }},
+                options: {{ responsive: true, scales: {{ y: {{ beginAtZero: true, max: 100, title: {{ display: true, text: 'Average Mark' }} }} }}, plugins: {{ legend: {{ position: 'bottom' }} }} }}
+            }});
+            """)
+        for i, chart in enumerate(stream_comparison_charts):
+            chart_js_calls.append(f"""
+            new Chart(document.getElementById('streamChart{i}'), {{
+                type: 'line',
+                data: {{ labels: {json.dumps(CYCLE_ORDER)}, datasets: {json.dumps(chart['datasets'])}.map((d, i) => ({{
+                    ...d, fill: false, tension: 0.3, borderWidth: 2,
+                    borderColor: ['#4f46e5','#059669','#d97706','#dc2626'][i % 4],
+                    backgroundColor: ['#4f46e5','#059669','#d97706','#dc2626'][i % 4],
+                }})) }},
+                options: {{ responsive: true, scales: {{ y: {{ beginAtZero: true, max: 100, title: {{ display: true, text: 'Average Mark' }} }} }}, plugins: {{ legend: {{ position: 'bottom' }} }} }}
+            }});
+            """)
+        milestone_charts_script = f"""
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+        <script>{"".join(chart_js_calls)}</script>
+        """
+
     return HTMLResponse(f"""
     <!DOCTYPE html>
     <html class="h-full">
@@ -3145,9 +3264,19 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
             <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                 {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No classes have been set up for this school yet.</p>"}
             </div>
+
+            {f'''<div class="flex items-center justify-between mb-4 mt-8">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">📈 Performance Milestones</h2>
+            </div>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {subject_chart_html}
+                {stream_charts_html}
+            </div>''' if (subject_chart_html or stream_charts_html) else ""}
+
             {support_contact_html()}
             <p class="text-center text-[11px] text-slate-300 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-400">Elimu Hub</span></p>
         </div>
+        {milestone_charts_script}
     </body>
     </html>
     """)
