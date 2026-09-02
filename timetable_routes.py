@@ -102,14 +102,22 @@ def _widen_unique_constraint(cur, table_name, old_columns, new_columns):
     caller in a try/except: this touches constraints on live tables, and
     a startup migration must never be able to crash the whole app if
     something about a specific school's data doesn't match what this
-    expects."""
+    expects.
+
+    kcu.column_name is Postgres's internal sql_identifier type, not plain
+    text — comparing array_agg(...) directly against a Python list (which
+    psycopg2 sends as a text[] array) fails with an operator-does-not-
+    exist error unless each element is explicitly cast to text first.
+    Caught the hard way: this silently failed on every single call until
+    tested against a real Postgres instance rather than trusted by
+    inspection."""
     cur.execute("""
         SELECT tc.constraint_name
         FROM information_schema.table_constraints tc
         JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_name = kcu.table_name
         WHERE tc.table_name = %s AND tc.constraint_type = 'UNIQUE'
         GROUP BY tc.constraint_name
-        HAVING array_agg(kcu.column_name ORDER BY kcu.column_name) = %s;
+        HAVING array_agg(kcu.column_name::text ORDER BY kcu.column_name::text) = %s;
     """, (table_name, sorted(old_columns)))
     row = cur.fetchone()
     if row:
@@ -123,7 +131,7 @@ def _widen_unique_constraint(cur, table_name, old_columns, new_columns):
         JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_name = kcu.table_name
         WHERE tc.table_name = %s AND tc.constraint_type = 'UNIQUE'
         GROUP BY tc.constraint_name
-        HAVING array_agg(kcu.column_name ORDER BY kcu.column_name) = %s;
+        HAVING array_agg(kcu.column_name::text ORDER BY kcu.column_name::text) = %s;
     """, (table_name, sorted(new_columns)))
     if not cur.fetchone():
         cur.execute(f"ALTER TABLE {table_name} ADD CONSTRAINT {table_name}_{'_'.join(new_columns)}_key UNIQUE ({', '.join(new_columns)});")
@@ -373,6 +381,180 @@ def bootstrap_timetable_schema():
                 );
             """)
             conn.commit()
+
+
+            # ================================================================
+            # Multi-plan migration: give every table that makes up a
+            # timetable its own plan_id, so a school can hold several fully
+            # independent timetables per education level (their own periods,
+            # days, teacher assignments, and every rule) without one
+            # touching another. This is purely additive and defensively
+            # wrapped — each step is safe to re-run on every future deploy,
+            # and a problem with any single step must never crash the whole
+            # app's startup.
+            # ================================================================
+
+            for tbl in [
+                "timetable_periods", "teacher_subject_assignments", "timetable_slots",
+                "teacher_availability", "subject_availability", "subject_sync_rules",
+                "subject_constraints", "timetable_custom_subjects", "class_link_rules",
+                "timetable_generation_issues",
+            ]:
+                try:
+                    cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS plan_id INTEGER REFERENCES timetable_plans(id) ON DELETE CASCADE;")
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    print(f"[timetable multi-plan migration] Could not add plan_id to {tbl}: {e}")
+
+            # Widen every unique constraint that predates plan_id — without
+            # this, a second plan trying to insert e.g. a teaching
+            # assignment for the same class+subject as the first plan would
+            # be rejected outright as a duplicate, even though the two rows
+            # now genuinely belong to two separate plans.
+            for tbl, old_cols, new_cols in [
+                ("timetable_periods", ["school_id", "education_level", "period_order"], ["school_id", "education_level", "period_order", "plan_id"]),
+                ("teacher_subject_assignments", ["school_id", "grade_name", "education_level", "stream", "learning_area_id"], ["school_id", "grade_name", "education_level", "stream", "learning_area_id", "plan_id"]),
+                ("teacher_availability", ["school_id", "staff_user_id", "day_of_week", "period_id"], ["school_id", "staff_user_id", "day_of_week", "period_id", "plan_id"]),
+                ("subject_availability", ["school_id", "learning_area_id", "day_of_week", "period_id"], ["school_id", "learning_area_id", "day_of_week", "period_id", "plan_id"]),
+                ("subject_sync_rules", ["school_id", "learning_area_id"], ["school_id", "learning_area_id", "plan_id"]),
+                ("timetable_generation_issues", ["school_id", "grade_name", "education_level", "stream"], ["school_id", "grade_name", "education_level", "stream", "plan_id"]),
+            ]:
+                try:
+                    _widen_unique_constraint(cur, tbl, old_cols, new_cols)
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    print(f"[timetable multi-plan migration] Could not widen unique constraint on {tbl}: {e}")
+
+            # The two PARTIAL unique indexes (custom-subject variants) are
+            # plain CREATE INDEX statements, not named table constraints, so
+            # they're simpler to widen directly: drop the old one, create a
+            # new one covering the same columns plus plan_id.
+            for old_index_name, tbl, new_index_name, cols_expr in [
+                ("idx_tsa_custom_subject", "teacher_subject_assignments", "idx_tsa_custom_subject_plan",
+                 "school_id, grade_name, education_level, stream, custom_subject_id, plan_id"),
+                ("idx_sa_custom_subject", "subject_availability", "idx_sa_custom_subject_plan",
+                 "school_id, custom_subject_id, day_of_week, period_id, plan_id"),
+            ]:
+                try:
+                    cur.execute(f"DROP INDEX IF EXISTS {old_index_name};")
+                    cur.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {new_index_name} ON {tbl} ({cols_expr}) WHERE custom_subject_id IS NOT NULL;")
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    print(f"[timetable multi-plan migration] Could not widen partial index on {tbl}: {e}")
+
+            # One-time backfill: any (school_id, education_level) that
+            # already has real timetable data but no plan yet gets a single
+            # "Main Timetable" plan, marked active immediately — so every
+            # existing report, print view, and staff dashboard keeps
+            # showing exactly what it already showed, with zero visible
+            # change for any live school. active_days is carried over from
+            # that school's existing (school-wide) days_per_week setting,
+            # so a school that had a 6-day week configured keeps it.
+            # WHERE plan_id IS NULL makes every step here safe to re-run —
+            # once a school/level is migrated, this never touches it again.
+            #
+            # Split into two passes because not every table has its own
+            # education_level column: teacher_availability, subject_
+            # availability, and subject_sync_rules are tied to a specific
+            # period_id instead, which itself belongs to one specific
+            # education level's bell schedule — so Pass 1 must migrate
+            # timetable_periods (and every table with its own
+            # education_level) first, and Pass 2 then derives the right
+            # plan for the period-based tables by following period_id to
+            # the now-migrated timetable_periods.plan_id. A few rows in
+            # subject_sync_rules can have no period_id set at all (a rule
+            # not yet given a fixed slot) — those fall back to deriving
+            # their level from their subject's own learning_areas.
+            # education_level instead.
+            try:
+                cur.execute("""
+                    SELECT DISTINCT school_id, education_level FROM (
+                        SELECT school_id, education_level FROM teacher_subject_assignments WHERE plan_id IS NULL
+                        UNION
+                        SELECT school_id, education_level FROM timetable_periods WHERE plan_id IS NULL
+                        UNION
+                        SELECT school_id, education_level FROM timetable_slots WHERE plan_id IS NULL
+                    ) AS needing_migration;
+                """)
+                to_migrate = cur.fetchall()
+
+                for row in to_migrate:
+                    school_id_m, education_level_m = row[0], row[1]
+
+                    cur.execute("SELECT days_per_week FROM timetable_settings WHERE school_id = %s;", (school_id_m,))
+                    settings_row = cur.fetchone()
+                    days_per_week_m = (settings_row[0] if settings_row else 5) or 5
+                    all_day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+                    active_days_m = ",".join(all_day_names[:max(1, min(6, days_per_week_m))])
+
+                    cur.execute("""
+                        INSERT INTO timetable_plans (school_id, education_level, name, active_days, is_active)
+                        VALUES (%s, %s, 'Main Timetable', %s, TRUE)
+                        RETURNING id;
+                    """, (school_id_m, education_level_m, active_days_m))
+                    new_plan_id = cur.fetchone()[0]
+
+                    # Pass 1: tables with their own direct education_level column.
+                    for tbl in ["timetable_periods", "teacher_subject_assignments", "timetable_slots",
+                                "subject_constraints", "timetable_custom_subjects", "timetable_generation_issues"]:
+                        cur.execute(f"UPDATE {tbl} SET plan_id = %s WHERE school_id = %s AND education_level = %s AND plan_id IS NULL;", (new_plan_id, school_id_m, education_level_m))
+                    conn.commit()
+
+                # Pass 2: tables keyed by period_id instead of education_level
+                # directly — derive their plan by following period_id to the
+                # now-migrated timetable_periods.plan_id.
+                for tbl in ["teacher_availability", "subject_availability", "subject_sync_rules"]:
+                    cur.execute(f"""
+                        UPDATE {tbl} AS t
+                        SET plan_id = tp.plan_id
+                        FROM timetable_periods tp
+                        WHERE t.period_id = tp.id AND t.plan_id IS NULL AND tp.plan_id IS NOT NULL;
+                    """)
+                conn.commit()
+
+                # Fallback for subject_availability/subject_sync_rules rows
+                # with no period_id set yet (a rule not yet given a fixed
+                # slot) — derive the level from the subject's own
+                # learning_areas.education_level instead. Uses a comma-join
+                # (implicit cross join) rather than an explicit JOIN...ON,
+                # since Postgres doesn't allow the UPDATE target table (t)
+                # to be referenced inside a JOIN...ON clause within an
+                # UPDATE...FROM — every correlation has to move to WHERE
+                # instead, which a comma-join allows.
+                for tbl in ["subject_availability", "subject_sync_rules"]:
+                    cur.execute(f"""
+                        UPDATE {tbl} AS t
+                        SET plan_id = tplan.id
+                        FROM learning_areas la, timetable_plans tplan
+                        WHERE t.learning_area_id = la.id
+                          AND tplan.school_id = t.school_id
+                          AND tplan.education_level = la.education_level
+                          AND tplan.is_active = TRUE
+                          AND t.plan_id IS NULL;
+                    """)
+                conn.commit()
+
+                # class_link_rules spans two classes that can be in two
+                # DIFFERENT education levels (Francis's real example: Grade
+                # 9V linked with Grade 8J) — there's no single level a link
+                # rule cleanly belongs to. Backfilling against class A's
+                # own level is a reasonable, documented choice here, not a
+                # perfect one; a link between two levels that were migrated
+                # at different times could still need a manual re-check.
+                cur.execute("""
+                    UPDATE class_link_rules AS clr
+                    SET plan_id = tplan.id
+                    FROM timetable_plans tplan
+                    WHERE tplan.school_id = clr.school_id AND tplan.education_level = clr.class_a_education_level
+                      AND tplan.is_active = TRUE AND clr.plan_id IS NULL;
+                """)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[timetable multi-plan migration] Backfill failed: {e}")
 
 
 def get_school_days(cur, school_id: int):
