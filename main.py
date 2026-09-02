@@ -1104,12 +1104,28 @@ def teacher_can_access_class(class_keys: set, grade_name: str, education_level: 
     return (grade_name, education_level, _normalize_stream_for_match(stream)) in class_keys
 
 
-def get_teacher_learning_area_ids(cur, school_id: int, user_id: int, grade_name: str, education_level: str, stream: str) -> set:
-    """Every learning_area_id this staff member is personally assigned to
-    teach for this exact class — the actual marks-entry restriction.
-    Being the class (homeroom) teacher does NOT by itself grant marks-
-    entry rights for every subject; only an explicit teaching assignment
-    does, matching "enter marks... for learning areas they only teach"."""
+def is_teacher_of_this_class(cur, school_id: int, user_id: int, grade_name: str, education_level: str, stream: str) -> bool:
+    """Is this staff member the assigned class (homeroom) teacher for this
+    exact class? A class teacher gets full access to every subject for
+    their own class — see get_teacher_learning_area_ids — unlike a
+    subject-only teacher, who's restricted to just what they're assigned
+    to teach."""
+    target_stream = _normalize_stream_for_match(stream)
+    cur.execute("SELECT stream FROM class_teachers WHERE school_id = %s AND teacher_user_id = %s AND grade_name = %s AND education_level = %s;", (school_id, user_id, grade_name, education_level))
+    return any(_normalize_stream_for_match(r['stream']) == target_stream for r in cur.fetchall())
+
+
+def get_teacher_learning_area_ids(cur, school_id: int, user_id: int, grade_name: str, education_level: str, stream: str):
+    """Every learning_area_id this staff member can view/enter marks for,
+    for this exact class. A class (homeroom) teacher gets every subject
+    for their own class — returns None, meaning "unrestricted", so the
+    caller shows the full subject list exactly like an admin would. A
+    subject-only teacher (no class_teachers row here) is restricted to
+    just the learning_area_ids they have an explicit teaching assignment
+    for."""
+    if is_teacher_of_this_class(cur, school_id, user_id, grade_name, education_level, stream):
+        return None
+
     target_stream = _normalize_stream_for_match(stream)
     cur.execute("""
         SELECT learning_area_id, stream FROM teacher_subject_assignments
@@ -3666,7 +3682,8 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
                 if not teacher_can_access_class(allowed_class_keys, grade_name, education_level, stream):
                     raise HTTPException(status_code=403, detail="You aren't assigned to this class.")
                 allowed_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
-                subjects = [s for s in subjects if s['id'] in allowed_subject_ids]
+                if allowed_subject_ids is not None:  # None = class teacher, full access to this class
+                    subjects = [s for s in subjects if s['id'] in allowed_subject_ids]
 
             cur.execute("""
                 SELECT sc.learning_area_id, sc.raw_score, s.id AS student_id, s.admission_number, s.first_name, s.middle_name, s.last_name
@@ -4149,7 +4166,8 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
                 if not teacher_can_access_class(allowed_class_keys, grade_name, education_level, stream):
                     raise HTTPException(status_code=403, detail="You aren't assigned to this class.")
                 allowed_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
-                subjects = [s for s in subjects if s['id'] in allowed_subject_ids]
+                if allowed_subject_ids is not None:  # None = class teacher, full access to this class
+                    subjects = [s for s in subjects if s['id'] in allowed_subject_ids]
 
             score_map = {}
             if student_ids:
@@ -4546,9 +4564,11 @@ def educators_bulk_entry_grid(
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
             subjects = cur.fetchall()
 
-            # A restricted staff member only ever sees the subjects they
-            # personally teach for THIS class — being the class (homeroom)
-            # teacher does not by itself unlock every subject.
+            # A class (homeroom) teacher gets every subject for their own
+            # class (get_teacher_learning_area_ids returns None for them,
+            # meaning "unrestricted"). A subject-only teacher without a
+            # class_teachers row is restricted to just what they're
+            # assigned to teach.
             if restricted_subject_ids is not None:
                 subjects = [s for s in subjects if s['id'] in restricted_subject_ids]
 
@@ -6044,7 +6064,7 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
                 if not teacher_can_access_class(allowed_class_keys, grade_name, education_level, stream):
                     raise HTTPException(status_code=403, detail="You aren't assigned to this class. Ask your admin to add you as its class teacher or a subject teacher there.")
                 allowed_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
-                if learning_area_id not in allowed_subject_ids:
+                if allowed_subject_ids is not None and learning_area_id not in allowed_subject_ids:  # None = class teacher, full access to this class
                     raise HTTPException(status_code=403, detail="You aren't assigned to teach this subject for this class. Ask your admin to add you under Teaching Assignments.")
 
     # Fetched once here, used by both save branches below — every mark
