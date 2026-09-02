@@ -575,6 +575,7 @@ from shared import (
     abbreviate_subject,
     with_query_param,
     full_student_name,
+    get_current_session_user,
 )
 
 
@@ -1067,6 +1068,55 @@ def is_paper_based_subject(subject_name: str, education_level: str) -> bool:
     if (education_level or "").strip() != "Junior School":
         return False
     return (subject_name or "").strip().lower().rstrip(".") in PAPER_BASED_SUBJECTS
+
+
+def _normalize_stream_for_match(stream) -> str:
+    """Treats 'SINGLE STREAM' (the placeholder this app uses throughout
+    its URLs/forms for a class with no real sub-streams) as equivalent to
+    a blank/NULL stream value — teacher_subject_assignments and
+    class_teachers always store a literal stream string, while
+    students.stream is often genuinely blank/NULL for a school with no
+    real sub-streams. Comparing these directly without normalizing is
+    exactly the bug class that broke scheme-of-work visibility earlier in
+    this project; every access-control check here goes through this."""
+    return None if (not stream or not stream.strip() or stream.strip().upper() == "SINGLE STREAM") else stream.strip()
+
+
+def get_teacher_class_keys(cur, school_id: int, user_id: int) -> set:
+    """Every (grade_name, education_level, normalized_stream) this staff
+    member is connected to — either as the assigned class (homeroom)
+    teacher, or as a subject teacher with at least one teaching
+    assignment there (from the timetable module's own teacher_subject_
+    assignments table — the single source of truth for "who teaches
+    what", reused here rather than building a second one). Only call
+    this to restrict role == 'staff' — admins and super admins are never
+    restricted by this."""
+    cur.execute("SELECT grade_name, education_level, stream FROM class_teachers WHERE school_id = %s AND teacher_user_id = %s;", (school_id, user_id))
+    rows = list(cur.fetchall())
+    cur.execute("SELECT DISTINCT grade_name, education_level, stream FROM teacher_subject_assignments WHERE school_id = %s AND staff_user_id = %s;", (school_id, user_id))
+    rows += list(cur.fetchall())
+    return {(r['grade_name'], r['education_level'], _normalize_stream_for_match(r['stream'])) for r in rows}
+
+
+def teacher_can_access_class(class_keys: set, grade_name: str, education_level: str, stream: str) -> bool:
+    """Checks a specific class against a teacher's allowed set, built by
+    get_teacher_class_keys."""
+    return (grade_name, education_level, _normalize_stream_for_match(stream)) in class_keys
+
+
+def get_teacher_learning_area_ids(cur, school_id: int, user_id: int, grade_name: str, education_level: str, stream: str) -> set:
+    """Every learning_area_id this staff member is personally assigned to
+    teach for this exact class — the actual marks-entry restriction.
+    Being the class (homeroom) teacher does NOT by itself grant marks-
+    entry rights for every subject; only an explicit teaching assignment
+    does, matching "enter marks... for learning areas they only teach"."""
+    target_stream = _normalize_stream_for_match(stream)
+    cur.execute("""
+        SELECT learning_area_id, stream FROM teacher_subject_assignments
+        WHERE school_id = %s AND staff_user_id = %s AND grade_name = %s AND education_level = %s AND learning_area_id IS NOT NULL;
+    """, (school_id, user_id, grade_name, education_level))
+    return {r['learning_area_id'] for r in cur.fetchall() if _normalize_stream_for_match(r['stream']) == target_stream}
+
 
 def generate_teacher_comment(first_name: str, pld: str) -> str:
     """Class teacher remark, tailored to the learner's overall performance level for the term."""
@@ -2894,9 +2944,19 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
 
+            viewer = get_current_session_user(request)
+            is_restricted_staff = bool(viewer and viewer.get('role') == 'staff')
+
             staff_email = None
             staff_name = None
-            effective_user_id = user_id or request.cookies.get("session_user_id")
+            # A staff member can only ever see their OWN dashboard — the
+            # user_id query param is only honored for an admin/superadmin
+            # previewing a specific teacher's view, never for a staff
+            # account to browse into a colleague's.
+            if is_restricted_staff:
+                effective_user_id = viewer['id']
+            else:
+                effective_user_id = user_id or request.cookies.get("session_user_id")
             if effective_user_id:
                 cur.execute("SELECT email, full_name FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (effective_user_id, school_id))
                 staff_user = cur.fetchone()
@@ -2912,6 +2972,14 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                 ORDER BY c.id ASC, s.stream ASC;
             """, (school_id,))
             classes = cur.fetchall()
+
+            # A class only appears here for a staff member if they're the
+            # assigned class (homeroom) teacher for it, OR they have at
+            # least one subject teaching assignment there. Admins and
+            # super admins previewing a dashboard are never restricted.
+            if is_restricted_staff:
+                allowed_class_keys = get_teacher_class_keys(cur, school_id, effective_user_id)
+                classes = [c for c in classes if teacher_can_access_class(allowed_class_keys, c['grade_name'], c['education_level'], c['stream'])]
 
     st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'is_single_stream': False}
 
@@ -3555,6 +3623,16 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
+            # A restricted staff member only sees the top-per-subject
+            # tables for subjects they personally teach for this class.
+            viewer = get_current_session_user(request)
+            if viewer and viewer.get('role') == 'staff':
+                allowed_class_keys = get_teacher_class_keys(cur, school_id, viewer['id'])
+                if not teacher_can_access_class(allowed_class_keys, grade_name, education_level, stream):
+                    raise HTTPException(status_code=403, detail="You aren't assigned to this class.")
+                allowed_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
+                subjects = [s for s in subjects if s['id'] in allowed_subject_ids]
+
             cur.execute("""
                 SELECT sc.learning_area_id, sc.raw_score, s.id AS student_id, s.admission_number, s.first_name, s.middle_name, s.last_name
                 FROM student_scores sc
@@ -4027,6 +4105,17 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
             subjects = cur.fetchall()
 
+            # A restricted staff member only sees analysis for subjects
+            # they personally teach for this class — matching the same
+            # restriction already applied to marks entry itself.
+            viewer = get_current_session_user(request)
+            if viewer and viewer.get('role') == 'staff':
+                allowed_class_keys = get_teacher_class_keys(cur, school_id, viewer['id'])
+                if not teacher_can_access_class(allowed_class_keys, grade_name, education_level, stream):
+                    raise HTTPException(status_code=403, detail="You aren't assigned to this class.")
+                allowed_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
+                subjects = [s for s in subjects if s['id'] in allowed_subject_ids]
+
             score_map = {}
             if student_ids:
                 cur.execute("""
@@ -4391,10 +4480,27 @@ def educators_bulk_entry_grid(
     saved: int = None,
     skipped: int = None,
 ):
+    # This route had NO session check at all before — anyone who knew or
+    # guessed the URL parameters could view or edit any school's student
+    # marks without even being logged in. Matches every other class-scoped
+    # route in this file.
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
+
+            viewer = get_current_session_user(request)
+            is_restricted_staff = bool(viewer and viewer.get('role') == 'staff')
+            restricted_subject_ids = None
+            if is_restricted_staff:
+                allowed_class_keys = get_teacher_class_keys(cur, school_id, viewer['id'])
+                if not teacher_can_access_class(allowed_class_keys, grade_name, education_level, stream):
+                    raise HTTPException(status_code=403, detail="You aren't assigned to this class. Ask your admin to add you as its class teacher or a subject teacher there, under Teaching Assignments.")
+                restricted_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
 
             cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
@@ -4404,8 +4510,21 @@ def educators_bulk_entry_grid(
             # Fetch relevant subjects matched by the educational segment level
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
             subjects = cur.fetchall()
-            
+
+            # A restricted staff member only ever sees the subjects they
+            # personally teach for THIS class — being the class (homeroom)
+            # teacher does not by itself unlock every subject.
+            if restricted_subject_ids is not None:
+                subjects = [s for s in subjects if s['id'] in restricted_subject_ids]
+
             selected_area_id = learning_area_id or (subjects[0]['id'] if subjects else None)
+            # If a restricted staff member requests (or is defaulted to) a
+            # subject outside their own assignment — e.g. an old bookmark
+            # from before they were reassigned — fall back to whichever of
+            # their own subjects comes first, rather than silently showing
+            # someone else's subject's marks.
+            if restricted_subject_ids is not None and selected_area_id not in restricted_subject_ids:
+                selected_area_id = subjects[0]['id'] if subjects else None
             selected_subject_name = next((sub['name'] for sub in subjects if sub['id'] == selected_area_id), "")
             is_paper_mode = is_paper_based_subject(selected_subject_name, education_level)
 
@@ -5853,6 +5972,12 @@ def drop_individual_score(school_id: int, score_id: int = Form(...), student_id:
 
 @app.post("/api/v1/scores/bulk-save/{school_id}")
 async def batch_save_class_marks_matrix(school_id: int, request: Request):
+    # This route had no session check at all before — added to match
+    # every other marks-affecting route in this file.
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     # Declared `async def` so we can await the form parse directly instead of
     # spinning up a nested event loop with asyncio.run() inside a sync route
     # (which is wasteful and can misbehave under some ASGI server setups).
@@ -5866,6 +5991,26 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     cycle_name = (form_data.get('cycle_name') or "").strip()
     if not cycle_name:
         raise HTTPException(status_code=400, detail="An assessment cycle must be selected before saving.")
+
+    grade_name = form_data.get("grade_name", "")
+    education_level = form_data.get("education_level", "")
+    stream = form_data.get("stream", "")
+
+    # Server-side enforcement of the same restriction the entry page
+    # already applies — the subject dropdown there only ever shows a
+    # restricted staff member their own assigned subjects, but a request
+    # can always be crafted by hand, so this must be checked here too,
+    # not just hidden in the UI. Admins and super admins are unrestricted.
+    viewer = get_current_session_user(request)
+    if viewer and viewer.get('role') == 'staff':
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                allowed_class_keys = get_teacher_class_keys(cur, school_id, viewer['id'])
+                if not teacher_can_access_class(allowed_class_keys, grade_name, education_level, stream):
+                    raise HTTPException(status_code=403, detail="You aren't assigned to this class. Ask your admin to add you as its class teacher or a subject teacher there.")
+                allowed_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
+                if learning_area_id not in allowed_subject_ids:
+                    raise HTTPException(status_code=403, detail="You aren't assigned to teach this subject for this class. Ask your admin to add you under Teaching Assignments.")
 
     # Fetched once here, used by both save branches below — every mark
     # saved in this request is scoped to the school's currently active
