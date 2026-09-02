@@ -869,6 +869,21 @@ def bootstrap_database_schema():
                 (1, 'Grade 1', 'Lower Primary'), (2, 'Grade 2', 'Lower Primary'), (3, 'Grade 3', 'Lower Primary'),
                 (4, 'Grade 4', 'Upper Primary'), (5, 'Grade 5', 'Upper Primary'), (6, 'Grade 6', 'Upper Primary'),
                 (7, 'Grade 7', 'Junior School'), (8, 'Grade 8', 'Junior School'), (9, 'Grade 9', 'Junior School'),
+                # ECDE — PP1 and PP2. Deliberately unused, safe class ids
+                # (10, 11) rather than renumbering anything: every existing
+                # school already has real students tied to ids 1-9, and
+                # those must never move. NOTE: "Advance All Classes" does
+                # NOT yet cascade PP1 -> PP2 -> Grade 1 automatically —
+                # that promotion still has to be done by hand for now,
+                # since correctly slotting these into the existing
+                # descending-order cascade needs care to avoid
+                # accidentally double-promoting a student in the same run
+                # (a real risk given how that logic works), and this
+                # wasn't asked for yet. Everything else about ECDE (its
+                # own classes, subjects, streams, timetable, marks,
+                # report cards, finance) works exactly like any other
+                # level immediately.
+                (10, 'PP1', 'ECDE'), (11, 'PP2', 'ECDE'),
             ]
             for class_id, grade, level in classes_payload:
                 cur.execute("INSERT INTO classes (id, grade_name, education_level) VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING;", (class_id, grade, level))
@@ -885,6 +900,9 @@ def bootstrap_database_schema():
                 ('Upper Primary', 'Christian religious education'),
                 ('Lower Primary', 'MATHEMATICS'), ('Lower Primary', 'ENGLISH'),
                 ('Lower Primary', 'LUGHA'), ('Lower Primary', 'INTEGRATED SCIENCE'),
+                ('ECDE', 'Language Activities'), ('ECDE', 'Mathematics Activities'),
+                ('ECDE', 'Environmental Activities'), ('ECDE', 'Creative Arts Activities'),
+                ('ECDE', 'Religious Education'),
             ]
             for lvl, name in subjects_payload:
                 cur.execute("INSERT INTO learning_areas (education_level, name) VALUES (%s, %s) ON CONFLICT (education_level, name) DO NOTHING;", (lvl, name))
@@ -3843,7 +3861,7 @@ def marks_entry_supervision(school_id: int, request: Request):
         levels.setdefault(level_key, {}).setdefault(class_key, {})[r['subject_name']] = (r['entered_count'], r['total_students'])
 
     level_sections_html = ""
-    for level in ["Lower Primary", "Upper Primary", "Junior School"]:
+    for level in ["ECDE", "Lower Primary", "Upper Primary", "Junior School"]:
         if level not in levels:
             continue
         class_map = levels[level]

@@ -44,7 +44,7 @@ from shared import (
 
 router = APIRouter()
 
-EDUCATION_LEVELS = ["Lower Primary", "Upper Primary", "Junior School"]
+EDUCATION_LEVELS = ["ECDE", "Lower Primary", "Upper Primary", "Junior School"]
 
 # Custom subjects (Music/Art/PE splits, PPI, etc.) share the scheduling
 # engine, teacher assignments, and time-off logic with regular subjects by
@@ -465,7 +465,7 @@ def timetable_workspace_hub(school_id: int, request: Request):
     for sec in sections:
         sections_by_level.setdefault(sec['education_level'], []).append(sec)
 
-    level_accent = {"Lower Primary": "#0d9488", "Upper Primary": "#0891b2", "Junior School": "#7c3aed"}
+    level_accent = {"ECDE": "#db2777", "Lower Primary": "#0d9488", "Upper Primary": "#0891b2", "Junior School": "#7c3aed"}
 
     level_groups_html = ""
     for level_name, level_sections in sections_by_level.items():
