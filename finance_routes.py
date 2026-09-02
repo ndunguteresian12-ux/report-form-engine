@@ -39,6 +39,7 @@ from shared import (
     require_admin_session,
     get_dashboard_url,
     full_student_name,
+    get_current_session_user,
 )
 
 router = APIRouter()
@@ -83,6 +84,7 @@ def bootstrap_finance_schema():
                     created_at TIMESTAMP DEFAULT NOW(),
                     UNIQUE(school_id, name)
                 );
+                ALTER TABLE fee_categories ADD COLUMN IF NOT EXISTS collectible_by_staff BOOLEAN NOT NULL DEFAULT TRUE;
 
                 CREATE TABLE IF NOT EXISTS fee_structures (
                     id SERIAL PRIMARY KEY,
@@ -173,6 +175,13 @@ def bootstrap_finance_schema():
                 );
             """)
             cur.execute("ALTER TABLE fee_payments ADD COLUMN IF NOT EXISTS import_batch_id INTEGER REFERENCES fee_payment_imports(id) ON DELETE CASCADE;")
+            # Freezes what the balance was AT THE MOMENT this exact payment
+            # was recorded — a receipt is an official historical document
+            # and must never show a different number on a later reprint
+            # just because more payments happened since. NULL on any
+            # payment recorded before this existed; the receipt view falls
+            # back to a live calculation only for those old rows.
+            cur.execute("ALTER TABLE fee_payments ADD COLUMN IF NOT EXISTS balance_after_payment NUMERIC(10, 2);")
             conn.commit()
 
             # Manually-entered "brought forward" balance — for arrears that
@@ -237,6 +246,38 @@ def _receipt_number_from_id(school_id: int, payment_id: int) -> str:
     return f"RCT-{school_id:03d}-{payment_id:06d}"
 
 
+def _compute_balance_after(cur, school_id, student_id, grade_name, category_id, term, year) -> float:
+    """The standard fee-balance formula used throughout this module: this
+    category's fee amount for the grade/term + any brought-forward opening
+    balance - everything paid to date for this category/term. Call this
+    right after inserting a new payment (so the SUM already includes it)
+    to freeze a snapshot on that payment row — see balance_after_payment.
+    Robust to both RealDictCursor and plain-tuple cursors, since call
+    sites in this file use both."""
+    cur.execute("""
+        SELECT amount FROM fee_structures
+        WHERE school_id = %s AND grade_name = %s AND term = %s AND year = %s AND fee_category_id = %s;
+    """, (school_id, grade_name, term, year, category_id))
+    row = cur.fetchone()
+    fee_amount = float(row['amount'] if isinstance(row, dict) else row[0]) if row else 0.0
+
+    cur.execute("""
+        SELECT amount FROM fee_opening_balances
+        WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+    """, (school_id, student_id, category_id, term, year))
+    row = cur.fetchone()
+    opening_amount = float(row['amount'] if isinstance(row, dict) else row[0]) if row else 0.0
+
+    cur.execute("""
+        SELECT COALESCE(SUM(amount), 0) AS total FROM fee_payments
+        WHERE student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+    """, (student_id, category_id, term, year))
+    row = cur.fetchone()
+    total_paid = float(row['total'] if isinstance(row, dict) else row[0])
+
+    return fee_amount + opening_amount - total_paid
+
+
 def _get_school_and_settings(cur, school_id):
     cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
     school = cur.fetchone()
@@ -274,11 +315,19 @@ def fee_categories_view(school_id: int, request: Request):
                 <span class="text-sm font-semibold text-slate-700">{esc(c['name'])}</span>
                 {"<span class='ml-2 text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200'>Default</span>" if c['is_default'] else ""}
             </div>
-            {"" if c['is_default'] else f'''
-            <form action="/api/v1/finance/categories/delete/{school_id}/{c['id']}" method="post" onsubmit="return confirm('Delete the \\'{esc(c['name'])}\\' fee category? Any fee amounts or payments already recorded under it will remain, but you will not be able to set new amounts for it.');">
-                <button type="submit" class="text-rose-600 hover:text-rose-800 text-xs font-bold">Delete</button>
-            </form>
-            '''}
+            <div class="flex items-center gap-4">
+                <form action="/api/v1/finance/categories/toggle-staff/{school_id}/{c['id']}" method="post">
+                    <label class="flex items-center gap-1.5 text-xs font-semibold text-slate-500 cursor-pointer">
+                        <input type="checkbox" name="collectible_by_staff" value="1" {"checked" if c['collectible_by_staff'] else ""} onchange="this.form.submit()" class="w-3.5 h-3.5">
+                        Staff can collect
+                    </label>
+                </form>
+                {"" if c['is_default'] else f'''
+                <form action="/api/v1/finance/categories/delete/{school_id}/{c['id']}" method="post" onsubmit="return confirm('Delete the \\'{esc(c['name'])}\\' fee category? Any fee amounts or payments already recorded under it will remain, but you will not be able to set new amounts for it.');">
+                    <button type="submit" class="text-rose-600 hover:text-rose-800 text-xs font-bold">Delete</button>
+                </form>
+                '''}
+            </div>
         </div>
     """ for c in categories)
 
@@ -290,7 +339,7 @@ def fee_categories_view(school_id: int, request: Request):
         <div class="max-w-xl mx-auto space-y-4">
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">🏷️ Fee Categories — {esc(school['name'])}</h2>
-                <p class="text-xs text-slate-400 mt-1">"School Fees" is always available. Add special fees like Exam Fee, Uniform Fee, or Trip Fee here — each gets its own amount and balance tracking.</p>
+                <p class="text-xs text-slate-400 mt-1">"School Fees" is always available. Add special fees like Exam Fee, Uniform Fee, or Trip Fee here — each gets its own amount and balance tracking. Use "Staff can collect" to control which categories show up for teachers on the Collect Fees page — uncheck one to keep it admin-only (e.g. a Boarding Fee or Building Fund you manage yourself).</p>
             </div>
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <div class="mb-4">{rows_html}</div>
@@ -324,6 +373,29 @@ def add_fee_category(school_id: int, request: Request, name: str = Form(...)):
                 INSERT INTO fee_categories (school_id, name, is_default) VALUES (%s, %s, FALSE)
                 ON CONFLICT (school_id, name) DO NOTHING;
             """, (school_id, name))
+            conn.commit()
+
+    return RedirectResponse(url=f"/finance/categories/{school_id}", status_code=303)
+
+
+@router.post("/api/v1/finance/categories/toggle-staff/{school_id}/{category_id}")
+def toggle_category_staff_access(school_id: int, category_id: int, request: Request, collectible_by_staff: str = Form(None)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    # Checkbox semantics: present in the form data only when checked, so
+    # an unchecked box submits no value at all rather than "false".
+    is_collectible = collectible_by_staff is not None
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE fee_categories SET collectible_by_staff = %s
+                WHERE id = %s AND school_id = %s;
+            """, (is_collectible, category_id, school_id))
             conn.commit()
 
     return RedirectResponse(url=f"/finance/categories/{school_id}", status_code=303)
@@ -1260,9 +1332,11 @@ def add_fee_payment(
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
-            if not cur.fetchone():
+            cur.execute("SELECT c.grade_name FROM students s JOIN classes c ON s.class_id = c.id WHERE s.id = %s AND s.school_id = %s;", (student_id, school_id))
+            student_row = cur.fetchone()
+            if not student_row:
                 raise HTTPException(status_code=404, detail="Student not found.")
+            grade_name = student_row[0]
 
             category_id = fee_category_id or _ensure_default_category(cur, school_id)
             recorded_by = request.cookies.get("session_user_id")
@@ -1272,7 +1346,14 @@ def add_fee_payment(
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
             """, (student_id, school_id, category_id, amount, payment_method, reference_note.strip() or None, term, year, recorded_by))
             new_payment_id = cur.fetchone()[0]
-            cur.execute("UPDATE fee_payments SET receipt_number = %s WHERE id = %s;", (_receipt_number_from_id(school_id, new_payment_id), new_payment_id))
+            # Frozen the moment this payment is recorded — see
+            # _compute_balance_after's docstring for why this must never
+            # be recalculated later.
+            frozen_balance = _compute_balance_after(cur, school_id, student_id, grade_name, category_id, term, year)
+            cur.execute(
+                "UPDATE fee_payments SET receipt_number = %s, balance_after_payment = %s WHERE id = %s;",
+                (_receipt_number_from_id(school_id, new_payment_id), frozen_balance, new_payment_id)
+            )
             conn.commit()
 
     return RedirectResponse(url=f"/finance/student/{school_id}/{student_id}?term={urllib.parse.quote(term)}&year={year}&saved=1", status_code=303)
@@ -1400,33 +1481,41 @@ def view_receipt(school_id: int, payment_id: int, request: Request):
             if not payment:
                 raise HTTPException(status_code=404, detail="Receipt not found.")
 
-            # Balance remaining AFTER this payment, for this category/term —
-            # computed from the same fee + brought-forward - paid formula
-            # used everywhere else in the module, so it always agrees with
-            # the student's statement page.
-            cur.execute("""
-                SELECT amount FROM fee_structures
-                WHERE school_id = %s AND grade_name = %s AND term = %s AND year = %s
-                  AND fee_category_id = %s;
-            """, (school_id, payment['grade_name'], payment['term'], payment['year'], payment['fee_category_id']))
-            fee_row = cur.fetchone()
-            fee_amount = float(fee_row['amount']) if fee_row else 0
+            # Balance remaining AFTER this payment, for this category/term.
+            # ALWAYS prefer the frozen snapshot taken at the moment this
+            # payment was recorded (balance_after_payment) — a receipt is
+            # a historical financial document and must never silently
+            # change later just because the student paid again, an admin
+            # adjusted the opening balance, or the fee amount changed.
+            # Only a payment recorded before this freezing existed (NULL
+            # here) falls back to the old live computation, which is the
+            # closest available approximation for those.
+            if payment['balance_after_payment'] is not None:
+                balance_after = float(payment['balance_after_payment'])
+            else:
+                cur.execute("""
+                    SELECT amount FROM fee_structures
+                    WHERE school_id = %s AND grade_name = %s AND term = %s AND year = %s
+                      AND fee_category_id = %s;
+                """, (school_id, payment['grade_name'], payment['term'], payment['year'], payment['fee_category_id']))
+                fee_row = cur.fetchone()
+                fee_amount = float(fee_row['amount']) if fee_row else 0
 
-            cur.execute("""
-                SELECT amount FROM fee_opening_balances
-                WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
-            """, (school_id, payment['student_id'], payment['fee_category_id'], payment['term'], payment['year']))
-            opening_row = cur.fetchone()
-            opening_amount = float(opening_row['amount']) if opening_row else 0
+                cur.execute("""
+                    SELECT amount FROM fee_opening_balances
+                    WHERE school_id = %s AND student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+                """, (school_id, payment['student_id'], payment['fee_category_id'], payment['term'], payment['year']))
+                opening_row = cur.fetchone()
+                opening_amount = float(opening_row['amount']) if opening_row else 0
 
-            cur.execute("""
-                SELECT COALESCE(SUM(amount), 0) AS total_paid FROM fee_payments
-                WHERE student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
-            """, (payment['student_id'], payment['fee_category_id'], payment['term'], payment['year']))
-            total_paid_row = cur.fetchone()
-            total_paid_to_date = float(total_paid_row['total_paid']) if total_paid_row else 0
+                cur.execute("""
+                    SELECT COALESCE(SUM(amount), 0) AS total_paid FROM fee_payments
+                    WHERE student_id = %s AND fee_category_id = %s AND term = %s AND year = %s;
+                """, (payment['student_id'], payment['fee_category_id'], payment['term'], payment['year']))
+                total_paid_row = cur.fetchone()
+                total_paid_to_date = float(total_paid_row['total_paid']) if total_paid_row else 0
 
-            balance_after = fee_amount + opening_amount - total_paid_to_date
+                balance_after = fee_amount + opening_amount - total_paid_to_date
 
     logo_src = school.get('logo_url')
     logo_html = ""
@@ -1530,7 +1619,7 @@ def staff_collect_search(school_id: int, request: Request, search: str = None, g
             default_category_id = _ensure_default_category(cur, school_id)
             conn.commit()
 
-            cur.execute("SELECT * FROM fee_categories WHERE school_id = %s ORDER BY is_default DESC, name ASC;", (school_id,))
+            cur.execute("SELECT * FROM fee_categories WHERE school_id = %s AND collectible_by_staff = TRUE ORDER BY is_default DESC, name ASC;", (school_id,))
             categories = cur.fetchall()
 
             cur.execute("""
@@ -1557,9 +1646,18 @@ def staff_collect_search(school_id: int, request: Request, search: str = None, g
             # Class Fee List. This is what actually lets staff see who
             # still owes what per category, rather than only being able
             # to look up one student they already have in mind by name.
-            if grade_name and education_level and stream:
+            if grade_name and education_level and stream and categories:
                 category_id = category_id or default_category_id
-                current_category = next((c for c in categories if c['id'] == category_id), categories[0] if categories else None)
+                current_category = next((c for c in categories if c['id'] == category_id), None)
+                if current_category is None:
+                    # Requested category is either gone or no longer
+                    # collectible_by_staff (e.g. a stale bookmark from
+                    # before an admin restricted it) — fall back to
+                    # whatever this staff member CAN actually collect,
+                    # rather than silently computing amounts for a
+                    # category they no longer have access to.
+                    current_category = categories[0] if categories else None
+                    category_id = current_category['id'] if current_category else category_id
 
                 cur.execute("""
                     SELECT amount FROM fee_structures
@@ -1597,6 +1695,7 @@ def staff_collect_search(school_id: int, request: Request, search: str = None, g
     )
 
     class_list_rows_html = ""
+    return_ctx = f"grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}&stream={urllib.parse.quote(stream)}&category_id={category_id}" if grade_name else ""
     for s in class_list_students:
         paid = float(s['paid'])
         opening = float(s['opening_balance'])
@@ -1608,7 +1707,7 @@ def staff_collect_search(school_id: int, request: Request, search: str = None, g
             "<span class='text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200'>No fee set</span>"
         )
         class_list_rows_html += f"""
-        <a href="/finance/staff/collect/{school_id}/{s['id']}" class="flex items-center justify-between p-3 border-b last:border-0 hover:bg-slate-50 transition flex-wrap gap-1">
+        <a href="/finance/staff/collect/{school_id}/{s['id']}?{return_ctx}" class="flex items-center justify-between p-3 border-b last:border-0 hover:bg-slate-50 transition flex-wrap gap-1">
             <div>
                 <span class="text-sm font-semibold text-slate-800">{esc(full_student_name(s))}</span>
                 <span class="text-slate-400 font-normal text-xs block">#{esc(s['admission_number'])} — Balance: KSh {balance:,.0f}</span>
@@ -1629,8 +1728,9 @@ def staff_collect_search(school_id: int, request: Request, search: str = None, g
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">💰 Collect Fees</h2>
                 <p class="text-xs text-slate-400 mt-1">Search for a student by name, or browse a full class list by fee category below.</p>
-                <form method="get" class="mt-3">
-                    <input type="text" name="search" value="{esc(search or '')}" placeholder="Search by name or admission number..." class="w-full border p-3 rounded-xl text-sm" autofocus>
+                <form method="get" class="mt-3 flex gap-2">
+                    <input type="text" name="search" value="{esc(search or '')}" placeholder="Search by name or admission number..." class="flex-1 border p-3 rounded-xl text-sm" autofocus>
+                    <button type="submit" class="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-5 rounded-xl text-sm transition">Search</button>
                 </form>
             </div>
 
@@ -1638,6 +1738,7 @@ def staff_collect_search(school_id: int, request: Request, search: str = None, g
 
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h3 class="text-sm font-bold text-slate-800 mb-3">📋 Browse by Class &amp; Category</h3>
+                {"<p class='text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2'>⚠️ Your admin hasn't enabled any fee category for staff collection yet. Ask them to allow at least one under Fee Categories.</p>" if not categories else f'''
                 <form method="get" class="grid grid-cols-2 gap-2">
                     <select name="class_pick" onchange="const [g,l,s]=this.value.split('|'); document.getElementById('gn').value=g; document.getElementById('el').value=l; document.getElementById('st').value=s; this.form.submit();" class="col-span-2 border p-2.5 rounded-xl text-sm bg-white">
                         <option value="">— Select a class —</option>{class_options}
@@ -1647,6 +1748,7 @@ def staff_collect_search(school_id: int, request: Request, search: str = None, g
                     <input type="hidden" id="st" name="stream" value="{esc(stream or '')}">
                     <select name="category_id" onchange="this.form.submit()" class="col-span-2 border p-2.5 rounded-xl text-sm bg-white">{category_options}</select>
                 </form>
+                '''}
             </div>
 
             {f'''<div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
@@ -1665,7 +1767,7 @@ def staff_collect_search(school_id: int, request: Request, search: str = None, g
 
 
 @router.get("/finance/staff/collect/{school_id}/{student_id}", response_class=HTMLResponse)
-def staff_collect_form(school_id: int, student_id: int, request: Request, saved: str = None):
+def staff_collect_form(school_id: int, student_id: int, request: Request, saved: str = None, grade_name: str = None, education_level: str = None, stream: str = None, category_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -1686,7 +1788,7 @@ def staff_collect_form(school_id: int, student_id: int, request: Request, saved:
             if not student:
                 raise HTTPException(status_code=404, detail="Student not found.")
 
-            cur.execute("SELECT * FROM fee_categories WHERE school_id = %s ORDER BY is_default DESC, name ASC;", (school_id,))
+            cur.execute("SELECT * FROM fee_categories WHERE school_id = %s AND collectible_by_staff = TRUE ORDER BY is_default DESC, name ASC;", (school_id,))
             categories = cur.fetchall()
 
             # Only THIS staff member's own collections for this student —
@@ -1713,12 +1815,25 @@ def staff_collect_form(school_id: int, student_id: int, request: Request, saved:
         </tr>
     """ for p in my_payments_for_student)
 
+    # Preserves whichever class/category the teacher was browsing so the
+    # "back" link returns them to that SAME list (not a blank search
+    # page) — this is the actual fix for the reported redirect bug.
+    has_class_context = bool(grade_name and education_level and stream)
+    class_ctx_qs = f"grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}&stream={urllib.parse.quote(stream)}&category_id={category_id}" if has_class_context else ""
+    back_url = f"/finance/staff/collect/{school_id}?{class_ctx_qs}" if has_class_context else f"/finance/staff/collect/{school_id}"
+    back_label = "← Back to Class List" if has_class_context else "← Search Another Student"
+    ctx_hidden_fields = (
+        f'<input type="hidden" name="grade_name" value="{esc(grade_name)}"><input type="hidden" name="education_level" value="{esc(education_level)}"><input type="hidden" name="stream" value="{esc(stream)}"><input type="hidden" name="category_id" value="{category_id}">'
+        if has_class_context else ""
+    )
+
     return f"""
     <!DOCTYPE html>
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Collect Fee — {esc(full_student_name(student))}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
         <div class="max-w-lg mx-auto space-y-4">
+            <a href="{back_url}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">{back_label}</a>
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">{esc(full_student_name(student))}</h2>
                 <p class="text-xs text-slate-400">#{esc(student['admission_number'])} — {esc(student['grade_name'])}</p>
@@ -1728,8 +1843,10 @@ def staff_collect_form(school_id: int, student_id: int, request: Request, saved:
 
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h3 class="text-sm font-bold text-slate-800 mb-3">Record a Payment</h3>
+                {"<p class='text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3'>⚠️ Your admin hasn't enabled any fee category for staff collection yet. Ask them to allow at least one under Fee Categories.</p>" if not categories else f'''
                 <form action="/api/v1/finance/staff/collect/{school_id}/{student_id}" method="post" class="grid grid-cols-2 gap-3">
                     <input type="hidden" name="term" value="{esc(active_term)}"><input type="hidden" name="year" value="{active_year}">
+                    {ctx_hidden_fields}
                     <div class="col-span-2">
                         <label class="text-xs font-bold text-slate-600 block mb-1">Fee Category</label>
                         <select name="fee_category_id" class="w-full border p-2.5 rounded-xl text-sm bg-white" required>{category_options}</select>
@@ -1753,6 +1870,7 @@ def staff_collect_form(school_id: int, student_id: int, request: Request, saved:
                     </div>
                     <button type="submit" class="col-span-2 bg-emerald-700 hover:bg-emerald-800 text-white font-bold py-3 rounded-xl text-sm transition">+ Record Payment</button>
                 </form>
+                '''}
             </div>
 
             {f'''<div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
@@ -1760,7 +1878,7 @@ def staff_collect_form(school_id: int, student_id: int, request: Request, saved:
                 <table class="w-full"><tbody>{history_html}</tbody></table>
             </div>''' if my_payments_for_student else ""}
 
-            <a href="/finance/staff/collect/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Search Another Student</a>
+            <a href="{back_url}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">{back_label}</a>
         </div>
     </body>
     </html>
@@ -1773,10 +1891,17 @@ def staff_collect_payment(
     amount: float = Form(...), payment_method: str = Form("cash"),
     reference_note: str = Form(""), term: str = Form(...), year: int = Form(...),
     fee_category_id: int = Form(None),
+    grade_name: str = Form(None), education_level: str = Form(None), stream: str = Form(None), category_id: int = Form(None),
 ):
     """Records a payment via the staff-scoped collection flow — same
     underlying insert as the admin payment form, just redirects back to
-    the staff view instead of the full admin finance module."""
+    the staff view instead of the full admin finance module.
+
+    grade_name/education_level/stream/category_id here are the CLASS
+    BROWSE context (which class list the teacher came from), not the
+    category being paid for — kept so the redirect back can return them
+    to the same class list rather than a blank search page. fee_category_id
+    is the actual category selected in this payment's own form."""
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -1790,22 +1915,46 @@ def staff_collect_payment(
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
-            if not cur.fetchone():
+            cur.execute("SELECT c.grade_name FROM students s JOIN classes c ON s.class_id = c.id WHERE s.id = %s AND s.school_id = %s;", (student_id, school_id))
+            student_row = cur.fetchone()
+            if not student_row:
                 raise HTTPException(status_code=404, detail="Student not found.")
+            actual_grade_name = student_row[0]
 
-            category_id = fee_category_id or _ensure_default_category(cur, school_id)
+            default_category_id = _ensure_default_category(cur, school_id)
+            category_id_to_use = fee_category_id or default_category_id
+
+            # Server-side enforcement of the admin's staff-collection
+            # restriction — the dropdown already only shows allowed
+            # categories, but a request can always be crafted by hand, so
+            # this must be checked here too, not just hidden in the UI.
+            cur.execute("SELECT collectible_by_staff FROM fee_categories WHERE id = %s AND school_id = %s;", (category_id_to_use, school_id))
+            cat_row = cur.fetchone()
+            if not cat_row or not cat_row[0]:
+                raise HTTPException(status_code=403, detail="This fee category isn't enabled for staff collection. Ask your admin to allow it under Fee Categories.")
+
             recorded_by = request.cookies.get("session_user_id")
 
             cur.execute("""
                 INSERT INTO fee_payments (student_id, school_id, fee_category_id, amount, payment_method, reference_note, term, year, recorded_by_user_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
-            """, (student_id, school_id, category_id, amount, payment_method, reference_note.strip() or None, term, year, recorded_by))
+            """, (student_id, school_id, category_id_to_use, amount, payment_method, reference_note.strip() or None, term, year, recorded_by))
             new_payment_id = cur.fetchone()[0]
-            cur.execute("UPDATE fee_payments SET receipt_number = %s WHERE id = %s;", (_receipt_number_from_id(school_id, new_payment_id), new_payment_id))
+            # Frozen the moment this payment is recorded — uses the
+            # student's REAL grade (looked up directly), not the class-
+            # browse context param above, since that context can be
+            # absent if this student was reached via name search instead.
+            frozen_balance = _compute_balance_after(cur, school_id, student_id, actual_grade_name, category_id_to_use, term, year)
+            cur.execute(
+                "UPDATE fee_payments SET receipt_number = %s, balance_after_payment = %s WHERE id = %s;",
+                (_receipt_number_from_id(school_id, new_payment_id), frozen_balance, new_payment_id)
+            )
             conn.commit()
 
-    return RedirectResponse(url=f"/finance/staff/collect/{school_id}/{student_id}?saved=1", status_code=303)
+    redirect_url = f"/finance/staff/collect/{school_id}/{student_id}?saved=1"
+    if grade_name and education_level and stream:
+        redirect_url += f"&grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}&stream={urllib.parse.quote(stream)}&category_id={category_id}"
+    return RedirectResponse(url=redirect_url, status_code=303)
 
 
 @router.get("/finance/staff/my-collections/{school_id}", response_class=HTMLResponse)
@@ -2114,7 +2263,17 @@ async def upload_fee_import(school_id: int, request: Request, file: UploadFile =
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
                         """, (row["student_id"], school_id, row["category_id"], row["amount"], row["payment_method"], row["reference_note"], row["term"], row["year"], recorded_by, batch_id))
                     new_payment_id = cur.fetchone()['id']
-                    cur.execute("UPDATE fee_payments SET receipt_number = %s WHERE id = %s;", (_receipt_number_from_id(school_id, new_payment_id), new_payment_id))
+                    # Frozen the same way a manually-recorded payment is —
+                    # so an imported historical receipt never has to fall
+                    # back to a live recalculation either.
+                    cur.execute("SELECT c.grade_name FROM students s JOIN classes c ON s.class_id = c.id WHERE s.id = %s;", (row["student_id"],))
+                    grade_row = cur.fetchone()
+                    row_grade_name = grade_row['grade_name'] if grade_row else None
+                    frozen_balance = _compute_balance_after(cur, school_id, row["student_id"], row_grade_name, row["category_id"], row["term"], row["year"])
+                    cur.execute(
+                        "UPDATE fee_payments SET receipt_number = %s, balance_after_payment = %s WHERE id = %s;",
+                        (_receipt_number_from_id(school_id, new_payment_id), frozen_balance, new_payment_id)
+                    )
                 conn.commit()
 
     import base64
