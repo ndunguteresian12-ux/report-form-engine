@@ -3113,8 +3113,8 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
     # data here either, reusing the same access-control helpers already
     # used for marks entry, not a separate, looser check.
     CYCLE_ORDER = ['Opener', 'Midterm', 'End Term']
-    subject_series = {}          # subject_name -> {cycle_name: [scores]}
-    stream_series_by_grade = {}  # grade_name -> {stream_label: {cycle_name: [scores]}}
+    subject_series_by_grade = {}  # grade_name -> {subject_name: {cycle_name: [scores]}}
+    stream_series_by_grade = {}   # grade_name -> {stream_label: {cycle_name: [scores]}}
 
     if classes:
         with get_db_connection() as conn:
@@ -3147,16 +3147,30 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                     for row in rows:
                         if allowed_subject_ids_for_class is not None and row['learning_area_id'] not in allowed_subject_ids_for_class:
                             continue
-                        subject_series.setdefault(row['subject_name'], {cyc: [] for cyc in CYCLE_ORDER})[row['cycle_name']].append(float(row['raw_score']))
+                        # Keyed by grade_name too — a subject's trend line
+                        # must never blend two different grades' students
+                        # together (e.g. a teacher's Grade 7 Mathematics and
+                        # Grade 8 Mathematics are different curricula/
+                        # difficulty levels; averaging them produces a
+                        # number that represents neither class correctly).
+                        subject_series_by_grade.setdefault(grade_name_q, {}).setdefault(row['subject_name'], {cyc: [] for cyc in CYCLE_ORDER})[row['cycle_name']].append(float(row['raw_score']))
                         stream_series_by_grade.setdefault(grade_name_q, {}).setdefault(stream_label, {cyc: [] for cyc in CYCLE_ORDER})[row['cycle_name']].append(float(row['raw_score']))
 
     def _avg_or_none(values):
         return round(sum(values) / len(values), 1) if values else None
 
-    subject_chart_datasets = [
-        {"label": subj, "data": [_avg_or_none(cycles[cyc]) for cyc in CYCLE_ORDER]}
-        for subj, cycles in subject_series.items()
-    ]
+    # One subject-wise chart PER GRADE — combines all streams of that
+    # SAME grade together (a genuine "whole Grade 8" subject view), but
+    # never mixes in a different grade's students.
+    subject_charts = []
+    for grade_name_g, subjects_map in subject_series_by_grade.items():
+        subject_charts.append({
+            "grade_name": grade_name_g,
+            "datasets": [
+                {"label": subj, "data": [_avg_or_none(cycles[cyc]) for cyc in CYCLE_ORDER]}
+                for subj, cycles in subjects_map.items()
+            ],
+        })
 
     # A comparison chart only makes sense for a grade with 2+ streams —
     # a single-stream grade has nothing to compare against.
@@ -3172,14 +3186,12 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
             ],
         })
 
-    subject_chart_html = ""
-    if subject_chart_datasets:
-        subject_chart_html = f"""
+    subject_chart_html = "".join(f"""
         <div class="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs">
-            <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📈 Subject Performance Milestones — {esc(st['active_term'])}</h3>
-            <canvas id="subjectMilestoneChart" height="90"></canvas>
+            <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📈 {esc(chart['grade_name'])} — Subject Performance Milestones ({esc(st['active_term'])})</h3>
+            <canvas id="subjectMilestoneChart{i}" height="90"></canvas>
         </div>
-        """
+        """ for i, chart in enumerate(subject_charts))
 
     stream_charts_html = "".join(f"""
         <div class="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs">
@@ -3189,13 +3201,13 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
         """ for i, chart in enumerate(stream_comparison_charts))
 
     milestone_charts_script = ""
-    if subject_chart_datasets or stream_comparison_charts:
+    if subject_charts or stream_comparison_charts:
         chart_js_calls = []
-        if subject_chart_datasets:
+        for i, chart in enumerate(subject_charts):
             chart_js_calls.append(f"""
-            new Chart(document.getElementById('subjectMilestoneChart'), {{
+            new Chart(document.getElementById('subjectMilestoneChart{i}'), {{
                 type: 'line',
-                data: {{ labels: {json.dumps(CYCLE_ORDER)}, datasets: {json.dumps(subject_chart_datasets)}.map((d, i) => ({{
+                data: {{ labels: {json.dumps(CYCLE_ORDER)}, datasets: {json.dumps(chart['datasets'])}.map((d, i) => ({{
                     ...d, fill: false, tension: 0.3, borderWidth: 2,
                     borderColor: ['#4f46e5','#059669','#d97706','#dc2626','#0891b2','#7c3aed','#db2777'][i % 7],
                     backgroundColor: ['#4f46e5','#059669','#d97706','#dc2626','#0891b2','#7c3aed','#db2777'][i % 7],
