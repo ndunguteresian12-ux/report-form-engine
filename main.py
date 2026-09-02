@@ -2358,6 +2358,40 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             """, (table,))
             columns = cur.fetchall()
 
+            # Direct, unambiguous checks for the two specific things
+            # reported as "not showing up" — cuts straight through any
+            # doubt about which file version is actually deployed.
+            cur.execute("SELECT id, grade_name, education_level FROM classes WHERE education_level = 'ECDE' ORDER BY id;")
+            ecde_classes = cur.fetchall()
+            cur.execute("SELECT COUNT(*) AS cnt FROM learning_areas WHERE education_level = 'ECDE';")
+            ecde_subject_count = cur.fetchone()['cnt']
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'fee_categories' AND column_name = 'collectible_by_staff';
+            """)
+            has_staff_category_column = cur.fetchone() is not None
+
+    ecde_status_html = f"""
+    <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-3">
+        <h2 class="text-lg font-black text-slate-800">🎯 Direct Checks</h2>
+        <div class="p-3 rounded-xl {'bg-emerald-50 border border-emerald-200' if ecde_classes else 'bg-rose-50 border border-rose-200'}">
+            <p class="text-xs font-bold {'text-emerald-800' if ecde_classes else 'text-rose-800'}">
+                {'✅ ECDE classes found: ' + ', '.join(f"{c['grade_name']} (id={c['id']})" for c in ecde_classes) if ecde_classes else '❌ No ECDE classes found in the classes table — the seeding migration has not run on this database yet.'}
+            </p>
+        </div>
+        <div class="p-3 rounded-xl {'bg-emerald-50 border border-emerald-200' if ecde_subject_count > 0 else 'bg-rose-50 border border-rose-200'}">
+            <p class="text-xs font-bold {'text-emerald-800' if ecde_subject_count > 0 else 'text-rose-800'}">
+                {'✅ ' + str(ecde_subject_count) + ' ECDE learning area(s) found' if ecde_subject_count > 0 else '❌ No ECDE learning areas found.'}
+            </p>
+        </div>
+        <div class="p-3 rounded-xl {'bg-emerald-50 border border-emerald-200' if has_staff_category_column else 'bg-rose-50 border border-rose-200'}">
+            <p class="text-xs font-bold {'text-emerald-800' if has_staff_category_column else 'text-rose-800'}">
+                {'✅ fee_categories.collectible_by_staff column exists' if has_staff_category_column else '❌ fee_categories.collectible_by_staff column does not exist — this deployment is running an older finance_routes.py.'}
+            </p>
+        </div>
+    </div>
+    """
+
     rows_html = "".join(
         f"<tr class='border-b text-xs'><td class='p-2 font-mono font-bold'>{esc(c['column_name'])}</td><td class='p-2 text-slate-500'>{esc(c['data_type'])}</td><td class='p-2'>{esc(c['is_nullable'])}</td></tr>"
         for c in columns
@@ -2369,6 +2403,7 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | DB Diagnostic</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-2xl mx-auto space-y-4">
+            {ecde_status_html}
             <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
                 <h2 class="text-lg font-black text-slate-800">🔍 Live Database Diagnostic</h2>
                 <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs font-mono space-y-1">
