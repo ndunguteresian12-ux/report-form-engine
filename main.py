@@ -574,6 +574,53 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # and durable; this local mount is a safety net and will NOT survive a
 # redeploy on Render since local disk is ephemeral there).
 app.mount(f"/{UPLOAD_DIR}", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+# PWA assets (manifest, service worker, icons) — checked into the repo
+# under static/, unlike UPLOAD_DIR which holds runtime-uploaded files on
+# ephemeral storage. These are build-time assets, present on every deploy.
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Injected into every page's <head> that should be installable as a PWA —
+# links the manifest, sets iOS-specific meta tags (Apple never adopted
+# the standard <link rel="manifest">, so it needs its own tags), and
+# registers the service worker with a small "new version available"
+# banner so a deployed update actually reaches someone who already has
+# the app installed, instead of sitting invisible until their next full
+# restart.
+PWA_HEAD_SNIPPET = """
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#0d9488">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Elimu Hub">
+<script>
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/static/sw.js').then((reg) => {
+            reg.addEventListener('updatefound', () => {
+                const newWorker = reg.installing;
+                if (!newWorker) return;
+                newWorker.addEventListener('statechange', () => {
+                    if (newWorker.state === 'activated' && navigator.serviceWorker.controller) {
+                        showUpdateBanner();
+                    }
+                });
+            });
+        }).catch(() => {});
+    });
+}
+function showUpdateBanner() {
+    if (document.getElementById('elimu-update-banner')) return;
+    const banner = document.createElement('div');
+    banner.id = 'elimu-update-banner';
+    banner.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#0d9488;color:white;padding:12px 16px;text-align:center;font-size:13px;font-weight:600;z-index:9999;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 -2px 10px rgba(0,0,0,0.15);';
+    banner.innerHTML = 'A new version of Elimu Hub is available. <button id="elimu-update-btn" style="background:white;color:#0d9488;border:none;padding:6px 14px;border-radius:8px;font-weight:700;font-size:12px;cursor:pointer;">Refresh Now</button>';
+    document.body.appendChild(banner);
+    document.getElementById('elimu-update-btn').onclick = () => window.location.reload();
+}
+</script>
+"""
+
 
 # --- Shared helpers (DB pool, auth checks, subject ordering) ---
 # Moved to shared.py so timetable_routes.py can use them too without a
@@ -1244,14 +1291,40 @@ def fetch_theme_styles(color_name: str):
 def landing_root():
     return RedirectResponse(url="/login")
 
+
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def robots_txt():
+    """Almost everything past /login is a login-gated, per-school portal —
+    genuinely private data, not content that should ever show up in
+    someone's search results. Only the public entry point is listed as
+    crawlable."""
+    return "User-agent: *\nAllow: /login\nDisallow: /admin/\nDisallow: /staff/\nDisallow: /superadmin/\nDisallow: /timetable/\nDisallow: /finance/\nDisallow: /api/\nSitemap: https://report-form-engine.onrender.com/sitemap.xml\n"
+
+
+@app.get("/sitemap.xml", response_class=Response)
+def sitemap_xml():
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+        <loc>https://report-form-engine.onrender.com/login</loc>
+        <changefreq>monthly</changefreq>
+        <priority>1.0</priority>
+    </url>
+</urlset>
+"""
+    return Response(content=xml, media_type="application/xml")
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_portal():
     return f"""
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
-        <title>Elimu Hub | Multi-Tenant Hub Gateway</title>
+        <title>Elimu Hub | School Management System for Kenyan CBC Schools</title>
+        <meta name="description" content="Elimu Hub is a school management platform built for Kenyan CBC schools — timetabling, fee management, marks entry, and schemes of work in one place.">
+        {PWA_HEAD_SNIPPET}
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-slate-900 flex items-center justify-center h-screen font-sans">
@@ -2221,6 +2294,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Control Deck - {esc(school['name'])}</title>
+        {PWA_HEAD_SNIPPET}
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -3447,6 +3521,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Staff Portal - {esc(school['name'])}</title>
+        {PWA_HEAD_SNIPPET}
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
         <link rel="preconnect" href="https://fonts.googleapis.com">
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
