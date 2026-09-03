@@ -1149,6 +1149,22 @@ def is_teacher_of_this_class(cur, school_id: int, user_id: int, grade_name: str,
     return any(_normalize_stream_for_match(r['stream']) == target_stream for r in cur.fetchall())
 
 
+def get_teacher_registerable_class_ids(cur, school_id: int, user_id: int) -> set:
+    """Every classes.id this staff member can register new students into —
+    every grade/level they're the assigned class (homeroom) teacher for,
+    in any stream. classes.id only encodes grade+level (a school's
+    streams live on the student record itself, entered fresh at
+    registration time, not on the class row), so this matches by
+    grade+level and ignores the specific stream a class_teachers row
+    happens to name."""
+    cur.execute("SELECT DISTINCT grade_name, education_level FROM class_teachers WHERE school_id = %s AND teacher_user_id = %s;", (school_id, user_id))
+    grade_level_pairs = {(r['grade_name'], r['education_level']) for r in cur.fetchall()}
+    if not grade_level_pairs:
+        return set()
+    cur.execute("SELECT id, grade_name, education_level FROM classes;")
+    return {c['id'] for c in cur.fetchall() if (c['grade_name'], c['education_level']) in grade_level_pairs}
+
+
 def get_teacher_learning_area_ids(cur, school_id: int, user_id: int, grade_name: str, education_level: str, stream: str):
     """Every learning_area_id this staff member can view/enter marks for,
     for this exact class. A class (homeroom) teacher gets every subject
@@ -4586,6 +4602,14 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
 # --- GET View Routes for Administration Subsystems ---
 @app.get("/admin/student/new/{school_id}", response_class=HTMLResponse)
 def add_student_view(school_id: int, request: Request):
+    # This route had no session check at all before — anyone who knew or
+    # guessed the URL could view the registration form for any school
+    # without even being logged in. require_school_session (not admin-
+    # only) since class teachers can now register students too.
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT is_single_stream FROM school_settings WHERE school_id = %s;", (school_id,))
@@ -4599,6 +4623,32 @@ def add_student_view(school_id: int, request: Request):
             # app, ordered by id so grades stay in their natural sequence.
             cur.execute("SELECT id, grade_name, education_level FROM classes ORDER BY id ASC;")
             all_classes = cur.fetchall()
+
+            # A class (homeroom) teacher can register students into their
+            # own class(es) — e.g. ECDE learners registered by their PP1/
+            # PP2 teacher — but only those classes, not the whole school.
+            # Admins are never restricted here.
+            viewer = get_current_session_user(request)
+            is_restricted_staff = bool(viewer and viewer.get('role') == 'staff')
+            registerable_class_ids = None
+            if is_restricted_staff:
+                registerable_class_ids = get_teacher_registerable_class_ids(cur, school_id, viewer['id'])
+                all_classes = [c for c in all_classes if c['id'] in registerable_class_ids]
+
+    if is_restricted_staff and not all_classes:
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Add New Student Record</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+        <body class="bg-slate-100 flex items-center justify-center min-h-screen p-4">
+            <div class="bg-white p-8 rounded-2xl border shadow-md max-w-sm text-center space-y-2">
+                <p class="text-3xl">🏫</p>
+                <h2 class="text-base font-black text-slate-800">Not a Class Teacher Yet</h2>
+                <p class="text-xs text-slate-500">You aren't set as the class (homeroom) teacher for any grade yet, so there's no class to register a new student into. Ask your admin to assign you as a class teacher first.</p>
+            </div>
+        </body>
+        </html>
+        """)
 
     stream_field_html = (
         "<div class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500'>ℹ️ This school is in <b>Single Stream Mode</b> — no stream assignment is needed.</div>"
@@ -6074,6 +6124,26 @@ def backend_add_student(
     class_id: int = Form(...), 
     stream: str = Form(None)
 ):
+    # This route had no session check at all before — anyone who knew or
+    # guessed the URL could register a student into any school without
+    # even being logged in.
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    # Server-side enforcement matching the GET form's restriction — a
+    # class teacher can only register students into their own class(es),
+    # e.g. a PP1/PP2 teacher registering ECDE learners. A request can
+    # always be crafted by hand, so this must be checked here too, not
+    # just hidden in the UI. Admins are never restricted by this.
+    viewer = get_current_session_user(request)
+    if viewer and viewer.get('role') == 'staff':
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                registerable_class_ids = get_teacher_registerable_class_ids(cur, school_id, viewer['id'])
+        if class_id not in registerable_class_ids:
+            raise HTTPException(status_code=403, detail="You aren't the class teacher for that grade. Ask your admin to assign you as its class teacher first.")
+
     # Clean up the string input value
     raw_stream = stream.strip().upper() if stream else ""
     
