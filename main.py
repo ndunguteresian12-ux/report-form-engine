@@ -753,6 +753,33 @@ def bootstrap_database_schema():
                 );
                 ALTER TABLE students ADD COLUMN IF NOT EXISTS middle_name VARCHAR(100);
 
+                -- One row per "Advance All Classes" run — lets a super
+                -- admin precisely undo a school's accidental promotion,
+                -- rather than blindly shifting every student back a grade
+                -- (which would incorrectly demote students who were
+                -- already in that grade before the promotion, not moved
+                -- there by it).
+                CREATE TABLE IF NOT EXISTS class_promotion_history (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    performed_at TIMESTAMP DEFAULT NOW(),
+                    performed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    old_active_term VARCHAR(20),
+                    old_active_year INTEGER,
+                    new_active_term VARCHAR(20),
+                    new_active_year INTEGER,
+                    reverted_at TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS class_promotion_history_students (
+                    id SERIAL PRIMARY KEY,
+                    history_id INTEGER REFERENCES class_promotion_history(id) ON DELETE CASCADE,
+                    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+                    old_class_id INTEGER,
+                    old_status VARCHAR(30),
+                    new_class_id INTEGER,
+                    new_status VARCHAR(30)
+                );
+
                 CREATE TABLE IF NOT EXISTS learning_areas (
                     id SERIAL PRIMARY KEY,
                     education_level VARCHAR(100) NOT NULL,
@@ -1985,7 +2012,9 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         trend_chart_html = f"""
         <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">
             <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">📈 Performance Trend This Term</h2>
-            <canvas id="dashTrendChart" height="70"></canvas>
+            <div class="relative h-48">
+                <canvas id="dashTrendChart"></canvas>
+            </div>
         </div>
         """
         trend_chart_script = f"""
@@ -2798,6 +2827,167 @@ def delete_platform_announcement(announcement_id: int, request: Request):
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
 
 
+@app.get("/superadmin/school/{school_id}", response_class=HTMLResponse)
+def superadmin_school_detail(school_id: int, request: Request, undone: str = None):
+    """Per-school management page for Super Admin — staff contact details
+    (with phone numbers, for reaching a teacher directly) and the ability
+    to undo a school's most recent "Advance All Classes" run, in case it
+    was triggered by mistake."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("""
+                SELECT id, full_name, email, phone_number, tsc_number, role, is_verified
+                FROM users WHERE school_id = %s AND role IN ('admin', 'staff')
+                ORDER BY role ASC, full_name NULLS LAST, email ASC;
+            """, (school_id,))
+            all_users = cur.fetchall()
+
+            cur.execute("""
+                SELECT id, performed_at, old_active_term, old_active_year, new_active_term, new_active_year, reverted_at,
+                       (SELECT COUNT(*) FROM class_promotion_history_students WHERE history_id = class_promotion_history.id) AS student_count
+                FROM class_promotion_history
+                WHERE school_id = %s
+                ORDER BY performed_at DESC LIMIT 5;
+            """, (school_id,))
+            promotion_runs = cur.fetchall()
+
+    admins = [u for u in all_users if u['role'] == 'admin']
+    staff = [u for u in all_users if u['role'] == 'staff']
+
+    def _contact_row(u):
+        phone_html = f"<a href='tel:{esc(u['phone_number'])}' class='hover:underline text-slate-700'>📞 {esc(u['phone_number'])}</a>" if u['phone_number'] else "<span class='text-slate-300 italic'>No phone on file</span>"
+        verified_badge = "" if u['is_verified'] else "<span class='text-[10px] font-bold text-amber-600 ml-2'>(not yet activated)</span>"
+        return f"""
+        <tr class="border-b border-slate-50 text-sm">
+            <td class="p-3 font-semibold text-slate-800">{esc(u['full_name'] or '—')}{verified_badge}</td>
+            <td class="p-3 text-xs text-slate-500"><a href="mailto:{esc(u['email'])}" class="hover:underline">{esc(u['email'])}</a></td>
+            <td class="p-3 text-xs">{phone_html}</td>
+            <td class="p-3 text-xs text-slate-400">{esc(u['tsc_number'] or '—')}</td>
+        </tr>
+        """
+
+    admin_rows_html = "".join(_contact_row(u) for u in admins) or "<tr><td colspan='4' class='p-4 text-center text-slate-400 italic text-xs'>No admin account found.</td></tr>"
+    staff_rows_html = "".join(_contact_row(u) for u in staff) or "<tr><td colspan='4' class='p-4 text-center text-slate-400 italic text-xs'>No staff accounts yet.</td></tr>"
+
+    promotion_html = ""
+    most_recent = promotion_runs[0] if promotion_runs else None
+    if most_recent and not most_recent['reverted_at']:
+        promotion_html = f"""
+        <div class="bg-white rounded-2xl border border-amber-200 shadow-xs p-5">
+            <h2 class="text-sm font-black text-amber-700 mb-1">🔄 Undo Last Class Promotion</h2>
+            <p class="text-xs text-slate-500 mb-3">
+                {esc(str(most_recent['student_count']))} student(s) were advanced on {most_recent['performed_at'].strftime('%d %b %Y, %H:%M')}
+                {f"(term/year rolled from {esc(most_recent['old_active_term'])} {most_recent['old_active_year']} to {esc(most_recent['new_active_term'])} {most_recent['new_active_year']})" if most_recent['old_active_term'] else ""}.
+            </p>
+            <p class="text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mb-3">
+                ⚠️ This restores every affected student's class and status, and rolls the term/year setting back — but does <b>not</b> reverse any fee balance carried forward as part of that same promotion. Check the school's finance module afterward if fee balances need a manual correction too.
+            </p>
+            <form action="/api/v1/superadmin/school/{school_id}/undo-last-promotion/{most_recent['id']}" method="post" onsubmit="return confirm('Undo this promotion for {esc(school['name'])}? This restores every affected student\\'s class/status and the old term/year setting. This cannot itself be undone.');">
+                <button type="submit" class="w-full bg-amber-500 hover:bg-amber-600 text-white text-sm font-bold py-2.5 rounded-xl transition">Undo This Promotion</button>
+            </form>
+        </div>
+        """
+    elif most_recent and most_recent['reverted_at']:
+        promotion_html = f"""
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-xs p-5">
+            <h2 class="text-sm font-black text-slate-600 mb-1">🔄 Class Promotion History</h2>
+            <p class="text-xs text-slate-400">Most recent promotion ({esc(str(most_recent['student_count']))} student(s), {most_recent['performed_at'].strftime('%d %b %Y')}) was already undone on {most_recent['reverted_at'].strftime('%d %b %Y, %H:%M')}.</p>
+        </div>
+        """
+    else:
+        promotion_html = """
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-xs p-5">
+            <h2 class="text-sm font-black text-slate-600 mb-1">🔄 Class Promotion History</h2>
+            <p class="text-xs text-slate-400">No "Advance All Classes" run recorded yet for this school.</p>
+        </div>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | {esc(school['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-3xl mx-auto space-y-4">
+            <a href="/superadmin/dashboard" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to All Schools</a>
+            <div class="bg-white rounded-2xl border shadow-xs p-6">
+                <h1 class="text-lg font-black text-slate-800">{esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">{esc(school['sub_county'])}</p>
+            </div>
+
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2.5 rounded-xl'>✅ Promotion undone successfully.</div>" if undone else ""}
+
+            {promotion_html}
+
+            <div class="bg-white rounded-2xl border shadow-xs p-5">
+                <h2 class="text-sm font-black text-slate-800 mb-3">👤 Admin Contact</h2>
+                <table class="w-full text-left border-collapse">
+                    <thead><tr class="border-b-2 text-[11px] uppercase text-slate-400"><th class="p-3">Name</th><th class="p-3">Email</th><th class="p-3">Phone</th><th class="p-3">TSC No.</th></tr></thead>
+                    <tbody>{admin_rows_html}</tbody>
+                </table>
+            </div>
+
+            <div class="bg-white rounded-2xl border shadow-xs p-5">
+                <h2 class="text-sm font-black text-slate-800 mb-3">🧑‍🏫 Teachers / Staff ({len(staff)})</h2>
+                <table class="w-full text-left border-collapse">
+                    <thead><tr class="border-b-2 text-[11px] uppercase text-slate-400"><th class="p-3">Name</th><th class="p-3">Email</th><th class="p-3">Phone</th><th class="p-3">TSC No.</th></tr></thead>
+                    <tbody>{staff_rows_html}</tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/api/v1/superadmin/school/{school_id}/undo-last-promotion/{history_id}")
+def undo_last_promotion(school_id: int, history_id: int, request: Request):
+    """Restores every student a specific "Advance All Classes" run
+    touched back to their exact prior class/status, and rolls the term/
+    year setting back — using the precise per-student snapshot taken at
+    promotion time, never a blind "shift everyone back a grade" (which
+    would incorrectly affect students who were already in a grade before
+    that promotion, not moved there by it). Does not reverse any fee
+    carry-forward from the same run — that's flagged clearly to the
+    super admin on the page, not silently skipped."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM class_promotion_history WHERE id = %s AND school_id = %s;", (history_id, school_id))
+            history_row = cur.fetchone()
+            if not history_row:
+                raise HTTPException(status_code=404, detail="Promotion record not found.")
+            if history_row['reverted_at']:
+                raise HTTPException(status_code=400, detail="This promotion has already been undone.")
+
+            cur.execute("SELECT student_id, old_class_id, old_status FROM class_promotion_history_students WHERE history_id = %s;", (history_id,))
+            affected = cur.fetchall()
+
+            for row in affected:
+                cur.execute("UPDATE students SET class_id = %s, status = %s WHERE id = %s;", (row['old_class_id'], row['old_status'], row['student_id']))
+
+            if history_row['old_active_term'] and history_row['old_active_year']:
+                cur.execute("UPDATE school_settings SET active_term = %s, active_year = %s WHERE school_id = %s;", (history_row['old_active_term'], history_row['old_active_year'], school_id))
+
+            cur.execute("UPDATE class_promotion_history SET reverted_at = NOW() WHERE id = %s;", (history_id,))
+            conn.commit()
+            log_audit_action(cur, request, school_id, "classes_promotion_undone", f"Super admin undid promotion history id {history_id} — {len(affected)} student(s) restored")
+            conn.commit()
+
+    return RedirectResponse(url=f"/superadmin/school/{school_id}?undone=1", status_code=303)
+
+
 @app.get("/superadmin/school/reset-admin-password/{school_id}", response_class=HTMLResponse)
 def superadmin_reset_admin_password_form(school_id: int, request: Request, done: str = None):
     auth_error = require_superadmin_session(request)
@@ -3123,14 +3313,18 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
     subject_chart_html = "".join(f"""
         <div class="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs">
             <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📈 {esc(chart['grade_name'])} — Subject Performance Milestones ({esc(st['active_term'])})</h3>
-            <canvas id="subjectMilestoneChart{i}" height="90"></canvas>
+            <div class="relative h-48">
+                <canvas id="subjectMilestoneChart{i}"></canvas>
+            </div>
         </div>
         """ for i, chart in enumerate(subject_charts))
 
     stream_charts_html = "".join(f"""
         <div class="bg-white border border-slate-200/80 p-5 rounded-2xl shadow-xs">
             <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📊 {esc(chart['grade_name'])} — Stream Comparison ({esc(st['active_term'])})</h3>
-            <canvas id="streamChart{i}" height="90"></canvas>
+            <div class="relative h-48">
+                <canvas id="streamChart{i}"></canvas>
+            </div>
         </div>
         """ for i, chart in enumerate(stream_comparison_charts))
 
@@ -3146,7 +3340,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                     borderColor: ['#4f46e5','#059669','#d97706','#dc2626','#0891b2','#7c3aed','#db2777'][i % 7],
                     backgroundColor: ['#4f46e5','#059669','#d97706','#dc2626','#0891b2','#7c3aed','#db2777'][i % 7],
                 }})) }},
-                options: {{ responsive: true, scales: {{ y: {{ beginAtZero: true, max: 100, title: {{ display: true, text: 'Average Mark' }} }} }}, plugins: {{ legend: {{ position: 'bottom' }} }} }}
+                options: {{ responsive: true, maintainAspectRatio: false, scales: {{ y: {{ beginAtZero: true, max: 100, title: {{ display: true, text: 'Average Mark' }} }} }}, plugins: {{ legend: {{ position: 'bottom' }} }} }}
             }});
             """)
         for i, chart in enumerate(stream_comparison_charts):
@@ -3158,7 +3352,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                     borderColor: ['#4f46e5','#059669','#d97706','#dc2626'][i % 4],
                     backgroundColor: ['#4f46e5','#059669','#d97706','#dc2626'][i % 4],
                 }})) }},
-                options: {{ responsive: true, scales: {{ y: {{ beginAtZero: true, max: 100, title: {{ display: true, text: 'Average Mark' }} }} }}, plugins: {{ legend: {{ position: 'bottom' }} }} }}
+                options: {{ responsive: true, maintainAspectRatio: false, scales: {{ y: {{ beginAtZero: true, max: 100, title: {{ display: true, text: 'Average Mark' }} }} }}, plugins: {{ legend: {{ position: 'bottom' }} }} }}
             }});
             """)
         milestone_charts_script = f"""
@@ -6520,6 +6714,7 @@ def promote_school_classes(school_id: int, request: Request):
             # instead of the grade they were actually billed at.
             cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
+            old_term, old_year, next_term, next_year = None, None, None, None
             if settings_row:
                 old_term, old_year = settings_row[0], settings_row[1]
                 from finance_routes import run_carry_forward_balances, _next_term_year
@@ -6546,6 +6741,44 @@ def promote_school_classes(school_id: int, request: Request):
                 # anyone clicking things in a particular order.
                 cur.execute("UPDATE school_settings SET active_term = %s, active_year = %s WHERE school_id = %s;", (next_term, next_year, school_id))
                 conn.commit()
+
+            # --- Snapshot every student about to be affected, BEFORE any
+            # changes are made. This is what lets a super admin precisely
+            # undo this exact run later if a school triggers it by
+            # mistake — restoring exactly the students this run actually
+            # touched, rather than blindly shifting everyone back a grade
+            # (which would incorrectly demote students who were already
+            # in that grade before this promotion, not moved there by
+            # it). Note: this snapshot does NOT capture the fee carry-
+            # forward above — undoing a promotion restores class
+            # assignments and the term/year setting, but any fee balances
+            # already carried forward need a separate manual check. ---
+            cur.execute("""
+                SELECT id, class_id, status FROM students
+                WHERE school_id = %s AND class_id BETWEEN 1 AND 9
+                  AND (status IS NULL OR status != 'GRADUATED');
+            """, (school_id,))
+            affected_students = cur.fetchall()
+
+            performed_by = request.cookies.get("session_user_id")
+            cur.execute("""
+                INSERT INTO class_promotion_history (school_id, performed_by_user_id, old_active_term, old_active_year, new_active_term, new_active_year)
+                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
+            """, (school_id, performed_by, old_term, old_year, next_term, next_year))
+            history_id = cur.fetchone()[0]
+
+            for student_id, current_class_id, current_status in affected_students:
+                if current_class_id == 9:
+                    new_class_id, new_status = None, 'GRADUATED'
+                else:
+                    new_class_id, new_status = promotion_map.get(current_class_id), current_status
+                cur.execute("""
+                    INSERT INTO class_promotion_history_students (history_id, student_id, old_class_id, old_status, new_class_id, new_status)
+                    VALUES (%s, %s, %s, %s, %s, %s);
+                """, (history_id, student_id, current_class_id, current_status, new_class_id, new_status))
+            conn.commit()
+            log_audit_action(cur, request, school_id, "classes_advanced", f"{len(affected_students)} student(s) advanced — history id {history_id}, reversible by super admin")
+            conn.commit()
 
             # Step 1: Safely graduate Grade 9 out of the active pool
             cur.execute("""
