@@ -606,9 +606,66 @@ def bootstrap_timetable_schema():
                 print(f"[timetable multi-plan migration] Backfill failed: {e}")
 
 
-def get_school_days(cur, school_id: int):
-    """Returns the school's active weekdays in order, e.g.
-    ['Monday', ..., 'Friday']. Defaults to a 5-day week."""
+def resolve_plan_id(cur, school_id: int, education_level: str, plan_id_param: int = None) -> int:
+    """The single source of truth for "which plan are we actually working
+    on" across every plan-aware route. If plan_id_param is given (the
+    admin explicitly selected a plan on the page), it's used after
+    confirming it genuinely belongs to this school+level. Otherwise
+    resolves to whichever plan is currently marked active — the same
+    thing every route did implicitly before plans existed, so any link
+    or bookmark with no plan_id at all keeps working exactly as before.
+    If somehow no plan exists yet for this school+level (shouldn't
+    happen after the migration, but this is a genuine safety net, not a
+    decoration), one is created on the fly."""
+    if plan_id_param:
+        cur.execute("SELECT id FROM timetable_plans WHERE id = %s AND school_id = %s AND education_level = %s;", (plan_id_param, school_id, education_level))
+        row = cur.fetchone()
+        if row:
+            return row[0] if not isinstance(row, dict) else row['id']
+
+    cur.execute("SELECT id FROM timetable_plans WHERE school_id = %s AND education_level = %s AND is_active = TRUE LIMIT 1;", (school_id, education_level))
+    row = cur.fetchone()
+    if row:
+        return row[0] if not isinstance(row, dict) else row['id']
+
+    cur.execute("""
+        INSERT INTO timetable_plans (school_id, education_level, name, active_days, is_active)
+        VALUES (%s, %s, 'Main Timetable', 'Monday,Tuesday,Wednesday,Thursday,Friday', TRUE) RETURNING id;
+    """, (school_id, education_level))
+    new_row = cur.fetchone()
+    return new_row[0] if not isinstance(new_row, dict) else new_row['id']
+
+
+def get_plan_options_html(cur, school_id: int, education_level: str, current_plan_id: int) -> str:
+    """The plan-switcher dropdown shown at the top of every plan-aware
+    page — lets an admin actually pick a specific (possibly non-active)
+    plan to work on, which is the whole point of plans existing."""
+    cur.execute("SELECT id, name, is_active FROM timetable_plans WHERE school_id = %s AND education_level = %s ORDER BY is_active DESC, created_at ASC;", (school_id, education_level))
+    plans = cur.fetchall()
+    options = "".join(
+        f"<option value='{p['id']}' {'selected' if p['id'] == current_plan_id else ''}>{esc(p['name'])}{' (Active)' if p['is_active'] else ' (Draft)'}</option>"
+        for p in plans
+    )
+    return options
+
+
+def get_school_days(cur, school_id: int, plan_id: int = None):
+    """Returns the days in order for a specific plan, e.g.
+    ['Monday', ..., 'Friday'] — or ['Saturday', 'Sunday'] for a custom
+    weekend plan. When plan_id is given, reads that plan's own
+    active_days — the real per-plan custom day list. Callers that don't
+    pass plan_id (not yet updated to be plan-aware) fall back to the old
+    school-wide days_per_week setting, exactly as before — so nothing
+    breaks for a route this pass didn't get to yet, it just doesn't see
+    per-plan custom days until it's updated too."""
+    if plan_id:
+        cur.execute("SELECT active_days FROM timetable_plans WHERE id = %s;", (plan_id,))
+        row = cur.fetchone()
+        if row:
+            active_days_str = row['active_days'] if isinstance(row, dict) else row[0]
+            if active_days_str:
+                return [d.strip() for d in active_days_str.split(",") if d.strip()]
+
     try:
         cur.execute("SELECT days_per_week FROM timetable_settings WHERE school_id = %s;", (school_id,))
         row = cur.fetchone()
@@ -619,7 +676,16 @@ def get_school_days(cur, school_id: int):
     return all_days[:max(1, min(6, days_per_week))]
 
 
-def get_periods_for_level(cur, school_id: int, education_level: str):
+def get_periods_for_level(cur, school_id: int, education_level: str, plan_id: int = None):
+    if plan_id:
+        cur.execute("""
+            SELECT * FROM timetable_periods
+            WHERE school_id = %s AND education_level = %s AND plan_id = %s
+            ORDER BY period_order ASC;
+        """, (school_id, education_level, plan_id))
+        return cur.fetchall()  # correctly empty for a genuinely new plan with no periods yet — never falls back to another plan's data
+    # Only reached when no plan_id was given at all (a caller not yet
+    # updated to be plan-aware) — the old, plan-agnostic query.
     cur.execute("""
         SELECT * FROM timetable_periods
         WHERE school_id = %s AND education_level = %s
@@ -1334,7 +1400,7 @@ def validate_timetable_setup(cur, school_id: int, grade_name: str, education_lev
 # ============================================================
 
 @router.get("/timetable/periods/{school_id}", response_class=HTMLResponse)
-def timetable_periods_view(school_id: int, request: Request, education_level: str = "Lower Primary"):
+def timetable_periods_view(school_id: int, request: Request, education_level: str = "Lower Primary", plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -1346,19 +1412,18 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
-            cur.execute("SELECT days_per_week FROM timetable_settings WHERE school_id = %s;", (school_id,))
-            settings_row = cur.fetchone()
-            days_per_week = settings_row['days_per_week'] if settings_row else 5
+            resolved_plan_id = resolve_plan_id(cur, school_id, education_level, plan_id)
+            cur.execute("SELECT name, active_days FROM timetable_plans WHERE id = %s;", (resolved_plan_id,))
+            plan_row = cur.fetchone()
+            plan_options_html = get_plan_options_html(cur, school_id, education_level, resolved_plan_id)
+            current_days = set((plan_row['active_days'] or "").split(",")) if plan_row else set()
 
-            cur.execute(
-                "SELECT * FROM timetable_periods WHERE school_id = %s AND education_level = %s ORDER BY period_order ASC;",
-                (school_id, education_level)
-            )
-            periods = cur.fetchall()
+            periods = get_periods_for_level(cur, school_id, education_level, resolved_plan_id)
 
-    days_options = "".join(
-        f"<option value='{n}' {'selected' if n == days_per_week else ''}>{n} days ({', '.join(ALL_POSSIBLE_DAYS[:n])})</option>"
-        for n in range(1, 7)
+    all_seven_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    day_checkboxes = "".join(
+        f"<label class='flex items-center gap-1.5 text-xs font-semibold text-slate-600'><input type='checkbox' name='days' value='{d}' {'checked' if d in current_days else ''}> {d}</label>"
+        for d in all_seven_days
     )
 
     level_tabs = "".join(
@@ -1390,7 +1455,7 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
                 <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border {badge_class}">{row_type}</span>
             </td>
             <td class="p-2.5 text-right">
-                <form action="/api/v1/timetable/periods/delete/{school_id}/{p['id']}" method="post" onsubmit="return confirm('Delete period \\'{esc(p['label'])}\\'? Any timetable slots using it will be cleared too.');">
+                <form action="/api/v1/timetable/periods/delete/{school_id}/{p['id']}?plan_id={resolved_plan_id}" method="post" onsubmit="return confirm('Delete period \\'{esc(p['label'])}\\'? Any timetable slots using it will be cleared too.');">
                     <button type="submit" class="text-rose-600 hover:text-rose-800 text-xs font-bold">Delete</button>
                 </form>
             </td>
@@ -1415,12 +1480,21 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
         </header>
 
         <div class="p-4 sm:p-8 max-w-4xl mx-auto space-y-6">
+            <div class="bg-indigo-50 border border-indigo-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+                <label class="text-xs font-bold text-indigo-800 shrink-0">📋 Working on plan:</label>
+                <form method="get" action="/timetable/periods/{school_id}" class="flex-1 flex gap-2">
+                    <input type="hidden" name="education_level" value="{esc(education_level)}">
+                    <select name="plan_id" onchange="this.form.submit()" class="flex-1 border border-indigo-200 bg-white p-2 rounded-xl text-xs font-semibold">{plan_options_html}</select>
+                </form>
+                <a href="/timetable/plans/{school_id}" class="text-[11px] font-bold text-indigo-700 hover:underline whitespace-nowrap">Manage Plans →</a>
+            </div>
+
             <div class="bg-white p-5 sm:p-6 rounded-2xl border shadow-xs">
-                <h2 class="text-sm font-bold text-slate-800 mb-3">Number of Teaching Days</h2>
-                <p class="text-xs text-slate-400 mb-3">This applies school-wide, across every level.</p>
-                <form action="/api/v1/timetable/periods/days/{school_id}" method="post" class="flex flex-col sm:flex-row gap-3">
-                    <select name="days_per_week" class="flex-1 border p-2.5 rounded-xl text-sm font-medium">{days_options}</select>
-                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">Save</button>
+                <h2 class="text-sm font-bold text-slate-800 mb-1">Days for "{esc(plan_row['name'] if plan_row else 'this plan')}"</h2>
+                <p class="text-xs text-slate-400 mb-3">Pick any combination — this is specific to this one plan, so a weekend plan can run on just Saturday + Sunday while your normal weekday plan is untouched.</p>
+                <form action="/api/v1/timetable/periods/days/{school_id}?education_level={urllib.parse.quote(education_level)}&plan_id={resolved_plan_id}" method="post" class="flex flex-col gap-3">
+                    <div class="flex flex-wrap gap-3 bg-slate-50 p-3 rounded-xl">{day_checkboxes}</div>
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition self-start">Save Days</button>
                 </form>
             </div>
 
@@ -1443,11 +1517,12 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
                                 <th class="p-2.5">Start</th><th class="p-2.5">End</th><th class="p-2.5 text-center">Type</th><th class="p-2.5"></th>
                             </tr>
                         </thead>
-                        <tbody>{period_rows or "<tr><td colspan='7' class='text-center p-6 text-slate-400 italic text-xs'>No periods configured yet for this level — add the first one below.</td></tr>"}</tbody>
+                        <tbody>{period_rows or "<tr><td colspan='7' class='text-center p-6 text-slate-400 italic text-xs'>No periods configured yet for this plan/level — add the first one below.</td></tr>"}</tbody>
                     </table>
                 </div>
                 <form action="/api/v1/timetable/periods/add/{school_id}" method="post" class="p-5 sm:p-6 bg-slate-50/50 border-t grid grid-cols-1 sm:grid-cols-6 gap-3">
                     <input type="hidden" name="education_level" value="{esc(education_level)}">
+                    <input type="hidden" name="plan_id" value="{resolved_plan_id}">
                     <div class="sm:col-span-2">
                         <label class="text-[11px] font-bold text-slate-500">Name</label>
                         <input type="text" name="label" placeholder="e.g. Period 1, Short Break" class="w-full border p-2 rounded-lg mt-1 text-sm" required>
@@ -1485,21 +1560,27 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
 
 
 @router.post("/api/v1/timetable/periods/days/{school_id}")
-def save_timetable_days(school_id: int, request: Request, days_per_week: int = Form(...)):
+async def save_timetable_days(school_id: int, request: Request, education_level: str, plan_id: int):
+    """Saves this ONE plan's own day selection — any combination of the
+    7 real days, not the old school-wide "count from Monday" model. A
+    weekend plan and a normal weekday plan can each have their own
+    completely independent day list."""
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
 
-    days_per_week = max(1, min(6, days_per_week))
+    form_data = await request.form()
+    days_selected = form_data.getlist("days")
+    all_days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    ordered_days = [d for d in all_days_order if d in days_selected]
+    active_days_str = ",".join(ordered_days) if ordered_days else "Monday,Tuesday,Wednesday,Thursday,Friday"
+
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO timetable_settings (school_id, days_per_week) VALUES (%s, %s)
-                ON CONFLICT (school_id) DO UPDATE SET days_per_week = EXCLUDED.days_per_week;
-            """, (school_id, days_per_week))
+            cur.execute("UPDATE timetable_plans SET active_days = %s, updated_at = NOW() WHERE id = %s AND school_id = %s;", (active_days_str, plan_id, school_id))
             conn.commit()
 
-    return RedirectResponse(url=f"/timetable/periods/{school_id}", status_code=303)
+    return RedirectResponse(url=f"/timetable/periods/{school_id}?education_level={urllib.parse.quote(education_level)}&plan_id={plan_id}", status_code=303)
 
 
 @router.post("/api/v1/timetable/periods/add/{school_id}")
@@ -1512,6 +1593,7 @@ def add_timetable_period(
     start_time: str = Form(...),
     end_time: str = Form(...),
     period_type: str = Form("teaching"),
+    plan_id: int = Form(...),
 ):
     auth_error = require_school_session(request, school_id)
     if auth_error:
@@ -1528,21 +1610,21 @@ def add_timetable_period(
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COALESCE(MAX(period_order), 0) + 1 AS next_order FROM timetable_periods WHERE school_id = %s AND education_level = %s;",
-                (school_id, education_level)
+                "SELECT COALESCE(MAX(period_order), 0) + 1 AS next_order FROM timetable_periods WHERE school_id = %s AND education_level = %s AND plan_id = %s;",
+                (school_id, education_level, plan_id)
             )
             next_order = cur.fetchone()[0]
             cur.execute("""
-                INSERT INTO timetable_periods (school_id, education_level, period_order, label, short_label, start_time, end_time, is_teaching_period, period_type)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
-            """, (school_id, education_level, next_order, label, short_label, start_time, end_time, is_teaching_period, period_type))
+                INSERT INTO timetable_periods (school_id, education_level, period_order, label, short_label, start_time, end_time, is_teaching_period, period_type, plan_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+            """, (school_id, education_level, next_order, label, short_label, start_time, end_time, is_teaching_period, period_type, plan_id))
             conn.commit()
 
-    return RedirectResponse(url=f"/timetable/periods/{school_id}?education_level={urllib.parse.quote(education_level)}", status_code=303)
+    return RedirectResponse(url=f"/timetable/periods/{school_id}?education_level={urllib.parse.quote(education_level)}&plan_id={plan_id}", status_code=303)
 
 
 @router.post("/api/v1/timetable/periods/delete/{school_id}/{period_id}")
-def delete_timetable_period(school_id: int, period_id: int, request: Request):
+def delete_timetable_period(school_id: int, period_id: int, request: Request, plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -1556,7 +1638,7 @@ def delete_timetable_period(school_id: int, period_id: int, request: Request):
             cur.execute("DELETE FROM timetable_periods WHERE id = %s AND school_id = %s;", (period_id, school_id))
             conn.commit()
 
-    return RedirectResponse(url=f"/timetable/periods/{school_id}?education_level={urllib.parse.quote(level)}", status_code=303)
+    return RedirectResponse(url=f"/timetable/periods/{school_id}?education_level={urllib.parse.quote(level)}" + (f"&plan_id={plan_id}" if plan_id else ""), status_code=303)
 
 
 
