@@ -419,6 +419,17 @@ def bootstrap_timetable_schema():
                 ("subject_availability", ["school_id", "learning_area_id", "day_of_week", "period_id"], ["school_id", "learning_area_id", "day_of_week", "period_id", "plan_id"]),
                 ("subject_sync_rules", ["school_id", "learning_area_id"], ["school_id", "learning_area_id", "plan_id"]),
                 ("timetable_generation_issues", ["school_id", "grade_name", "education_level", "stream"], ["school_id", "grade_name", "education_level", "stream", "plan_id"]),
+                # This one wasn't in the original table catalog used to
+                # plan this migration — it turned out to have a real,
+                # already-deployed UNIQUE(school_id, education_level, name)
+                # constraint on the live database that didn't show up
+                # anywhere in this file's own CREATE TABLE statement,
+                # discovered the hard way via a live "Save As" duplicate-
+                # key crash. _widen_unique_constraint finds a constraint by
+                # its actual columns, not by name or origin, so this
+                # correctly finds and widens it regardless of how or when
+                # it was originally created.
+                ("timetable_custom_subjects", ["school_id", "education_level", "name"], ["school_id", "education_level", "name", "plan_id"]),
             ]:
                 try:
                     _widen_unique_constraint(cur, tbl, old_cols, new_cols)
