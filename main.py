@@ -1888,20 +1888,24 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             cur.execute("SELECT message FROM platform_announcements WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 3;")
             active_announcements = cur.fetchall()
 
-            # School-wide average score per exam cycle, for the trend chart —
-            # one simple aggregate query, no per-student loop. Scoped to the
-            # currently active term/year specifically — otherwise this
-            # silently averages marks across every term ever entered.
+            # Performance trend, broken down by EDUCATION LEVEL rather
+            # than one flat school-wide number — one line per level
+            # (ECDE, Lower Primary, etc.), so an admin can actually see
+            # which part of the school is trending up or down, not just
+            # a single blended average that could hide real differences
+            # between levels.
             _dash_active_term = (settings['active_term'] if settings else None) or 'Term 1'
             _dash_active_year = (settings['active_year'] if settings else None) or 2026
             cur.execute("""
-                SELECT sc.cycle_name, AVG(sc.raw_score) AS avg_score, COUNT(DISTINCT sc.student_id) AS student_count
+                SELECT c.education_level, sc.cycle_name, AVG(sc.raw_score) AS avg_score
                 FROM student_scores sc
                 JOIN students s ON sc.student_id = s.id
+                JOIN classes c ON s.class_id = c.id
                 WHERE s.school_id = %s AND sc.term = %s AND sc.year = %s
-                GROUP BY sc.cycle_name;
+                  AND sc.cycle_name IN ('Opener', 'Midterm', 'End Term')
+                GROUP BY c.education_level, sc.cycle_name;
             """, (school_id, _dash_active_term, _dash_active_year))
-            trend_rows = {r['cycle_name']: r for r in cur.fetchall()}
+            level_trend_rows = cur.fetchall()
 
     if not school:
         raise HTTPException(status_code=404, detail="Institution Tenant Context Missed.")
@@ -1966,36 +1970,37 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         for a in active_announcements
     )
 
+    CYCLE_ORDER_DASH = ["Opener", "Midterm", "End Term"]
+    level_trend_series = {}  # education_level -> {cycle_name: avg_score}
+    for r in level_trend_rows:
+        level_trend_series.setdefault(r['education_level'], {})[r['cycle_name']] = float(r['avg_score'])
+
     trend_chart_html = ""
-    cycles_with_data = [c for c in ["Opener", "Midterm", "End Term"] if c in trend_rows]
-    if cycles_with_data:
-        bar_width = 100
-        gap = 40
-        chart_bars = ""
-        for i, cycle in enumerate(cycles_with_data):
-            avg = float(trend_rows[cycle]['avg_score'])
-            bar_height = max(4, (avg / 100) * 140)
-            x = 20 + i * (bar_width + gap)
-            chart_bars += f"""
-            <rect x="{x}" y="{160 - bar_height}" width="{bar_width}" height="{bar_height}" rx="6" fill="url(#trendGrad)" />
-            <text x="{x + bar_width/2}" y="{160 - bar_height - 8}" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e293b" font-family="'Plus Jakarta Sans',sans-serif">{avg:.1f}%</text>
-            <text x="{x + bar_width/2}" y="180" text-anchor="middle" font-size="11" fill="#64748b" font-family="'Plus Jakarta Sans',sans-serif">{cycle}</text>
-            """
-        chart_width = 20 + len(cycles_with_data) * (bar_width + gap)
+    trend_chart_script = ""
+    if level_trend_series:
+        trend_datasets = [
+            {"label": level, "data": [cycles.get(cyc) for cyc in CYCLE_ORDER_DASH]}
+            for level, cycles in level_trend_series.items()
+        ]
         trend_chart_html = f"""
-        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5">
-            <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📈 Performance Trend This Term</h2>
-            <svg viewBox="0 0 {chart_width} 195" style="width:100%; max-width:480px; height:auto;">
-                <defs>
-                    <linearGradient id="trendGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-                        <stop offset="0%" stop-color="#4f46e5"/>
-                        <stop offset="100%" stop-color="#0d9488"/>
-                    </linearGradient>
-                </defs>
-                <line x1="10" y1="160" x2="{chart_width - 10}" y2="160" stroke="#e2e8f0" stroke-width="1"/>
-                {chart_bars}
-            </svg>
+        <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">
+            <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">📈 Performance Trend This Term</h2>
+            <canvas id="dashTrendChart" height="70"></canvas>
         </div>
+        """
+        trend_chart_script = f"""
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+        <script>
+        new Chart(document.getElementById('dashTrendChart'), {{
+            type: 'line',
+            data: {{ labels: {json.dumps(CYCLE_ORDER_DASH)}, datasets: {json.dumps(trend_datasets)}.map((d, i) => ({{
+                ...d, fill: false, tension: 0.3, borderWidth: 2, pointRadius: 3,
+                borderColor: ['#4f46e5','#059669','#d97706','#db2777'][i % 4],
+                backgroundColor: ['#4f46e5','#059669','#d97706','#db2777'][i % 4],
+            }})) }},
+            options: {{ responsive: true, maintainAspectRatio: false, scales: {{ y: {{ beginAtZero: true, max: 100 }} }}, plugins: {{ legend: {{ position: 'bottom', labels: {{ boxWidth: 10, font: {{ size: 10 }} }} }} }} }}
+        }});
+        </script>
         """
 
     def _stat_card(label, value, accent_hex, sub=None):
@@ -2173,6 +2178,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             <div class="flex items-center flex-wrap gap-2 text-xs font-semibold">
                 <span class="{('bg-gradient-to-r from-emerald-500 to-emerald-600' if school.get('subscription_expires_at') and school['subscription_expires_at'] > datetime.now() else 'bg-gradient-to-r from-rose-500 to-rose-600') if BILLING_ENFORCED else 'bg-gradient-to-r from-slate-500 to-slate-600'} text-white px-3 py-2 rounded-xl shadow-xs">{(('✅ Active until ' + school['subscription_expires_at'].strftime('%d %b %Y')) if school.get('subscription_expires_at') and school['subscription_expires_at'] > datetime.now() else '⚠️ No active subscription') if BILLING_ENFORCED else '💳 Subscriptions launching soon'}</span>
                 <span class="bg-gradient-to-r from-violet-500 to-violet-600 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
+                <a href="/admin/school-settings/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">⚙️ School Settings</a>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📅 Timetable</a>
                 <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
                 <a href="/admin/audit-log/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📋 Activity Log</a>
@@ -2192,6 +2198,9 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
 
             <!-- ============ LEFT SIDEBAR ============ -->
             <aside class="w-full lg:w-80 shrink-0 lg:sticky lg:top-[73px] lg:h-[calc(100vh-73px)] lg:overflow-y-auto bg-indigo-950 px-5 py-6 space-y-6">
+
+                <!-- Settings (moved to the top so it's never buried below other sections) -->
+                <a href="/admin/school-settings/{school_id}" class="block text-center w-full bg-amber-400 hover:bg-amber-300 text-indigo-950 text-xs py-2.5 rounded-xl font-bold transition shadow-xs mb-2">⚙️ School Settings &amp; Advance Classes →</a>
 
                 <!-- Classes quick nav -->
                 <div>
@@ -2239,82 +2248,6 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 </div>
 
                 <!-- Settings -->
-                <div class="pt-5 border-t border-white/10">
-                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5 mb-2.5">
-                        <span class="w-2 h-2 rounded-full bg-slate-400"></span> Settings
-                    </h2>
-                    <div class="bg-white rounded-xl p-3">
-                    <form action="/api/v1/settings/update/{school_id}" method="post" class="space-y-3">
-                        <div class="grid grid-cols-3 gap-2">
-                            <div>
-                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Active Year</label>
-                                <input type="number" name="active_year" value="{st.get('active_year') or 2026}" min="2020" max="2100" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
-                            </div>
-                            <div>
-                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Academic Term</label>
-                                <select name="active_term" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
-                                    <option value="Term 1" {"selected" if st['active_term'] == 'Term 1' else ""}>Term 1</option>
-                                    <option value="Term 2" {"selected" if st['active_term'] == 'Term 2' else ""}>Term 2</option>
-                                    <option value="Term 3" {"selected" if st['active_term'] == 'Term 3' else ""}>Term 3</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Assessment Phase</label>
-                                <select name="active_cycle" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
-                                    <option value="Opener" {"selected" if st['active_cycle'] == 'Opener' else ""}>Opener Exam</option>
-                                    <option value="Midterm" {"selected" if st['active_cycle'] == 'Midterm' else ""}>Midterm Exam</option>
-                                    <option value="End Term" {"selected" if st['active_cycle'] == 'End Term' else ""}>End Term Synthesis</option>
-                                </select>
-                            </div>
-                        </div>
-                        <p class="text-[10px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-2">⚠️ Marks are saved against whatever Year + Term + Assessment Phase are set here at the moment of saving. Double-check all three are correct before entering marks for a new term.</p>
-
-                        <div>
-                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Theme Branding Color</label>
-                            <select name="theme_color" class="w-full border border-slate-200 p-2 rounded-xl text-xs font-semibold bg-white outline-none focus:border-slate-400">
-                                <option value="emerald" {"selected" if school.get('theme_color') == 'emerald' else ""}>Emerald Dynamic Green</option>
-                                <option value="indigo" {"selected" if school.get('theme_color') == 'indigo' else ""}>Indigo Corporate Blue</option>
-                                <option value="slate" {"selected" if school.get('theme_color') == 'slate' else ""}>Slate Minimalistic Gray</option>
-                            </select>
-                        </div>
-
-                        <div class="bg-slate-50 p-3 rounded-xl border border-slate-100 flex items-center justify-between">
-                            <div>
-                                <label class="text-xs font-bold text-slate-800 block">Single Stream Mode</label>
-                                <span class="text-[10px] text-slate-400 block">Hides class sorting columns</span>
-                            </div>
-                            <input type="checkbox" name="is_single_stream" value="true" {"checked" if is_single_stream else ""} class="w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500 cursor-pointer">
-                        </div>
-
-                        <div>
-                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Head of Institution's Name</label>
-                            <input type="text" name="head_teacher_name" value="{esc(st.get('head_teacher_name') or '')}" placeholder="e.g. Jane Wanjiru" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
-                            <span class="text-[10px] text-slate-400 block mt-1">Printed on the report card signature block.</span>
-                        </div>
-
-                        <div class="grid grid-cols-2 gap-2">
-                            <div>
-                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Opening Date</label>
-                                <input type="date" name="opening_date" value="{esc(st['opening_date'])}" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
-                            </div>
-                            <div>
-                                <label class="text-[11px] font-semibold text-slate-500 block mb-1">Closing Date</label>
-                                <input type="date" name="closing_date" value="{esc(st['closing_date'])}" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
-                            </div>
-                        </div>
-                        <button type="submit" class="w-full bg-slate-800 hover:bg-slate-900 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">Commit Engine Settings</button>
-                    </form>
-
-                    <div class="mt-3 pt-3 border-t border-slate-100">
-                        <form action="/api/v1/school/promote-classes/{school_id}" method="post"
-                              onsubmit="return confirm('CRITICAL WARNING: Are you sure you want to promote all active student cohorts up 1 Grade Level? Grade 9 cohorts will safely move into Graduated Status.');">
-                            <button type="submit" class="w-full bg-amber-50 border border-amber-200/80 text-amber-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-amber-100/70 transition cursor-pointer">
-                                🔄 Advance All Classes 1 Year
-                            </button>
-                        </form>
-                    </div>
-                    </div>
-                </div>
             </aside>
 
             <!-- ============ CENTER: PERFORMANCE ANALYSIS & INTERACTIVE CARDS ============ -->
@@ -2336,6 +2269,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <p class="text-center text-[11px] text-slate-300 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-400">Elimu Hub</span></p>
             </main>
         </div>
+        {trend_chart_script}
     </body>
     </html>
     """)
@@ -5564,6 +5498,121 @@ def fix_mistagged_marks_apply(school_id: int, request: Request, from_term: str =
             conn.commit()
 
     return RedirectResponse(url=f"/admin/fix-mistagged-marks/{school_id}", status_code=303)
+
+
+@app.get("/admin/school-settings/{school_id}", response_class=HTMLResponse)
+def school_settings_page(school_id: int, request: Request):
+    """Standalone School Settings page — Commit Engine Settings and
+    Advance All Classes used to live buried at the bottom of the admin
+    dashboard's sidebar, well below several other sections. Both are
+    genuinely high-stakes actions (term/year drives which marks show up
+    where; advancing classes moves every student in the school), so they
+    now get their own page, reachable directly from the top bar and from
+    the very top of the sidebar, instead of requiring a scroll past
+    everything else to find them."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+            cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings = cur.fetchone()
+
+    st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'opening_date': '', 'closing_date': '', 'is_single_stream': False}
+    is_single_stream = st.get('is_single_stream', False)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | School Settings</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
+        <div class="max-w-xl mx-auto space-y-4">
+            <a href="/admin/dashboard/{school_id}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Dashboard</a>
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6">
+                <h2 class="text-lg font-black text-slate-800 mb-1">⚙️ School Settings</h2>
+                <p class="text-xs text-slate-400 mb-4">{esc(school['name'])}</p>
+                <form action="/api/v1/settings/update/{school_id}" method="post" class="space-y-3">
+                    <div class="grid grid-cols-3 gap-2">
+                        <div>
+                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Active Year</label>
+                            <input type="number" name="active_year" value="{st.get('active_year') or 2026}" min="2020" max="2100" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
+                        </div>
+                        <div>
+                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Academic Term</label>
+                            <select name="active_term" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
+                                <option value="Term 1" {"selected" if st['active_term'] == 'Term 1' else ""}>Term 1</option>
+                                <option value="Term 2" {"selected" if st['active_term'] == 'Term 2' else ""}>Term 2</option>
+                                <option value="Term 3" {"selected" if st['active_term'] == 'Term 3' else ""}>Term 3</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Assessment Phase</label>
+                            <select name="active_cycle" class="w-full border border-slate-200 bg-white p-2 rounded-xl text-xs font-semibold text-slate-800 outline-none focus:border-slate-400">
+                                <option value="Opener" {"selected" if st['active_cycle'] == 'Opener' else ""}>Opener Exam</option>
+                                <option value="Midterm" {"selected" if st['active_cycle'] == 'Midterm' else ""}>Midterm Exam</option>
+                                <option value="End Term" {"selected" if st['active_cycle'] == 'End Term' else ""}>End Term Synthesis</option>
+                            </select>
+                        </div>
+                    </div>
+                    <p class="text-[10px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-2">⚠️ Marks are saved against whatever Year + Term + Assessment Phase are set here at the moment of saving. Double-check all three are correct before entering marks for a new term.</p>
+
+                    <div>
+                        <label class="text-[11px] font-semibold text-slate-500 block mb-1">Theme Branding Color</label>
+                        <select name="theme_color" class="w-full border border-slate-200 p-2 rounded-xl text-xs font-semibold bg-white outline-none focus:border-slate-400">
+                            <option value="emerald" {"selected" if school.get('theme_color') == 'emerald' else ""}>Emerald Dynamic Green</option>
+                            <option value="indigo" {"selected" if school.get('theme_color') == 'indigo' else ""}>Indigo Corporate Blue</option>
+                            <option value="slate" {"selected" if school.get('theme_color') == 'slate' else ""}>Slate Minimalistic Gray</option>
+                        </select>
+                    </div>
+
+                    <div class="bg-slate-50 p-3 rounded-xl border border-slate-100 flex items-center justify-between">
+                        <div>
+                            <label class="text-xs font-bold text-slate-800 block">Single Stream Mode</label>
+                            <span class="text-[10px] text-slate-400 block">Hides class sorting columns</span>
+                        </div>
+                        <input type="checkbox" name="is_single_stream" value="true" {"checked" if is_single_stream else ""} class="w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500 cursor-pointer">
+                    </div>
+
+                    <div>
+                        <label class="text-[11px] font-semibold text-slate-500 block mb-1">Head of Institution's Name</label>
+                        <input type="text" name="head_teacher_name" value="{esc(st.get('head_teacher_name') or '')}" placeholder="e.g. Jane Wanjiru" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
+                        <span class="text-[10px] text-slate-400 block mt-1">Printed on the report card signature block.</span>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-2">
+                        <div>
+                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Opening Date</label>
+                            <input type="date" name="opening_date" value="{esc(st['opening_date'])}" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
+                        </div>
+                        <div>
+                            <label class="text-[11px] font-semibold text-slate-500 block mb-1">Closing Date</label>
+                            <input type="date" name="closing_date" value="{esc(st['closing_date'])}" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
+                        </div>
+                    </div>
+                    <button type="submit" class="w-full bg-slate-800 hover:bg-slate-900 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">Commit Engine Settings</button>
+                </form>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-amber-200/80 shadow-xs p-6">
+                <h2 class="text-sm font-black text-amber-700 mb-1">🔄 Advance All Classes</h2>
+                <p class="text-xs text-slate-400 mb-3">Promotes every active student up one grade level. Grade 9 cohorts move into Graduated status. This also automatically carries forward every student's fee balance from the current term into the next, before anyone's class changes.</p>
+                <form action="/api/v1/school/promote-classes/{school_id}" method="post"
+                      onsubmit="return confirm('CRITICAL WARNING: Are you sure you want to promote all active student cohorts up 1 Grade Level? Grade 9 cohorts will safely move into Graduated Status.');">
+                    <button type="submit" class="w-full bg-amber-50 border border-amber-200/80 text-amber-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-amber-100/70 transition cursor-pointer">
+                        🔄 Advance All Classes 1 Year
+                    </button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
 
 @app.get("/admin/class-teachers/{school_id}", response_class=HTMLResponse)
