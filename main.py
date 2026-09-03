@@ -6553,11 +6553,30 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
 
     # Real enforcement of the marks entry deadline — the entry page
     # already disables the submit button, but that's cosmetic; a request
-    # can always be crafted by hand, so staff are blocked here too.
-    # Admins are never restricted by this — they can always correct marks.
+    # can always be crafted by hand (e.g. the page was open before the
+    # deadline passed, then submitted after), so staff are blocked here
+    # too. Admins are never restricted by this — they can always correct
+    # marks. Returns a proper, friendly page rather than a raw HTTP error
+    # — a bare 403 with a JSON body looks like the app broke, when this
+    # is actually working exactly as configured.
     deadline = settings_row[3] if settings_row else None
     if viewer and viewer.get('role') == 'staff' and deadline and datetime.now() > deadline:
-        raise HTTPException(status_code=403, detail=f"Marks entry for this Assessment Phase closed on {deadline.strftime('%d %b %Y, %H:%M')}. Ask your admin to enter or correct marks, or extend the deadline under School Settings.")
+        back_url = f"/staff/bulk-entry/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}&stream={urllib.parse.quote(stream)}"
+        return HTMLResponse(f"""
+        <!DOCTYPE html>
+        <html>
+        <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Deadline Reached</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+        <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
+            <div class="bg-white rounded-2xl border border-rose-200 shadow-xs p-8 max-w-sm text-center space-y-3">
+                <p class="text-4xl">🔒</p>
+                <h1 class="text-lg font-black text-slate-800">Deadline Reached</h1>
+                <p class="text-sm text-slate-500">Marks entry for this Assessment Phase closed on {deadline.strftime('%d %b %Y, %H:%M')}.</p>
+                <p class="text-xs text-slate-400">Ask your admin to enter or correct marks, or extend the deadline under School Settings.</p>
+                <a href="{back_url}" class="inline-block bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold px-5 py-2.5 rounded-xl transition mt-2">← Back to Marks Entry</a>
+            </div>
+        </body>
+        </html>
+        """, status_code=403)
 
     is_paper_mode = form_data.get("is_paper_mode") == "1"
     skipped_entries = 0
