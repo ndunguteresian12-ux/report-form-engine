@@ -61,7 +61,18 @@ def get_db_connection():
     # noticing until the next real query runs. A cheap SELECT 1 here catches
     # that upfront and swaps in a fresh connection instead of crashing the
     # actual request.
-    for _ in range(3):
+    #
+    # Retries bumped from 3 to 5, and the catch widened to also include
+    # InterfaceError: after Neon suspends an idle compute, EVERY connection
+    # the pool is currently holding can go stale at once, not just one —
+    # with a pool as small as DB_POOL_MIN_CONN=2, 3 attempts isn't
+    # guaranteed to cycle through all of them before a genuinely fresh one
+    # gets created. InterfaceError ("connection already closed") is a
+    # second, separate exception psycopg2 can raise for a dead connection,
+    # depending on exactly when the network drop is noticed — a ping that
+    # only caught OperationalError could still hand out a connection that
+    # raises InterfaceError instead.
+    for _ in range(5):
         candidate = pool.getconn()
         if candidate.closed:
             try:
@@ -72,7 +83,7 @@ def get_db_connection():
         try:
             with candidate.cursor() as ping_cur:
                 ping_cur.execute("SELECT 1;")
-        except psycopg2.OperationalError as ping_err:
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as ping_err:
             last_err = ping_err
             try:
                 pool.putconn(candidate, close=True)
