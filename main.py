@@ -4826,7 +4826,7 @@ def educators_bulk_entry_grid(
     stream: str, 
     education_level: str, 
     learning_area_id: int = None, 
-    cycle_name: str = "End Term",
+    cycle_name: str = None,  # ignored — always overridden by school_settings.active_cycle below; kept only so old links with ?cycle_name=... in the URL don't error out
     saved: int = None,
     skipped: int = None,
 ):
@@ -4852,10 +4852,18 @@ def educators_bulk_entry_grid(
                     raise HTTPException(status_code=403, detail="You aren't assigned to this class. Ask your admin to add you as its class teacher or a subject teacher there, under Teaching Assignments.")
                 restricted_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
 
-            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+            cur.execute("SELECT active_term, active_year, active_cycle FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
             active_term = (settings_row['active_term'] if settings_row else None) or 'Term 1'
             active_year = (settings_row['active_year'] if settings_row else None) or 2026
+            # Locked to whatever the school's active assessment phase
+            # actually is — teachers used to be able to freely pick any
+            # cycle from a dropdown (and the page defaulted to "End Term"
+            # whenever no cycle was specified in the URL at all), which is
+            # exactly how marks kept landing in the wrong phase. The
+            # cycle is no longer a user-editable input anywhere on this
+            # page; whatever gets submitted is always overridden by this.
+            cycle_name = (settings_row['active_cycle'] if settings_row else None) or 'Opener'
             
             # Fetch relevant subjects matched by the educational segment level
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
@@ -5002,13 +5010,12 @@ def educators_bulk_entry_grid(
                 </div>
                 <div>
                     <label class="font-bold text-slate-500">Evaluation Phase</label>
-                    <select name="cycle_name" onchange="this.form.submit()" class="w-full border p-3 rounded-xl mt-1 font-semibold text-sm">
-                        <option value="Opener" {"selected" if cycle_name == 'Opener' else ""}>Opener Phase</option>
-                        <option value="Midterm" {"selected" if cycle_name == 'Midterm' else ""}>Midterm Cycle</option>
-                        <option value="End Term" {"selected" if cycle_name == 'End Term' else ""}>End Term Synthesis</option>
-                    </select>
+                    <div class="w-full border border-slate-200 bg-slate-50 p-3 rounded-xl mt-1 font-semibold text-sm text-slate-700 flex items-center gap-1.5">
+                        🔒 {esc({'Opener': 'Opener Phase', 'Midterm': 'Midterm Cycle', 'End Term': 'End Term Synthesis'}.get(cycle_name, cycle_name))}
+                    </div>
+                    <p class="text-[10px] text-slate-400 mt-1">Set school-wide under School Settings — not editable per class, so marks can never land in the wrong phase by accident.</p>
                 </div>
-                <div class="hidden sm:flex items-end text-slate-400 text-[11px] italic pb-2">Changing dropdown values auto-updates student listing map.</div>
+                <div class="hidden sm:flex items-end text-slate-400 text-[11px] italic pb-2">Changing subject auto-updates student listing map.</div>
             </form>
         </div>
 
@@ -6456,10 +6463,6 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="A valid learning area must be selected before saving.")
 
-    cycle_name = (form_data.get('cycle_name') or "").strip()
-    if not cycle_name:
-        raise HTTPException(status_code=400, detail="An assessment cycle must be selected before saving.")
-
     grade_name = form_data.get("grade_name", "")
     education_level = form_data.get("education_level", "")
     stream = form_data.get("stream", "")
@@ -6486,10 +6489,16 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     # silently overwriting Term 1's for the same cycle name.
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+            cur.execute("SELECT active_term, active_year, active_cycle FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
     active_term = settings_row[0] if settings_row else 'Term 1'
     active_year = settings_row[1] if settings_row else 2026
+    # ALWAYS derived from the school's actual active_cycle setting here —
+    # never trusts whatever the form submitted. The entry page no longer
+    # offers any way to pick a different cycle, but a request can always
+    # be crafted by hand, so real enforcement has to happen here too, not
+    # just in the UI.
+    cycle_name = (settings_row[2] if settings_row else None) or 'Opener'
 
     is_paper_mode = form_data.get("is_paper_mode") == "1"
     skipped_entries = 0

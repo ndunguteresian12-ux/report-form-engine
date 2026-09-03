@@ -46,6 +46,44 @@ router = APIRouter()
 
 EDUCATION_LEVELS = ["ECDE", "Lower Primary", "Upper Primary", "Junior School"]
 
+
+def _parse_time_to_minutes_shared(time_str):
+    """Module-level version of the time-parsing helper duplicated locally
+    in a few places in this file (generate_draft_timetable,
+    _find_timetable_collisions) — added here specifically for
+    update_timetable_slot's conflict check, which previously compared
+    exact period_id only. That missed a genuine cross-education-level
+    collision: two different levels' periods are separate rows with
+    different ids even when their real clock times are identical, so an
+    exact-id match let a teacher be manually double-booked across two
+    levels whose periods happened to overlap. Given the existing local
+    copies are already tested and working, this is added as a new,
+    separate function rather than risk refactoring them."""
+    if not time_str:
+        return None
+    cleaned = time_str.strip().upper().replace(".", "")
+    is_pm = "PM" in cleaned
+    is_am = "AM" in cleaned
+    cleaned = cleaned.replace("AM", "").replace("PM", "").strip()
+    parts = cleaned.replace(".", ":").split(":")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, IndexError):
+        return None
+    if is_pm and hour < 12:
+        hour += 12
+    if is_am and hour == 12:
+        hour = 0
+    return hour * 60 + minute
+
+
+def _time_ranges_overlap_shared(a_start, a_end, b_start, b_end):
+    if a_start is None or a_end is None or b_start is None or b_end is None:
+        return False
+    return a_start < b_end and b_start < a_end
+
+
 # Custom subjects (Music/Art/PE splits, PPI, etc.) share the scheduling
 # engine, teacher assignments, and time-off logic with regular subjects by
 # using this large offset on their id — guarantees zero collision with a
@@ -4722,18 +4760,39 @@ def update_timetable_slot(
                 teacher_id = activity_row['staff_user_id'] if activity_row else None
 
             if teacher_id:
+                # Matches by ACTUAL OVERLAPPING CLOCK TIME, not just exact
+                # period_id — two different education levels have entirely
+                # separate period rows even when their real times coincide
+                # exactly, so comparing period_id alone would miss a
+                # genuine cross-level double-booking (the actual bug this
+                # replaced: a teacher could be manually assigned to two
+                # different levels' classes at the same real time, since
+                # each level's "Period 3" is a different database row).
+                cur.execute("SELECT start_time, end_time FROM timetable_periods WHERE id = %s;", (period_id,))
+                this_period_row = cur.fetchone()
+                this_start = _parse_time_to_minutes_shared(this_period_row['start_time']) if this_period_row else None
+                this_end = _parse_time_to_minutes_shared(this_period_row['end_time']) if this_period_row else None
+
                 cur.execute("""
-                    SELECT ts.grade_name, ts.stream FROM timetable_slots ts
-                    WHERE ts.school_id = %s AND ts.day_of_week = %s AND ts.period_id = %s
+                    SELECT ts.grade_name, ts.stream, tp.start_time, tp.end_time FROM timetable_slots ts
+                    JOIN timetable_periods tp ON ts.period_id = tp.id
+                    WHERE ts.school_id = %s AND ts.day_of_week = %s
                       AND ts.staff_user_id = %s
                       AND NOT (ts.grade_name = %s AND ts.education_level = %s AND ts.stream = %s);
-                """, (school_id, day_of_week, period_id, teacher_id, grade_name, education_level, stream))
-                clash = cur.fetchone()
+                """, (school_id, day_of_week, teacher_id, grade_name, education_level, stream))
+                clash = None
+                if this_start is not None and this_end is not None:
+                    for candidate in cur.fetchall():
+                        other_start = _parse_time_to_minutes_shared(candidate['start_time'])
+                        other_end = _parse_time_to_minutes_shared(candidate['end_time'])
+                        if _time_ranges_overlap_shared(this_start, this_end, other_start, other_end):
+                            clash = candidate
+                            break
                 if clash:
                     clash_label = _section_label(clash['grade_name'], clash['stream'])
                     raise HTTPException(
                         status_code=400,
-                        detail=f"That teacher is already scheduled to teach {clash_label} at this exact day/period. Reassign the teacher for this subject, or pick a different subject for this slot."
+                        detail=f"That teacher is already scheduled to teach {clash_label} at this exact time. Reassign the teacher for this subject, or pick a different subject for this slot."
                     )
 
                 cur.execute("""
