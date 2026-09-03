@@ -665,6 +665,12 @@ def bootstrap_database_schema():
                 -- signature block — a school sets this once in Settings.
                 ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS head_teacher_name VARCHAR(255);
 
+                -- Optional cutoff for the CURRENTLY active assessment
+                -- cycle — once passed, staff (not admins) can no longer
+                -- save marks for it. NULL means no deadline set, so
+                -- nothing changes for a school that never touches this.
+                ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS marks_entry_deadline TIMESTAMP;
+
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
                     email VARCHAR(255) UNIQUE NOT NULL,
@@ -2911,6 +2917,12 @@ def superadmin_school_detail(school_id: int, request: Request, undone: str = Non
         </div>
         """
 
+    commit_button_html = (
+        "<div class='p-4 bg-slate-50 border-t'><button type='submit' disabled class='w-full bg-slate-300 text-slate-500 font-bold py-3.5 px-6 rounded-xl text-sm cursor-not-allowed'>🔒 Entry Closed — Deadline Passed</button></div>"
+        if deadline_passed else
+        "<div class='p-4 bg-slate-50 border-t'><button type='submit' class='w-full bg-[#046A38] hover:bg-emerald-900 text-white font-bold py-3.5 px-6 rounded-xl text-sm shadow-md'>Batch Commit Class Sheet</button></div>"
+    )
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -4852,7 +4864,7 @@ def educators_bulk_entry_grid(
                     raise HTTPException(status_code=403, detail="You aren't assigned to this class. Ask your admin to add you as its class teacher or a subject teacher there, under Teaching Assignments.")
                 restricted_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
 
-            cur.execute("SELECT active_term, active_year, active_cycle FROM school_settings WHERE school_id = %s;", (school_id,))
+            cur.execute("SELECT active_term, active_year, active_cycle, marks_entry_deadline FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
             active_term = (settings_row['active_term'] if settings_row else None) or 'Term 1'
             active_year = (settings_row['active_year'] if settings_row else None) or 2026
@@ -4864,6 +4876,11 @@ def educators_bulk_entry_grid(
             # cycle is no longer a user-editable input anywhere on this
             # page; whatever gets submitted is always overridden by this.
             cycle_name = (settings_row['active_cycle'] if settings_row else None) or 'Opener'
+
+            # Deadline only ever restricts staff — an admin can always
+            # still enter or correct marks, e.g. for a late enrollment.
+            deadline = settings_row['marks_entry_deadline'] if settings_row else None
+            deadline_passed = bool(is_restricted_staff and deadline and datetime.now() > deadline)
             
             # Fetch relevant subjects matched by the educational segment level
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
@@ -5019,6 +5036,10 @@ def educators_bulk_entry_grid(
             </form>
         </div>
 
+        {f'''<div class="bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-xl">
+            🔒 Marks entry for this Assessment Phase closed on {deadline.strftime('%d %b %Y, %H:%M')}. Ask your admin to enter or correct marks, or extend the deadline under School Settings.
+        </div>''' if deadline_passed else ''}
+
         <form action="/api/v1/scores/bulk-save/{school_id}" method="post" class="bg-white rounded-2xl border shadow-xs overflow-hidden" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){{b.disabled=true; b.textContent='Saving...'; b.style.opacity='0.7';}}">
             <input type="hidden" name="grade_name" value="{esc(grade_name)}">
             <input type="hidden" name="education_level" value="{esc(education_level)}">
@@ -5052,7 +5073,7 @@ def educators_bulk_entry_grid(
             <div id="studentRowsContainer">{student_rows or "<p class='text-center p-6 text-slate-400 italic text-xs'>No registered class matching criterion.</p>"}</div>
             <p id="noSearchResults" class="hidden text-center p-6 text-slate-400 italic text-xs">No learners match that search.</p>
 
-            {f'<div class="p-4 bg-slate-50 border-t"><button type="submit" class="w-full bg-[#046A38] hover:bg-emerald-900 text-white font-bold py-3.5 px-6 rounded-xl text-sm shadow-md">Batch Commit Class Sheet</button></div>' if students else ""}
+            {commit_button_html if students else ""}
         </form>
 
         <script>
@@ -5768,6 +5789,12 @@ def school_settings_page(school_id: int, request: Request):
                     </div>
                     <p class="text-[10px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-2.5 py-2">⚠️ Marks are saved against whatever Year + Term + Assessment Phase are set here at the moment of saving. Double-check all three are correct before entering marks for a new term.</p>
 
+                    <div class="bg-rose-50 p-3 rounded-xl border border-rose-100">
+                        <label class="text-xs font-bold text-slate-800 block mb-1">🔒 Marks Entry Deadline (optional)</label>
+                        <input type="datetime-local" name="marks_entry_deadline" value="{esc(st['marks_entry_deadline'].strftime('%Y-%m-%dT%H:%M')) if st.get('marks_entry_deadline') else ''}" class="w-full border border-rose-200 bg-white p-2 rounded-xl text-xs outline-none focus:border-rose-400">
+                        <p class="text-[10px] text-slate-500 mt-1">After this date/time, staff can no longer save marks for the current Assessment Phase above — you (as admin) can still enter or correct marks at any time. Leave blank for no deadline.</p>
+                    </div>
+
                     <div>
                         <label class="text-[11px] font-semibold text-slate-500 block mb-1">Theme Branding Color</label>
                         <select name="theme_color" class="w-full border border-slate-200 p-2 rounded-xl text-xs font-semibold bg-white outline-none focus:border-slate-400">
@@ -5942,6 +5969,7 @@ def update_settings_endpoint(
     is_single_stream: str = Form(None),
     head_teacher_name: str = Form(""),
     active_year: int = Form(...),
+    marks_entry_deadline: str = Form(""),
 ):
     auth_error = require_admin_session(request, school_id)
     if auth_error:
@@ -5966,6 +5994,11 @@ def update_settings_endpoint(
     # here correctly means "unchecked", not "leave unchanged".
     is_single_stream_bool = bool(is_single_stream)
 
+    # datetime-local submits as "2026-05-20T14:30" with no seconds/timezone
+    # — Postgres's TIMESTAMP column accepts this format directly. Blank
+    # means "no deadline", stored as NULL.
+    marks_entry_deadline_value = marks_entry_deadline.strip() or None
+
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             # Read what term/year this school was on BEFORE the update, so
@@ -5982,8 +6015,8 @@ def update_settings_endpoint(
             old_year = existing_settings_row[1] if existing_settings_row else None
 
             cur.execute("""
-                INSERT INTO school_settings (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream, head_teacher_name)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO school_settings (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream, head_teacher_name, marks_entry_deadline)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (school_id) DO UPDATE 
                 SET active_term = EXCLUDED.active_term, 
                     active_cycle = EXCLUDED.active_cycle, 
@@ -5991,8 +6024,9 @@ def update_settings_endpoint(
                     opening_date = EXCLUDED.opening_date, 
                     closing_date = EXCLUDED.closing_date,
                     is_single_stream = EXCLUDED.is_single_stream,
-                    head_teacher_name = EXCLUDED.head_teacher_name;
-            """, (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream_bool, head_teacher_name.strip() or None))
+                    head_teacher_name = EXCLUDED.head_teacher_name,
+                    marks_entry_deadline = EXCLUDED.marks_entry_deadline;
+            """, (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream_bool, head_teacher_name.strip() or None, marks_entry_deadline_value))
             
             # Sync the modern Tailwind color layout across the institution node
             cur.execute("UPDATE schools SET theme_color = %s WHERE id = %s;", (theme_color, school_id))
@@ -6489,7 +6523,7 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     # silently overwriting Term 1's for the same cycle name.
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT active_term, active_year, active_cycle FROM school_settings WHERE school_id = %s;", (school_id,))
+            cur.execute("SELECT active_term, active_year, active_cycle, marks_entry_deadline FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
     active_term = settings_row[0] if settings_row else 'Term 1'
     active_year = settings_row[1] if settings_row else 2026
@@ -6499,6 +6533,14 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     # be crafted by hand, so real enforcement has to happen here too, not
     # just in the UI.
     cycle_name = (settings_row[2] if settings_row else None) or 'Opener'
+
+    # Real enforcement of the marks entry deadline — the entry page
+    # already disables the submit button, but that's cosmetic; a request
+    # can always be crafted by hand, so staff are blocked here too.
+    # Admins are never restricted by this — they can always correct marks.
+    deadline = settings_row[3] if settings_row else None
+    if viewer and viewer.get('role') == 'staff' and deadline and datetime.now() > deadline:
+        raise HTTPException(status_code=403, detail=f"Marks entry for this Assessment Phase closed on {deadline.strftime('%d %b %Y, %H:%M')}. Ask your admin to enter or correct marks, or extend the deadline under School Settings.")
 
     is_paper_mode = form_data.get("is_paper_mode") == "1"
     skipped_entries = 0
