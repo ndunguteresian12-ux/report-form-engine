@@ -2934,12 +2934,6 @@ def superadmin_school_detail(school_id: int, request: Request, undone: str = Non
         </div>
         """
 
-    commit_button_html = (
-        "<div class='p-4 bg-slate-50 border-t'><button type='submit' disabled class='w-full bg-slate-300 text-slate-500 font-bold py-3.5 px-6 rounded-xl text-sm cursor-not-allowed'>🔒 Entry Closed — Deadline Passed</button></div>"
-        if deadline_passed else
-        "<div class='p-4 bg-slate-50 border-t'><button type='submit' class='w-full bg-[#046A38] hover:bg-emerald-900 text-white font-bold py-3.5 px-6 rounded-xl text-sm shadow-md'>Batch Commit Class Sheet</button></div>"
-    )
-
     return f"""
     <!DOCTYPE html>
     <html>
@@ -5017,6 +5011,12 @@ def educators_bulk_entry_grid(
             {input_html}
         </div>
         """
+
+    commit_button_html = (
+        "<div class='p-4 bg-slate-50 border-t'><button type='submit' disabled class='w-full bg-slate-300 text-slate-500 font-bold py-3.5 px-6 rounded-xl text-sm cursor-not-allowed'>🔒 Entry Closed — Deadline Passed</button></div>"
+        if deadline_passed else
+        "<div class='p-4 bg-slate-50 border-t'><button type='submit' class='w-full bg-[#046A38] hover:bg-emerald-900 text-white font-bold py-3.5 px-6 rounded-xl text-sm shadow-md'>Batch Commit Class Sheet</button></div>"
+    )
 
     return f"""
     <!DOCTYPE html>
