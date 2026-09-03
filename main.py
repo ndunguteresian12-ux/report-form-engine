@@ -3066,7 +3066,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                           AND sc.term = %s AND sc.year = %s
                           AND sc.cycle_name IN ('Opener', 'Midterm', 'End Term')
                           AND (s.status IS NULL OR s.status != 'GRADUATED');
-                    """, (school_id, grade_name_q, education_level_q, stream_q, stream_q, st['active_term'], st.get('active_year', 2026)))
+                    """, (school_id, grade_name_q, education_level_q, stream_q, stream_q, st['active_term'], st.get('active_year') or 2026))
                     rows = cur.fetchall()
 
                     # None = class (homeroom) teacher, unrestricted for
@@ -3211,13 +3211,13 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                 {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No classes have been set up for this school yet.</p>"}
             </div>
 
-            {f'''<div class="flex items-center justify-between mb-4 mt-8">
+            <div class="flex items-center justify-between mb-4 mt-8">
                 <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">📈 Performance Milestones</h2>
             </div>
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {f'''<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
                 {subject_chart_html}
                 {stream_charts_html}
-            </div>''' if (subject_chart_html or stream_charts_html) else ""}
+            </div>''' if (subject_chart_html or stream_charts_html) else "<p class='text-slate-400 text-xs italic text-center py-8 bg-white border border-dashed rounded-2xl'>No marks recorded yet for Opener, Midterm, or End Term this term — charts will appear here as soon as scores are entered for your classes.</p>"}
 
             {support_contact_html()}
             <p class="text-center text-[11px] text-slate-300 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-400">Elimu Hub</span></p>
@@ -3473,7 +3473,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         logo_html = f"<img src='{final_src}' style='width:64px;height:64px;object-fit:contain;' />"
 
     class_title = grade_name if (not stream or stream == "SINGLE STREAM") else f"{grade_name} — {stream}"
-    exam_code = f"{grade_name.replace(' ', '').upper()}{'' if (not stream or stream == 'SINGLE STREAM') else stream.replace(' ', '').upper()}{st.get('active_year', 2026)}{str(st['active_cycle']).upper().replace(' ', '')}"
+    exam_code = f"{grade_name.replace(' ', '').upper()}{'' if (not stream or stream == 'SINGLE STREAM') else stream.replace(' ', '').upper()}{st.get('active_year') or 2026}{str(st['active_cycle']).upper().replace(' ', '')}"
 
     subject_header_cells = "".join(f"<th style='text-align:center;'>{esc(abbreviate_subject(sub['name']))}</th>" for sub in subjects)
 
@@ -3543,7 +3543,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             <tr>
                 <td><b>CLASS:</b> {esc(class_title)}</td>
                 <td><b>TERM:</b> {esc(str(st['active_term']))}</td>
-                <td><b>YEAR:</b> {esc(str(st.get('active_year', 2026)))}</td>
+                <td><b>YEAR:</b> {esc(str(st.get('active_year') or 2026))}</td>
                 <td><b>EXAM NAME:</b> {'COMBINED (ALL CYCLES)' if combined else esc(str(st['active_cycle']).upper())}</td>
             </tr>
             <tr>
@@ -3711,7 +3711,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
             {logo_html}
             <div>
                 <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top 10 Students — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top 10 Students — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year') or ''})</p>
             </div>
         </div>
         {"<p class='no-print' style='background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 14px;border-radius:8px;font-size:12px;margin-top:12px;'>⚠️ No scores found for the <b>" + esc(str(st['active_cycle'])) + "</b> cycle for this stream. This report only looks at whichever exam cycle is currently marked active in Settings (Assessment Phase). If scores were entered under a different cycle (e.g. Opener/Midterm), either switch Assessment Phase to match, or enter scores for the currently active cycle.</p>" if not top10 else ""}
@@ -3848,7 +3848,7 @@ def _render_top_subject_page(school, class_title, logo_html, st, all_scores, sub
             {logo_html}
             <div>
                 <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top 10 Per Subject — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Top 10 Per Subject — {esc(class_title)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year') or ''})</p>
             </div>
         </div>
         {"<p class='no-print' style='background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 14px;border-radius:8px;font-size:12px;margin-top:12px;'>⚠️ No scores found for the <b>" + esc(str(st['active_cycle'])) + "</b> cycle for this stream. This report only looks at whichever exam cycle is currently marked active in Settings (Assessment Phase). If scores were entered under a different cycle (e.g. Opener/Midterm), either switch Assessment Phase to match, or enter scores for the currently active cycle.</p>" if not all_scores else ""}
@@ -3994,7 +3994,7 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
             {logo_html}
             <div>
                 <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Subject Grade Distribution — {esc(grade_name)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year', '')})</p>
+                <p style="margin:2px 0 0;font-size:12px;color:#64748b;">Subject Grade Distribution — {esc(grade_name)} ({st['active_cycle']}, {st['active_term']} {st.get('active_year') or ''})</p>
             </div>
         </div>
         {"<p class='no-print' style='background:#fffbeb;border:1px solid #fde68a;color:#92400e;padding:10px 14px;border-radius:8px;font-size:12px;margin-top:12px;'>⚠️ No scores found for the <b>" + esc(str(st['active_cycle'])) + "</b> cycle. This report only looks at whichever exam cycle is currently marked active in Settings.</p>" if not all_scores else ""}
@@ -4375,10 +4375,23 @@ def add_student_view(school_id: int, request: Request):
             settings_row = cur.fetchone()
             is_single_stream = bool(settings_row['is_single_stream']) if settings_row else False
 
+            # Was a fully hardcoded Grade 1-9 list before — meant PP1/PP2
+            # (and any future class this school gets) could never appear
+            # here no matter what existed in the database. Queried
+            # dynamically now, same as every other class-picker in this
+            # app, ordered by id so grades stay in their natural sequence.
+            cur.execute("SELECT id, grade_name, education_level FROM classes ORDER BY id ASC;")
+            all_classes = cur.fetchall()
+
     stream_field_html = (
         "<div class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500'>ℹ️ This school is in <b>Single Stream Mode</b> — no stream assignment is needed.</div>"
         if is_single_stream else
         "<div><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" name=\"stream\" placeholder=\"e.g. N\" class=\"w-full border p-2.5 rounded mt-1 text-base\" required></div>"
+    )
+
+    class_options_html = "".join(
+        f"<option value='{c['id']}'>{esc(c['grade_name'])} ({esc(c['education_level'])})</option>"
+        for c in all_classes
     )
 
     return f"""
@@ -4400,15 +4413,7 @@ def add_student_view(school_id: int, request: Request):
                         <label class="text-xs font-bold text-slate-600">Education Track Segment</label>
                         <select name="class_id" class="w-full border p-2.5 rounded mt-1 bg-white text-sm font-medium text-slate-800" required>
                             <option value="" disabled selected>Select Grade...</option>
-                            <option value="1">Grade 1</option>
-                            <option value="2">Grade 2</option>
-                            <option value="3">Grade 3</option>
-                            <option value="4">Grade 4</option>
-                            <option value="5">Grade 5</option>
-                            <option value="6">Grade 6</option>
-                            <option value="7">Grade 7</option>
-                            <option value="8">Grade 8</option>
-                            <option value="9">Grade 9</option>
+                            {class_options_html}
                         </select>
                     </div>
                     {stream_field_html}
