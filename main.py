@@ -2401,6 +2401,7 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
                 <p class="text-xs text-slate-400">Compare the database name above against the Neon project/branch you ran your ALTER TABLE commands on — if they don't match, that's exactly why the fix didn't take effect.</p>
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-student-scores' onsubmit=\"return confirm('Add entered_marks/entered_out_of columns to student_scores on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add entered_marks / entered_out_of to student_scores now</button></form>" if table == "student_scores" and not any(c['column_name'] == 'entered_marks' for c in columns) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-fee-categories' onsubmit=\"return confirm('Add collectible_by_staff column to fee_categories on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add collectible_by_staff to fee_categories now</button></form>" if table == "fee_categories" and not any(c['column_name'] == 'collectible_by_staff' for c in columns) else ""}
+                {"<form method='post' action='/superadmin/db-diagnostic/fix-school-settings' onsubmit=\"return confirm('Add marks_entry_deadline column to school_settings on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add marks_entry_deadline to school_settings now</button></form>" if table == "school_settings" and not any(c['column_name'] == 'marks_entry_deadline' for c in columns) else ""}
                 <form method="get" action="/superadmin/db-diagnostic" class="flex gap-2">
                     <input type="text" name="table" value="{esc(table)}" class="flex-1 border border-slate-200 p-2 rounded-lg text-xs">
                     <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold px-4 py-2 rounded-lg">Check Table</button>
@@ -2452,6 +2453,22 @@ def fix_fee_categories_columns(request: Request):
             conn.commit()
 
     return RedirectResponse(url="/superadmin/db-diagnostic?table=fee_categories", status_code=303)
+
+
+@app.post("/superadmin/db-diagnostic/fix-school-settings")
+def fix_school_settings_columns(request: Request):
+    """Same self-service pattern — adds school_settings.marks_entry_deadline
+    directly through the live app's own connection. Safe to run repeatedly."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS marks_entry_deadline TIMESTAMP;")
+            conn.commit()
+
+    return RedirectResponse(url="/superadmin/db-diagnostic?table=school_settings", status_code=303)
 
 
 @app.get("/superadmin/dashboard", response_class=HTMLResponse)
