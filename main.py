@@ -511,6 +511,19 @@ async def inject_help_widget_middleware(request: Request, call_next):
     return Response(content=new_body, status_code=response.status_code, headers=headers, media_type=response.media_type)
 
 
+def kenya_now() -> datetime:
+    """The current time in Kenya (EAT, UTC+3), used specifically for
+    comparing against admin-set deadlines. Kenya has no daylight savings,
+    so this fixed +3 offset is always correct, unlike relying on
+    datetime.now() — which returns whatever timezone the server
+    container happens to be configured with (Render's containers run in
+    UTC), silently making any deadline compared against it land 3 hours
+    later than the admin actually intended. Explicit datetime.utcnow()
+    is used as the base rather than datetime.now(), since the latter's
+    behavior depends on ambient container config that isn't guaranteed."""
+    return datetime.utcnow() + timedelta(hours=3)
+
+
 def _branded_error_page(status_code: int, message: str) -> HTMLResponse:
     return HTMLResponse(status_code=status_code, content=f"""
     <!DOCTYPE html>
@@ -3227,6 +3240,26 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
 
     st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'is_single_stream': False}
 
+    # Deadline alert for the staff dashboard — proactively visible the
+    # moment a teacher logs in, not just buried on the marks-entry page
+    # for one specific class. Admins are never shown this; they're never
+    # restricted by the deadline in the first place.
+    dashboard_deadline_html = ""
+    dashboard_deadline = st.get('marks_entry_deadline') if isinstance(st, dict) else None
+    if is_restricted_staff and dashboard_deadline:
+        if kenya_now() > dashboard_deadline:
+            dashboard_deadline_html = f"""
+            <div class="bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-xl mb-4">
+                🔒 Marks entry for {esc(str(st.get('active_cycle') or 'the current phase'))} closed on {dashboard_deadline.strftime('%d %b %Y, %H:%M')}. Ask your admin to enter or correct marks, or extend the deadline.
+            </div>
+            """
+        else:
+            dashboard_deadline_html = f"""
+            <div class="bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-4">
+                ⏰ Marks entry for {esc(str(st.get('active_cycle') or 'the current phase'))} closes on {dashboard_deadline.strftime('%d %b %Y, %H:%M')}.
+            </div>
+            """
+
     logo_src = school.get('logo_url')
     logo_html = ""
     if logo_src:
@@ -3446,6 +3479,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
         {toast_trigger("Student registered successfully!") if student_added else ""}
 
         <div class="p-8 max-w-6xl mx-auto w-full flex-1">
+            {dashboard_deadline_html}
             <div class="flex items-center justify-between mb-4">
                 <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Your Classroom Cohorts</h2>
                 {f'<a href="/admin/student/new/{school_id}" class="bg-indigo-900 hover:bg-indigo-800 text-white text-xs px-3.5 py-2 rounded-xl font-semibold transition shadow-xs">+ Register New Student</a>' if can_register_students else ''}
@@ -4951,7 +4985,7 @@ def educators_bulk_entry_grid(
             # Deadline only ever restricts staff — an admin can always
             # still enter or correct marks, e.g. for a late enrollment.
             deadline = settings_row['marks_entry_deadline'] if settings_row else None
-            deadline_passed = bool(is_restricted_staff and deadline and datetime.now() > deadline)
+            deadline_passed = bool(is_restricted_staff and deadline and kenya_now() > deadline)
             
             # Fetch relevant subjects matched by the educational segment level
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
@@ -6639,7 +6673,7 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     # — a bare 403 with a JSON body looks like the app broke, when this
     # is actually working exactly as configured.
     deadline = settings_row[3] if settings_row else None
-    if viewer and viewer.get('role') == 'staff' and deadline and datetime.now() > deadline:
+    if viewer and viewer.get('role') == 'staff' and deadline and kenya_now() > deadline:
         back_url = f"/staff/bulk-entry/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}&stream={urllib.parse.quote(stream)}"
         return HTMLResponse(f"""
         <!DOCTYPE html>
