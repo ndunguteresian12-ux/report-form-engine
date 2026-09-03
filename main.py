@@ -3216,6 +3216,15 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                 allowed_class_keys = get_teacher_class_keys(cur, school_id, effective_user_id)
                 classes = [c for c in classes if teacher_can_access_class(allowed_class_keys, c['grade_name'], c['education_level'], c['stream'])]
 
+            # Whether to show "+ Register New Student" on this dashboard —
+            # based on class_teachers directly (not the classes list above,
+            # which only includes classes that already have at least one
+            # student — a brand new class with zero students registered
+            # yet would otherwise never show this link at all, which is
+            # exactly backwards for a class teacher who needs to register
+            # their very first learner).
+            can_register_students = bool(effective_user_id and get_teacher_registerable_class_ids(cur, school_id, effective_user_id))
+
     st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'is_single_stream': False}
 
     logo_src = school.get('logo_url')
@@ -3439,6 +3448,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
         <div class="p-8 max-w-6xl mx-auto w-full flex-1">
             <div class="flex items-center justify-between mb-4">
                 <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Your Classroom Cohorts</h2>
+                {f'<a href="/admin/student/new/{school_id}" class="bg-indigo-900 hover:bg-indigo-800 text-white text-xs px-3.5 py-2 rounded-xl font-semibold transition shadow-xs">+ Register New Student</a>' if can_register_students else ''}
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                 {class_blocks_html or "<p class='text-slate-400 text-xs italic col-span-full text-center py-8 bg-white border border-dashed rounded-2xl'>No classes have been set up for this school yet.</p>"}
@@ -5936,11 +5946,10 @@ def class_teachers_view(school_id: int, request: Request):
             staff_members = cur.fetchall()
 
             cur.execute("""
-                SELECT DISTINCT c.grade_name, s.stream, c.education_level
-                FROM students s
-                JOIN classes c ON s.class_id = c.id
-                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
-                ORDER BY c.grade_name ASC, s.stream ASC;
+                SELECT DISTINCT c.grade_name, c.education_level, COALESCE(s.stream, 'SINGLE STREAM') AS stream
+                FROM classes c
+                LEFT JOIN students s ON s.class_id = c.id AND s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                ORDER BY c.grade_name ASC, stream ASC;
             """, (school_id,))
             classes = cur.fetchall()
 
