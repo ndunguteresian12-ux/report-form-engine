@@ -1664,17 +1664,20 @@ def delete_timetable_period(school_id: int, period_id: int, request: Request, pl
 # ============================================================
 
 @router.get("/timetable/assignments/{school_id}", response_class=HTMLResponse)
-def teacher_assignments_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
+def teacher_assignments_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str, plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            resolved_plan_id = resolve_plan_id(cur, school_id, education_level, plan_id)
+            plan_options_html = get_plan_options_html(cur, school_id, education_level, resolved_plan_id)
+
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
-            cur.execute("SELECT id, name FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s ORDER BY name ASC;", (school_id, education_level))
+            cur.execute("SELECT id, name FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s AND plan_id = %s ORDER BY name ASC;", (school_id, education_level, resolved_plan_id))
             custom_subjects = cur.fetchall()
 
             cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'staff' AND is_verified = TRUE ORDER BY full_name NULLS LAST, email ASC;", (school_id,))
@@ -1682,8 +1685,8 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
 
             cur.execute("""
                 SELECT learning_area_id, custom_subject_id, staff_user_id, lessons_per_week, requires_double, double_lessons_count FROM teacher_subject_assignments
-                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
-            """, (school_id, grade_name, education_level, stream))
+                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND plan_id = %s;
+            """, (school_id, grade_name, education_level, stream, resolved_plan_id))
             all_assignments = cur.fetchall()
             current_assignments = {r['learning_area_id']: r for r in all_assignments if r['learning_area_id'] is not None}
             current_custom_assignments = {r['custom_subject_id']: r for r in all_assignments if r['custom_subject_id'] is not None}
@@ -1718,7 +1721,17 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Assign Teachers</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
-        <div class="max-w-xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
+        <div class="max-w-xl mx-auto space-y-4">
+            <div class="bg-indigo-50 border border-indigo-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+                <label class="text-xs font-bold text-indigo-800 shrink-0">📋 Working on plan:</label>
+                <form method="get" action="/timetable/assignments/{school_id}" class="flex-1 flex gap-2">
+                    <input type="hidden" name="grade_name" value="{esc(grade_name)}">
+                    <input type="hidden" name="education_level" value="{esc(education_level)}">
+                    <input type="hidden" name="stream" value="{esc(stream)}">
+                    <select name="plan_id" onchange="this.form.submit()" class="flex-1 border border-indigo-200 bg-white p-2 rounded-xl text-xs font-semibold">{plan_options_html}</select>
+                </form>
+            </div>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">Assign Teachers</h2>
             <p class="text-xs text-slate-400 mb-4">{esc(section_label)} ({esc(education_level)}) — who teaches each subject, how many lessons per week, and whether it needs a double lesson (e.g. for practicals).</p>
             {"<p class='text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4'>No verified staff accounts yet — add and activate staff first, then come back to assign them here.</p>" if not staff_members else ""}
@@ -1726,14 +1739,16 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
                 <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                 <input type="hidden" name="education_level" value="{esc(education_level)}">
                 <input type="hidden" name="stream" value="{esc(stream)}">
+                <input type="hidden" name="plan_id" value="{resolved_plan_id}">
                 {rows_html or "<p class='text-slate-400 text-xs italic'>No subjects configured for this education level.</p>"}
                 {f'''<p class="text-[10px] font-bold uppercase tracking-wider text-slate-400 pt-4 pb-1">Custom Subjects (non-examinable / split subjects)</p>{custom_rows_html}''' if custom_subjects else ""}
-                <p class="text-[11px] text-slate-400 pt-3">Need a subject that isn't listed — like splitting Creative Arts into Music/Art/PE, or adding a non-graded subject like PPI? <a href="/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(education_level)}" class="text-indigo-700 font-bold hover:underline">Add a Custom Subject →</a></p>
+                <p class="text-[11px] text-slate-400 pt-3">Need a subject that isn't listed — like splitting Creative Arts into Music/Art/PE, or adding a non-graded subject like PPI? <a href="/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(education_level)}&plan_id={resolved_plan_id}" class="text-indigo-700 font-bold hover:underline">Add a Custom Subject →</a></p>
                 <div class="pt-4 flex gap-3">
                     <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 px-5 rounded-xl text-sm transition">Save Assignments</button>
                     <a href="/timetable/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition">← Back</a>
                 </div>
             </form>
+            </div>
         </div>
     </body>
     </html>
@@ -1754,7 +1769,9 @@ async def save_teacher_assignments(school_id: int, request: Request):
         raise HTTPException(status_code=400, detail="Grade and education level are required.")
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            plan_id = resolve_plan_id(cur, school_id, education_level, int(form.get("plan_id")) if form.get("plan_id") else None)
+
             for key, value in form.items():
                 # Regular subjects: "teacher_{learning_area_id}". Custom
                 # subjects use a distinct "teachercustom_{id}" prefix so the
@@ -1785,19 +1802,19 @@ async def save_teacher_assignments(school_id: int, request: Request):
                     # structures.
                     cur.execute("""
                         SELECT id FROM teacher_subject_assignments
-                        WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND custom_subject_id = %s;
-                    """, (school_id, grade_name, education_level, stream, custom_subject_id))
+                        WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND custom_subject_id = %s AND plan_id = %s;
+                    """, (school_id, grade_name, education_level, stream, custom_subject_id, plan_id))
                     existing_row = cur.fetchone()
                     if existing_row:
                         cur.execute("""
                             UPDATE teacher_subject_assignments SET staff_user_id = %s, lessons_per_week = %s, requires_double = %s, double_lessons_count = %s
                             WHERE id = %s;
-                        """, (staff_user_id, lessons_per_week, requires_double, double_lessons_count, existing_row[0]))
+                        """, (staff_user_id, lessons_per_week, requires_double, double_lessons_count, existing_row['id']))
                     else:
                         cur.execute("""
-                            INSERT INTO teacher_subject_assignments (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
-                        """, (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count))
+                            INSERT INTO teacher_subject_assignments (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count, plan_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (school_id, staff_user_id, custom_subject_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count, plan_id))
                     continue
 
                 if not key.startswith("teacher_"):
@@ -1815,18 +1832,26 @@ async def save_teacher_assignments(school_id: int, request: Request):
                     double_lessons_count = 0
                 requires_double = double_lessons_count > 0
 
+                # ON CONFLICT targets the actual current unique constraint —
+                # (school_id, grade_name, education_level, stream,
+                # learning_area_id, plan_id), widened to include plan_id
+                # when multi-plan support was added. The 5-column version
+                # this used to say no longer matches any real constraint on
+                # the table at all — every save through this exact path
+                # was failing outright with a live Postgres error the
+                # moment that migration ran, until this fix.
                 cur.execute("""
-                    INSERT INTO teacher_subject_assignments (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (school_id, learning_area_id, grade_name, education_level, stream)
+                    INSERT INTO teacher_subject_assignments (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count, plan_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (school_id, grade_name, education_level, stream, learning_area_id, plan_id)
                     DO UPDATE SET staff_user_id = EXCLUDED.staff_user_id, lessons_per_week = EXCLUDED.lessons_per_week, requires_double = EXCLUDED.requires_double, double_lessons_count = EXCLUDED.double_lessons_count;
-                """, (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count))
+                """, (school_id, staff_user_id, learning_area_id, grade_name, education_level, stream, lessons_per_week, requires_double, double_lessons_count, plan_id))
             conn.commit()
 
     encoded_grade = urllib.parse.quote(grade_name)
     encoded_level = urllib.parse.quote(education_level)
     encoded_stream = urllib.parse.quote(stream)
-    return RedirectResponse(url=f"/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}", status_code=303)
+    return RedirectResponse(url=f"/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}&plan_id={plan_id}", status_code=303)
 
 
 
