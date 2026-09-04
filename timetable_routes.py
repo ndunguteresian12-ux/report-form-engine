@@ -2653,7 +2653,7 @@ def remove_co_curricular_participant(school_id: int, activity_id: int, student_i
 # ============================================================
 
 @router.get("/timetable/availability/{school_id}/{teacher_id}", response_class=HTMLResponse)
-def teacher_availability_grid(school_id: int, teacher_id: int, request: Request, education_level: str = "Lower Primary"):
+def teacher_availability_grid(school_id: int, teacher_id: int, request: Request, education_level: str = "Lower Primary", plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2665,15 +2665,18 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request,
             if not teacher:
                 raise HTTPException(status_code=404, detail="Teacher not found.")
 
-            days = get_school_days(cur, school_id)
+            resolved_plan_id = resolve_plan_id(cur, school_id, education_level, plan_id)
+            plan_options_html = get_plan_options_html(cur, school_id, education_level, resolved_plan_id)
+
+            days = get_school_days(cur, school_id, resolved_plan_id)
             conn.commit()
 
-            periods = [p for p in get_periods_for_level(cur, school_id, education_level) if p['is_teaching_period']]
+            periods = [p for p in get_periods_for_level(cur, school_id, education_level, resolved_plan_id) if p['is_teaching_period']]
 
             cur.execute("""
                 SELECT day_of_week, period_id, status FROM teacher_availability
-                WHERE school_id = %s AND staff_user_id = %s;
-            """, (school_id, teacher_id))
+                WHERE school_id = %s AND staff_user_id = %s AND plan_id = %s;
+            """, (school_id, teacher_id, resolved_plan_id))
             current = {(r['day_of_week'], r['period_id']): r['status'] for r in cur.fetchall()}
 
     status_options = [("available", "✅ Available"), ("conditional", "❔ Conditional"), ("not_available", "❌ Not Available")]
@@ -2699,13 +2702,21 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request,
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Availability — {esc(teacher['full_name'] or teacher['email'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
-        <div class="max-w-4xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
+        <div class="max-w-4xl mx-auto space-y-4">
+            <div class="bg-indigo-50 border border-indigo-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+                <label class="text-xs font-bold text-indigo-800 shrink-0">📋 Working on plan:</label>
+                <form method="get" action="/timetable/availability/{school_id}/{teacher_id}" class="flex-1 flex gap-2">
+                    <input type="hidden" name="education_level" value="{esc(education_level)}">
+                    <select name="plan_id" onchange="this.form.submit()" class="flex-1 border border-indigo-200 bg-white p-2 rounded-xl text-xs font-semibold">{plan_options_html}</select>
+                </form>
+            </div>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">👩‍🏫 {esc(teacher['full_name'] or teacher['email'])} — Availability</h2>
             <p class="text-xs text-slate-400 mb-3">Mark when this teacher is unavailable (e.g. part-time, other commitments). The timetable generator and manual editor will both respect this.</p>
             <div class="flex gap-2 flex-wrap mb-4">
                 <span class="text-xs font-bold text-slate-500 self-center mr-1">Level:</span>{level_tabs}
             </div>
-            <form action="/api/v1/timetable/availability/update/{school_id}/{teacher_id}?education_level={urllib.parse.quote(education_level)}" method="post">
+            <form action="/api/v1/timetable/availability/update/{school_id}/{teacher_id}?education_level={urllib.parse.quote(education_level)}&plan_id={resolved_plan_id}" method="post">
                 <div class="overflow-x-auto">
                     <table class="w-full border-collapse text-xs">
                         <thead><tr><th class="p-2 sticky left-0 bg-white"></th>{header_cells}</tr></thead>
@@ -2717,6 +2728,7 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request,
                     <a href="/timetable/availability/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition">← Back</a>
                 </div>
             </form>
+            </div>
         </div>
     </body>
     </html>
@@ -2724,7 +2736,7 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request,
 
 
 @router.post("/api/v1/timetable/availability/update/{school_id}/{teacher_id}")
-async def save_teacher_availability(school_id: int, teacher_id: int, request: Request, education_level: str = "Lower Primary"):
+async def save_teacher_availability(school_id: int, teacher_id: int, request: Request, education_level: str = "Lower Primary", plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2732,20 +2744,16 @@ async def save_teacher_availability(school_id: int, teacher_id: int, request: Re
     form = await request.form()
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT id FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (teacher_id, school_id))
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Teacher not found.")
 
-            cur.execute("""
-                SELECT id FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE
-                AND education_level = (
-                    CASE WHEN EXISTS (SELECT 1 FROM timetable_periods WHERE school_id = %s AND education_level = %s)
-                         THEN %s ELSE 'ALL' END
-                );
-            """, (school_id, school_id, education_level, education_level))
-            period_ids = [r[0] for r in cur.fetchall()]
-            days = get_school_days(cur, school_id)
+            resolved_plan_id = resolve_plan_id(cur, school_id, education_level, plan_id)
+
+            periods = [p for p in get_periods_for_level(cur, school_id, education_level, resolved_plan_id) if p['is_teaching_period']]
+            period_ids = [p['id'] for p in periods]
+            days = get_school_days(cur, school_id, resolved_plan_id)
 
             for day in days:
                 for period_id in period_ids:
@@ -2755,18 +2763,27 @@ async def save_teacher_availability(school_id: int, teacher_id: int, request: Re
                         # Available is the implicit default — no need to store a row for it.
                         cur.execute("""
                             DELETE FROM teacher_availability
-                            WHERE school_id = %s AND staff_user_id = %s AND day_of_week = %s AND period_id = %s;
-                        """, (school_id, teacher_id, day, period_id))
+                            WHERE school_id = %s AND staff_user_id = %s AND day_of_week = %s AND period_id = %s AND plan_id = %s;
+                        """, (school_id, teacher_id, day, period_id, resolved_plan_id))
                     else:
+                        # ON CONFLICT targets the actual current unique
+                        # constraint — (school_id, staff_user_id,
+                        # day_of_week, period_id, plan_id), widened to
+                        # include plan_id when multi-plan support was
+                        # added. The 4-column version this used to say no
+                        # longer matches any real constraint on the table,
+                        # so every save through this exact path was
+                        # failing outright with a live Postgres error the
+                        # moment that migration ran, until this fix.
                         cur.execute("""
-                            INSERT INTO teacher_availability (school_id, staff_user_id, day_of_week, period_id, status)
-                            VALUES (%s, %s, %s, %s, %s)
-                            ON CONFLICT (school_id, staff_user_id, day_of_week, period_id)
+                            INSERT INTO teacher_availability (school_id, staff_user_id, day_of_week, period_id, status, plan_id)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (school_id, staff_user_id, day_of_week, period_id, plan_id)
                             DO UPDATE SET status = EXCLUDED.status;
-                        """, (school_id, teacher_id, day, period_id, status))
+                        """, (school_id, teacher_id, day, period_id, status, resolved_plan_id))
             conn.commit()
 
-    return RedirectResponse(url=f"/timetable/availability/{school_id}/{teacher_id}?education_level={urllib.parse.quote(education_level)}", status_code=303)
+    return RedirectResponse(url=f"/timetable/availability/{school_id}/{teacher_id}?education_level={urllib.parse.quote(education_level)}&plan_id={resolved_plan_id}", status_code=303)
 
 
 @router.get("/timetable/subject-availability/{school_id}", response_class=HTMLResponse)
