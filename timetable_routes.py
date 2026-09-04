@@ -109,18 +109,18 @@ DEFAULT_SUBJECT_COLORS = [
 # name always lands on the same pair, so a subject is visually consistent
 # across every report without needing to be pre-configured.
 SUBJECT_COLOR_PALETTE = [
-    ("#FEF3C7", "#92400E"),  # amber
-    ("#D1FAE5", "#065F46"),  # emerald
-    ("#FCE7F3", "#9D174D"),  # pink
-    ("#DBEAFE", "#1E40AF"),  # blue
-    ("#FFEDD5", "#9A3412"),  # orange
-    ("#EDE9FE", "#5B21B6"),  # violet
-    ("#CCFBF1", "#115E59"),  # teal
-    ("#FEE2E2", "#991B1B"),  # red
-    ("#E0E7FF", "#3730A3"),  # indigo
-    ("#ECFCCB", "#3F6212"),  # lime
-    ("#CFFAFE", "#155E75"),  # cyan
-    ("#FFE4E6", "#9F1239"),  # rose
+    ("#F6EDD9", "#7A5A0E"),  # ochre
+    ("#E4EDE0", "#37522B"),  # sage
+    ("#F2E2D5", "#8A4A25"),  # clay
+    ("#DEE7EE", "#2C4C68"),  # dusty blue
+    ("#EBE1EA", "#5B3560"),  # plum
+    ("#DCEDEA", "#1D5C54"),  # teal
+    ("#EEE1E1", "#7A3230"),  # wine
+    ("#ECEAD6", "#565A1E"),  # olive
+    ("#E2E3EF", "#35396E"),  # periwinkle
+    ("#F0E8D9", "#6E5730"),  # sand
+    ("#DFEAE1", "#285C3D"),  # forest
+    ("#F1E3E6", "#79374B"),  # dusty rose
 ]
 
 def get_subject_color(name: str):
@@ -3485,9 +3485,9 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
         if p_type in ('break', 'prep'):
             label_note = "Prep Time (protected)" if p_type == 'prep' else p['label']
             body_rows += f"""
-            <tr class="bg-slate-50">
-                <td class="p-2 text-xs font-bold text-slate-500 whitespace-nowrap">{esc(p['label'])}<br><span class="font-normal text-slate-400">{esc(p['start_time'] or '')}–{esc(p['end_time'] or '')}</span></td>
-                <td colspan="{len(days)}" class="p-2 text-center text-xs italic text-slate-400">{esc(label_note)}</td>
+            <tr style="background:#F2EEE4;">
+                <td class="p-2 text-xs font-bold whitespace-nowrap" style="color:#8A7F6C;">{esc(p['label'])}<br><span class="font-normal" style="color:#B3A996;">{esc(p['start_time'] or '')}–{esc(p['end_time'] or '')}</span></td>
+                <td colspan="{len(days)}" class="p-2 text-center text-xs italic" style="color:#B3A996;">{esc(label_note)}</td>
             </tr>
             """
             continue
@@ -3521,14 +3521,14 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
                     <input type="hidden" name="stream" value="{esc(stream)}">
                     <input type="hidden" name="day_of_week" value="{day}">
                     <input type="hidden" name="period_id" value="{p['id']}">
-                    <select name="subject_choice" onchange="this.form.submit()" class="w-full border p-1.5 rounded-lg text-[11px] font-semibold bg-white">{options}</select>
-                    {f"<p class='text-[9px] text-slate-400 text-center truncate'>{esc(teacher_label)}</p>" if teacher_label else ""}
+                    <select name="subject_choice" onchange="this.form.submit()" class="w-full p-1.5 rounded-lg text-[11px] font-semibold bg-white" style="border:1px solid #E4DFD3;">{options}</select>
+                    {f"<p class='text-[9px] text-center truncate' style=\"color:#A79C87;\">{esc(teacher_label)}</p>" if teacher_label else ""}
                 </form>
             </td>
             """
         body_rows += f"""
-        <tr class="border-b border-slate-100">
-            <td class="p-2 text-xs font-bold text-slate-600 whitespace-nowrap align-top">{esc(p['label'])}<br><span class="font-normal text-slate-400">{esc(p['start_time'] or '')}–{esc(p['end_time'] or '')}</span></td>
+        <tr style="border-bottom:1px solid #F2EEE4;">
+            <td class="p-2 text-xs font-bold whitespace-nowrap align-top" style="color:#5A5346;">{esc(p['label'])}<br><span class="font-normal" style="color:#A79C87;">{esc(p['start_time'] or '')}–{esc(p['end_time'] or '')}</span></td>
             {row_cells}
         </tr>
         """
@@ -3595,41 +3595,41 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Elimu Hub | Timetable — {esc(section_label)}</title>
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
+        <link href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+        <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }} .slab {{ font-family: 'Zilla Slab', serif; }}</style>
     </head>
-    <body class="bg-[#F7F9F8] min-h-screen">
-        <header class="bg-white border-b px-6 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
+    <body class="min-h-screen" style="background:#F5F1E8;">
+        <header class="px-6 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3" style="background:#FFFDF8;border-bottom:3px solid #046A38;">
             <div>
-                <h1 class="text-base font-bold text-slate-900">📅 {esc(section_label)} Timetable</h1>
-                <p class="text-xs text-slate-400">{esc(school['name'] if school else '')} — {esc(education_level)}</p>
+                <h1 class="slab text-lg font-bold" style="color:#2B2620;">{esc(section_label)} Timetable</h1>
+                <p class="text-xs" style="color:#8A7F6C;">{esc(school['name'] if school else '')} — {esc(education_level)}</p>
             </div>
             <div class="flex flex-wrap gap-2">
-                <a href="/timetable/dashboard/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-4 py-2 rounded-xl text-xs font-bold transition" title="Generation now only runs per education level or for the whole school — that's the only way teacher/room collisions across classes get checked properly.">🧪 Generate from Timetable Workspace →</a>
+                <a href="/timetable/dashboard/{school_id}" class="px-4 py-2 rounded-xl text-xs font-bold transition" style="background:#EAF2EC;color:#1D5C34;border:1px solid #C9DFCE;" title="Generation now only runs per education level or for the whole school — that's the only way teacher/room collisions across classes get checked properly.">🧪 Generate from Timetable Workspace →</a>
                 <form action="/api/v1/timetable/sync-teachers/{school_id}" method="post" onsubmit="return confirm('Sync teacher names for {esc(section_label)}? This updates which teacher shows on each already-scheduled subject to match the current Assignments — day/period placement is left exactly as it is.');">
                     <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                     <input type="hidden" name="education_level" value="{esc(education_level)}">
                     <input type="hidden" name="stream" value="{esc(stream)}">
-                    <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-xl text-xs font-bold transition shadow-sm">🔄 Sync Teacher Names</button>
+                    <button type="submit" class="px-4 py-2 rounded-xl text-xs font-bold transition" style="background:#046A38;color:white;">🔄 Sync Teacher Names</button>
                 </form>
                 <form action="/api/v1/timetable/new/{school_id}" method="post" onsubmit="return confirm('Start a brand-new BLANK timetable for {esc(section_label)}? This clears every period currently scheduled — you\\'ll build it up from scratch by hand. This cannot be undone.');">
                     <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                     <input type="hidden" name="education_level" value="{esc(education_level)}">
                     <input type="hidden" name="stream" value="{esc(stream)}">
-                    <button type="submit" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">＋ New</button>
+                    <button type="submit" class="px-4 py-2 rounded-xl text-xs font-bold transition" style="background:white;color:#5A5346;border:1px solid #E4DFD3;">＋ New</button>
                 </form>
-                <a href="/timetable/print/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" target="_blank" class="bg-teal-700 hover:bg-teal-800 text-white px-4 py-2 rounded-xl text-xs font-bold transition">🖨 Print</a>
-                <a href="/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">Teachers</a>
-                <a href="/timetable/dashboard/{school_id}" class="bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 px-4 py-2 rounded-xl text-xs font-bold transition">← Back</a>
+                <a href="/timetable/print/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" target="_blank" class="px-4 py-2 rounded-xl text-xs font-bold transition" style="background:#2B2620;color:white;">🖨 Print</a>
+                <a href="/timetable/assignments/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}" class="px-4 py-2 rounded-xl text-xs font-bold transition" style="background:white;color:#5A5346;border:1px solid #E4DFD3;">Teachers</a>
+                <a href="/timetable/dashboard/{school_id}" class="px-4 py-2 rounded-xl text-xs font-bold transition" style="background:white;color:#5A5346;border:1px solid #E4DFD3;">← Back</a>
             </div>
         </header>
-        {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4'>✅ Teacher names synced from current Assignments — day/period placement was left untouched.</div>" if synced == "ok" else ""}
-        {"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4'>⚠️ Nothing to sync — no timetable has been generated for this class yet. Use Test &amp; Generate first.</div>" if synced == "none" else ""}
+        {"<div class='text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4' style=\"background:#EAF2EC;border:1px solid #C9DFCE;color:#1D5C34;\">✅ Teacher names synced from current Assignments — day/period placement was left untouched.</div>" if synced == "ok" else ""}
+        {"<div class='text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4' style=\"background:#F6EDD9;border:1px solid #E5D6AE;color:#7A5A0E;\">⚠️ Nothing to sync — no timetable has been generated for this class yet. Use Test &amp; Generate first.</div>" if synced == "none" else ""}
         {test_issues_html}
         <div class="p-4 sm:p-8 max-w-6xl mx-auto overflow-x-auto">
-            <table class="w-full border-collapse bg-white rounded-2xl overflow-hidden border shadow-xs text-xs" style="min-width:700px;">
+            <table class="w-full border-collapse rounded-2xl overflow-hidden text-xs" style="min-width:700px;background:#FFFDF8;border:1px solid #E4DFD3;box-shadow:0 1px 3px rgba(43,38,32,0.06);">
                 <thead>
-                    <tr class="bg-slate-50 text-slate-500 text-[10px] font-bold uppercase tracking-wider border-b">
+                    <tr class="text-[10px] font-bold uppercase tracking-wider" style="background:#F2EEE4;color:#8A7F6C;border-bottom:1px solid #E4DFD3;">
                         <th class="p-2 text-left">Period</th>
                         {header_cells}
                     </tr>
@@ -5234,33 +5234,37 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
     to be assigned a subject; cell_lookup_fn is never even consulted for
     them. cell_lookup_fn(day, period) returns the inner HTML for a teaching-
     period cell (or None/'' for a free slot) — or a (html, bg_color_hex)
-    tuple if the cell should be color-coded (e.g. by subject)."""
+    tuple if the cell should be color-coded (e.g. by subject).
+
+    Warm, paper-toned palette (ink/taupe/brand-green) — deliberately not
+    the cool slate-gray defaults most generated UI reaches for, since this
+    is meant to read like a physical school document, not a SaaS export."""
     header_cells = "".join(
-        f"<th style='padding:12px 10px;font-size:17px;{'background:#eef2f7;' if not p['is_teaching_period'] else ''}'>{esc(p['short_label'] or p['label'])}</th>"
+        f"<th style='padding:12px 10px;font-size:17px;color:#2B2620;{'background:#EFEAE0;' if not p['is_teaching_period'] else ''}'>{esc(p['short_label'] or p['label'])}</th>"
         for p in periods
     )
     time_cells = "".join(
-        f"<th style='font-weight:normal;font-size:14px;color:#64748b;padding-bottom:8px;'>{esc(p['start_time'] or '')}-{esc(p['end_time'] or '')}</th>"
+        f"<th style='font-weight:normal;font-size:13px;color:#8A7F6C;padding-bottom:8px;'>{esc(p['start_time'] or '')}-{esc(p['end_time'] or '')}</th>"
         for p in periods
     )
 
     body_rows = ""
     for day_i, day in enumerate(days):
-        row = f"<td style='padding:18px 16px;font-weight:bold;font-size:18px;white-space:nowrap;border:1px solid #cbd5e1;'>{esc(day[:2].upper())}</td>"
+        row = f"<td style='padding:18px 16px;font-weight:bold;font-size:17px;white-space:nowrap;border:1px solid #E4DFD3;background:#EAF2EC;color:#1D5C34;'>{esc(day[:2].upper())}</td>"
         for p in periods:
             p_type = p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')
             if p_type == 'break':
                 if day_i == 0:
                     row += (
-                        f"<td rowspan='{len(days)}' style='border:1px solid #cbd5e1;text-align:center;background:#f1f5f9;'>"
-                        f"<div style='writing-mode:vertical-rl;transform:rotate(180deg);font-size:16px;font-weight:bold;"
-                        f"color:#475569;white-space:nowrap;margin:0 auto;'>{esc(p['label'])}</div></td>"
+                        f"<td rowspan='{len(days)}' style='border:1px solid #E4DFD3;text-align:center;background:#F2EEE4;'>"
+                        f"<div style='writing-mode:vertical-rl;transform:rotate(180deg);font-size:15px;font-weight:bold;"
+                        f"color:#8A7F6C;white-space:nowrap;margin:0 auto;'>{esc(p['label'])}</div></td>"
                     )
                 continue  # subsequent days: cell already covered by row 1's rowspan
             if p_type == 'prep':
                 row += (
-                    "<td style='padding:18px 10px;text-align:center;border:1px solid #e2e8f0;background:#f5f3ff;'>"
-                    "<span style='font-size:15px;font-weight:bold;color:#6d28d9;'>PREP</span></td>"
+                    "<td style='padding:18px 10px;text-align:center;border:1px solid #E4DFD3;background:#EBE1EA;'>"
+                    "<span style='font-size:14px;font-weight:bold;color:#5B3560;'>PREP</span></td>"
                 )
                 continue
 
@@ -5271,15 +5275,15 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
                 cell_bg = f"background:{bg_color};" if bg_color else ""
             else:
                 content = result
-            content = content or "<span style='color:#cbd5e1;'>-</span>"
-            row += f"<td style='padding:18px 10px;text-align:center;border:1px solid #e2e8f0;{cell_bg}'>{content}</td>"
+            content = content or "<span style='color:#C9C0AE;'>-</span>"
+            row += f"<td style='padding:18px 10px;text-align:center;border:1px solid #E4DFD3;{cell_bg}'>{content}</td>"
         body_rows += f"<tr>{row}</tr>"
 
     return f"""
-    <table style="width:100%;height:100%;border-collapse:collapse;font-size:19px;margin-top:18px;table-layout:fixed;">
+    <table style="width:100%;height:100%;border-collapse:collapse;font-size:19px;margin-top:18px;table-layout:fixed;font-family:'Plus Jakarta Sans',sans-serif;">
         <thead>
-            <tr style="background:#f8fafc;"><th style="padding:10px;"></th>{header_cells}</tr>
-            <tr style="background:#f8fafc;"><th></th>{time_cells}</tr>
+            <tr style="background:#F2EEE4;"><th style="padding:10px;"></th>{header_cells}</tr>
+            <tr style="background:#F2EEE4;"><th></th>{time_cells}</tr>
         </thead>
         <tbody>{body_rows}</tbody>
     </table>
@@ -5489,29 +5493,30 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Elimu Hub | Timetable — {esc(section_label)}</title>
+        <link href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
         <style>
             @page {{ size: A4 landscape; margin: 5mm; }}
-            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; background:#f1f5f9; }}
+            body {{ font-family: 'Plus Jakarta Sans', sans-serif; padding: 20px; color: #2B2620; background: #F5F1E8; }}
             @media print {{ .no-print {{ display: none !important; }} body {{ background: white; padding: 0; }} }}
-            th {{ background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:10px; text-transform:uppercase; color:#64748b; }}
-            .print-page {{ max-width: 287mm; margin: 0 auto; background: white; padding: 14mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
+            th {{ background: #F2EEE4; border-bottom: 2px solid #E4DFD3; font-size: 10px; text-transform: uppercase; color: #8A7F6C; }}
+            .print-page {{ max-width: 287mm; margin: 0 auto; background: #FFFDF8; padding: 14mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(43,38,32,0.1); }}
             @media print {{ .print-page {{ box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; }} }}
         </style>
     </head>
     <body>
         <div class="no-print" style="text-align:right; margin-bottom:16px; max-width:267mm; margin-left:auto; margin-right:auto;">
-            <button onclick="window.print()" style="background:#4f46e5;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#94a3b8;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
+            <button onclick="window.print()" style="background:#046A38;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;font-family:'Plus Jakarta Sans',sans-serif;">🖨 Print / Save as PDF</button><p style="font-size:10px;color:#8A7F6C;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download a file instead of printing on paper.</p>
         </div>
         <div class="print-page">
-            <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
+            <div style="display:flex;align-items:center;gap:16px;border-bottom:3px solid #046A38;padding-bottom:14px;">
                 {logo_html}
                 <div>
-                    <h1 style="margin:0;font-size:18px;">{esc(school['name'] if school else '')}</h1>
-                    <p style="margin:2px 0 0;font-size:15px;font-weight:bold;">CLASS TIMETABLE — {esc(section_label)} ({esc(education_level)})</p>
+                    <h1 style="margin:0;font-family:'Zilla Slab',serif;font-weight:700;font-size:23px;color:#2B2620;">{esc(school['name'] if school else '')}</h1>
+                    <p style="margin:4px 0 0;font-size:14px;font-weight:600;color:#1D5C34;letter-spacing:0.2px;">Class Timetable — {esc(section_label)} ({esc(education_level)})</p>
                 </div>
             </div>
             {grid_html}
-            <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#94a3b8;">
+            <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#A79C87;">
                 <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
                 <span>{esc(school['name'] if school else '')} — Powered by Elimu Hub</span>
             </div>
