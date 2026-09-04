@@ -1340,7 +1340,10 @@ def login_portal():
                 </div>
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">Security Passphrase</label>
-                    <input type="password" name="password" class="w-full p-3 border rounded-lg mt-1 focus:ring-2 focus:ring-emerald-600 outline-none" required>
+                    <div class="relative mt-1">
+                        <input type="password" name="password" id="loginPasswordField" class="w-full p-3 pr-11 border rounded-lg focus:ring-2 focus:ring-emerald-600 outline-none" required>
+                        <button type="button" onclick="const f=document.getElementById('loginPasswordField'); const isHidden=f.type==='password'; f.type=isHidden?'text':'password'; this.textContent=isHidden?'Hide':'Show';" class="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-bold text-slate-400 hover:text-slate-600">Show</button>
+                    </div>
                 </div>
                 <button type="submit" class="w-full bg-emerald-700 text-white p-3.5 rounded-lg font-black tracking-wide hover:bg-emerald-800 transition shadow-lg">Authenticate Instance</button>
             </form>
