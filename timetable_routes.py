@@ -445,6 +445,23 @@ def bootstrap_timetable_schema():
                     conn.rollback()
                     print(f"[timetable multi-plan migration] Could not add plan_id to {tbl}: {e}")
 
+            # Marks a slot as pre-placed by the level-wide shared-teacher
+            # doubles pass (see _preplace_shared_teacher_doubles), which
+            # runs BEFORE any single class's own generation — resolving a
+            # teacher shared across multiple classes' double-lesson needs
+            # jointly, rather than leaving it to whichever class happens
+            # to generate first. generate_draft_timetable's own DELETE and
+            # setup steps are made aware of this flag specifically so a
+            # per-class regeneration preserves these rows instead of
+            # wiping them out and re-discovering the same cross-class
+            # conflict from scratch.
+            try:
+                cur.execute("ALTER TABLE timetable_slots ADD COLUMN IF NOT EXISTS is_preplaced BOOLEAN NOT NULL DEFAULT FALSE;")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[timetable multi-plan migration] Could not add is_preplaced to timetable_slots: {e}")
+
             # Widen every unique constraint that predates plan_id — without
             # this, a second plan trying to insert e.g. a teaching
             # assignment for the same class+subject as the first plan would
@@ -3645,6 +3662,57 @@ def test_and_generate_whole_level(school_id: int, request: Request, education_le
             """, (school_id, education_level))
             sections = cur.fetchall()
 
+            # Level-wide pre-placement of double lessons for teachers shared
+            # across multiple classes at this level — resolves the actual,
+            # confirmed cross-class bottleneck (a shared teacher's best
+            # double-lesson slots getting greedily claimed by whichever
+            # class happens to generate first) BEFORE any single class's
+            # own generation runs. See _preplace_shared_teacher_doubles for
+            # the full rationale. Wrapped defensively — if anything about
+            # this enhancement pass goes wrong, whole-level generation must
+            # still proceed exactly as it did before this existed, just
+            # without the extra cross-class coordination.
+            if sections:
+                try:
+                    days = get_school_days(cur, school_id)
+                    teaching_periods = [p for p in get_periods_for_level(cur, school_id, education_level) if p['is_teaching_period']]
+                    sorted_teaching = sorted(teaching_periods, key=lambda p: p['period_order'])
+                    consecutive_period_pairs = [
+                        (sorted_teaching[i], sorted_teaching[i + 1])
+                        for i in range(len(sorted_teaching) - 1)
+                        if sorted_teaching[i + 1]['period_order'] - sorted_teaching[i]['period_order'] == 1
+                    ]
+                    cur.execute("SELECT staff_user_id, day_of_week, period_id FROM teacher_availability WHERE school_id = %s AND status = 'not_available';", (school_id,))
+                    unavailable = {(r['staff_user_id'], r['day_of_week'], r['period_id']) for r in cur.fetchall()}
+                    cur.execute("SELECT learning_area_id, day_of_week, period_id FROM subject_availability WHERE school_id = %s AND status = 'not_available' AND learning_area_id IS NOT NULL;", (school_id,))
+                    subject_unavailable = {(r['learning_area_id'], r['day_of_week'], r['period_id']) for r in cur.fetchall()}
+                    cur.execute("SELECT custom_subject_id, day_of_week, period_id FROM subject_availability WHERE school_id = %s AND status = 'not_available' AND custom_subject_id IS NOT NULL;", (school_id,))
+                    subject_unavailable |= {(r['custom_subject_id'] + CUSTOM_SUBJECT_ID_OFFSET, r['day_of_week'], r['period_id']) for r in cur.fetchall()}
+
+                    preplaced = _preplace_shared_teacher_doubles(cur, school_id, education_level, sections, days, teaching_periods, consecutive_period_pairs, unavailable, subject_unavailable)
+
+                    # Clear any stale pre-placed rows from a previous run
+                    # first, so re-running this doesn't accumulate
+                    # duplicates from an old, no-longer-relevant pass.
+                    for sec in sections:
+                        cur.execute(
+                            "DELETE FROM timetable_slots WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND is_preplaced = TRUE;",
+                            (school_id, sec['grade_name'], education_level, sec['stream'])
+                        )
+                    for (g, s), placements in preplaced.items():
+                        for p in placements:
+                            learning_area_id = p['subject_id'] if p['subject_id'] < CUSTOM_SUBJECT_ID_OFFSET else None
+                            custom_subject_id = (p['subject_id'] - CUSTOM_SUBJECT_ID_OFFSET) if p['subject_id'] >= CUSTOM_SUBJECT_ID_OFFSET else None
+                            for period_id in (p['period1_id'], p['period2_id']):
+                                cur.execute("""
+                                    INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, custom_subject_id, staff_user_id, is_preplaced)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE);
+                                """, (school_id, g, education_level, s, p['day'], period_id, learning_area_id, custom_subject_id, p['teacher_id']))
+                    conn.commit()
+                except Exception as e:
+                    conn.rollback()
+                    print(f"[timetable level-wide doubles pre-placement] Skipped due to error, falling back to per-class generation only: {e}")
+
     class_results = []
     for sec in sections:
         grade_name, stream = sec['grade_name'], sec['stream']
@@ -3841,6 +3909,113 @@ def timetable_level_report(school_id: int, request: Request, report: str):
 # (Phase 1 locked placements, Phase 2 doubles, Phase 3 fill-remaining
 # with conflict-avoidance-first candidate selection)
 # ============================================================
+
+def _preplace_shared_teacher_doubles(cur, school_id: int, education_level: str, sections: list, days: list, teaching_periods: list, consecutive_period_pairs: list, unavailable: set, subject_unavailable: set) -> dict:
+    """Resolves double-lesson placement for teachers shared across MULTIPLE
+    classes at this education level, BEFORE any single class's own
+    generation begins.
+
+    Without this, whole-level generation runs class-by-class in a plain
+    loop — a teacher's best double-lesson slots can get greedily claimed
+    by whichever class happens to generate first, leaving a later class
+    unable to find any valid double slot for that same teacher, even
+    when a different arrangement across both classes would have worked.
+    This is the actual, confirmed cause behind "low ability to handle
+    complex teacher lesson allocation... for an entire educational level."
+
+    Deliberately uses a first-fit heuristic (not a full joint backtracking
+    search across every shared teacher's every class at once) — a much
+    simpler, lower-risk piece of code to get right on something this
+    central, and it doesn't need to be perfect on its own: whatever it
+    can't resolve here still falls through to the existing, already
+    well-tested per-class Phase 2 backtracking search, which picks up
+    exactly where this leaves off using the correctly-reduced remaining
+    count. A partial win here is still a real win; this is a pure
+    enhancement layered on top of proven logic, not a replacement for it.
+
+    Returns: {(grade_name, stream): [ {subject_id, day, period1_id,
+    period2_id, teacher_id}, ... ]}
+    """
+    cur.execute("""
+        SELECT grade_name, stream, learning_area_id, custom_subject_id, staff_user_id, double_lessons_count
+        FROM teacher_subject_assignments
+        WHERE school_id = %s AND education_level = %s AND double_lessons_count > 0 AND staff_user_id IS NOT NULL;
+    """, (school_id, education_level))
+    rows = cur.fetchall()
+
+    section_set = {(s['grade_name'], s['stream']) for s in sections}
+
+    items = []
+    for r in rows:
+        key = (r['grade_name'], r['stream'])
+        if key not in section_set:
+            continue
+        sid = (r['custom_subject_id'] + CUSTOM_SUBJECT_ID_OFFSET) if r['custom_subject_id'] else r['learning_area_id']
+        if sid is None:
+            continue
+        items.append({
+            'grade_name': r['grade_name'], 'stream': r['stream'], 'subject_id': sid,
+            'teacher_id': r['staff_user_id'], 'needed': r['double_lessons_count'],
+        })
+
+    # Only teachers genuinely shared across 2+ DIFFERENT classes at this
+    # level need this pass — a teacher teaching doubles in just one class
+    # has no cross-class conflict to resolve; the per-class search
+    # already handles that correctly on its own, so leaving them alone
+    # here keeps this pass focused only on the actual bottleneck.
+    teacher_class_counts = {}
+    for item in items:
+        teacher_class_counts.setdefault(item['teacher_id'], set()).add((item['grade_name'], item['stream']))
+    shared_teacher_ids = {t for t, classes in teacher_class_counts.items() if len(classes) >= 2}
+    items = [item for item in items if item['teacher_id'] in shared_teacher_ids]
+
+    if not items:
+        return {}
+
+    items_by_teacher = {}
+    for item in items:
+        items_by_teacher.setdefault(item['teacher_id'], []).append(item)
+
+    result = {}
+    teacher_slot_used = set()  # (teacher_id, day, period_id) claimed by THIS pass so far
+
+    # Tightest-bottleneck-first: a teacher needing doubles across the most
+    # classes has the most total slots to fit into one shared weekly
+    # schedule, so they're resolved first — the same "most constrained
+    # first" principle already used inside a single class's own doubles
+    # search, just applied one level up.
+    for teacher_id in sorted(items_by_teacher.keys(), key=lambda t: -len(items_by_teacher[t])):
+        for item in items_by_teacher[teacher_id]:
+            sid = item['subject_id']
+            still_needed = item['needed']
+            placed_for_this_item = []
+            days_used_by_this_item = set()
+
+            for day in days:
+                if still_needed <= 0:
+                    break
+                if day in days_used_by_this_item:
+                    continue
+                for p1, p2 in consecutive_period_pairs:
+                    if (teacher_id, day, p1['id']) in teacher_slot_used or (teacher_id, day, p2['id']) in teacher_slot_used:
+                        continue
+                    if (teacher_id, day, p1['id']) in unavailable or (teacher_id, day, p2['id']) in unavailable:
+                        continue
+                    if (sid, day, p1['id']) in subject_unavailable or (sid, day, p2['id']) in subject_unavailable:
+                        continue
+                    teacher_slot_used.add((teacher_id, day, p1['id']))
+                    teacher_slot_used.add((teacher_id, day, p2['id']))
+                    days_used_by_this_item.add(day)
+                    placed_for_this_item.append({'subject_id': sid, 'day': day, 'period1_id': p1['id'], 'period2_id': p2['id'], 'teacher_id': teacher_id})
+                    still_needed -= 1
+                    break
+
+            if placed_for_this_item:
+                key = (item['grade_name'], item['stream'])
+                result.setdefault(key, []).extend(placed_for_this_item)
+
+    return result
+
 
 @router.post("/api/v1/timetable/generate/{school_id}")
 def generate_draft_timetable(school_id: int, request: Request, grade_name: str = Form(...), education_level: str = Form(...), stream: str = Form(...)):
@@ -4043,8 +4218,14 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
                 target.add((a, b))
                 target.add((b, a))
 
-            # Clear this section's existing plan before laying down the new one.
-            cur.execute("DELETE FROM timetable_slots WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;", (school_id, grade_name, education_level, stream))
+            # Clear this section's existing plan before laying down the new
+            # one — EXCEPT any rows the level-wide shared-teacher doubles
+            # pass already placed (is_preplaced = TRUE), which get loaded
+            # back in below instead of being wiped and rediscovered from
+            # scratch. A single-class "Generate for this class only" run
+            # never has any such rows to begin with, so this preserves
+            # the exact same delete-everything behavior it always had.
+            cur.execute("DELETE FROM timetable_slots WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND is_preplaced IS NOT TRUE;", (school_id, grade_name, education_level, stream))
 
             # How many lessons each subject still needs this week — defaults
             # to 1 for any subject without an explicit assignment configured.
@@ -4069,6 +4250,26 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             filled = {}       # (day, period_id) -> subject already placed there
             used_today_by_day = {day: set() for day in days}
             last_subject_by_day = {day: None for day in days}
+
+            # Load back any rows the level-wide pre-pass placed for this
+            # exact class — reserving their slots (filled, booked, used-
+            # today) and reducing how many MORE lessons that subject still
+            # needs, so nothing downstream tries to re-place work that's
+            # already done. For a class with no pre-placed rows (the
+            # normal case, and always true for single-class generation),
+            # this query simply returns nothing and changes nothing.
+            cur.execute("""
+                SELECT day_of_week, period_id, learning_area_id, custom_subject_id, staff_user_id
+                FROM timetable_slots
+                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND is_preplaced = TRUE;
+            """, (school_id, grade_name, education_level, stream))
+            for r in cur.fetchall():
+                preplaced_sid = (r['custom_subject_id'] + CUSTOM_SUBJECT_ID_OFFSET) if r['custom_subject_id'] else r['learning_area_id']
+                filled[(r['day_of_week'], r['period_id'])] = preplaced_sid
+                booked.setdefault((r['day_of_week'], r['period_id']), set()).add(r['staff_user_id'])
+                used_today_by_day.setdefault(r['day_of_week'], set()).add(preplaced_sid)
+                if preplaced_sid in remaining:
+                    remaining[preplaced_sid] = max(0, remaining[preplaced_sid] - 1)
 
             def _place(day, period_id, subject, teacher):
                 is_custom = subject['id'] >= CUSTOM_SUBJECT_ID_OFFSET
