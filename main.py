@@ -3228,6 +3228,17 @@ def superadmin_reset_admin_password_form(school_id: int, request: Request, done:
             <p class="text-xs mt-1">They can log in with it and change it afterward. It was never shown here.</p>
         </div>
         """
+    elif done == "failed" and admin:
+        # The email genuinely failed to send — the password was
+        # deliberately left unchanged (see the POST handler), so the
+        # admin's old password still works and this is safe to retry
+        # once the email issue is fixed.
+        result_html = f"""
+        <div class="bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-lg mb-4">
+            <p class="font-bold">Couldn't send the email to {esc(admin['email'])}.</p>
+            <p class="text-xs mt-1">The password was NOT changed — their current one still works. Check your SMTP setup (SMTP_USERNAME / SMTP_PASSWORD on Render) and try again.</p>
+        </div>
+        """
 
     if not admin:
         admin_block = "<p class='text-sm text-rose-600'>No admin account found for this school.</p>"
@@ -3277,16 +3288,16 @@ def superadmin_reset_admin_password_submit(school_id: int, request: Request):
             admin = cur.fetchone()
             if not admin:
                 raise HTTPException(status_code=404, detail="No admin account found for this school.")
-            cur.execute("UPDATE users SET password_hash = %s WHERE id = %s;", (hashed_password, admin['id']))
-            conn.commit()
 
-            # Emailed directly to the account holder — never shown to the
-            # super admin at all, on-screen or otherwise. Previously this
-            # was passed back through the URL and displayed on the super
-            # admin's own screen for manual relay, which meant a stranger
-            # to the account was the one actually seeing the password.
+            # Email sent BEFORE the password is actually changed in the
+            # database — deliberately. If the send fails and the password
+            # had already been updated, the admin would be locked out
+            # with a new password nobody knows and no way to receive it.
+            # Sending first means a failed email just leaves their old
+            # password working, safe to retry, instead of a genuine
+            # lockout.
             greeting_name = (admin['full_name'] or admin['email']).split(" ")[0]
-            send_email(
+            email_sent = send_email(
                 admin['email'],
                 "Your Elimu Hub password has been reset",
                 f"""
@@ -3298,9 +3309,12 @@ def superadmin_reset_admin_password_submit(school_id: int, request: Request):
                 """
             )
 
+            if email_sent:
+                cur.execute("UPDATE users SET password_hash = %s WHERE id = %s;", (hashed_password, admin['id']))
+                conn.commit()
 
     return RedirectResponse(
-        url=f"/superadmin/school/reset-admin-password/{school_id}?done=1",
+        url=f"/superadmin/school/reset-admin-password/{school_id}?done={'1' if email_sent else 'failed'}",
         status_code=303
     )
 
