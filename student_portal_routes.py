@@ -45,6 +45,47 @@ from shared import (
 
 router = APIRouter()
 
+# Installable as its own separate PWA — distinct name/icon/scope from the
+# main staff/admin app, registered with an explicit scope since the
+# service worker script itself lives under /static/, outside the
+# /student/ path it needs to control. Without the explicit scope option,
+# the browser would default to scoping this to /static/ (the script's own
+# directory) and it would never actually cover any real learner page.
+STUDENT_PWA_HEAD_SNIPPET = """
+<link rel="manifest" href="/static/student-manifest.json">
+<meta name="theme-color" content="#047857">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Elimu Learner">
+<script>
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/static/student-sw.js', { scope: '/student/' }).then((reg) => {
+            reg.addEventListener('updatefound', () => {
+                const newWorker = reg.installing;
+                if (!newWorker) return;
+                newWorker.addEventListener('statechange', () => {
+                    if (newWorker.state === 'activated' && navigator.serviceWorker.controller) {
+                        showStudentUpdateBanner();
+                    }
+                });
+            });
+        }).catch(() => {});
+    });
+}
+function showStudentUpdateBanner() {
+    if (document.getElementById('elimu-learner-update-banner')) return;
+    const banner = document.createElement('div');
+    banner.id = 'elimu-learner-update-banner';
+    banner.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:#047857;color:white;padding:12px 16px;text-align:center;font-size:13px;font-weight:600;z-index:9999;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 -2px 10px rgba(0,0,0,0.15);';
+    banner.innerHTML = 'A new version is available. <button id="elimu-learner-update-btn" style="background:white;color:#047857;border:none;padding:6px 14px;border-radius:8px;font-weight:700;font-size:12px;cursor:pointer;">Refresh Now</button>';
+    document.body.appendChild(banner);
+    document.getElementById('elimu-learner-update-btn').onclick = () => window.location.reload();
+}
+</script>
+"""
+
 
 def _grade_part_matches(grade_part: str, grade_name: str) -> bool:
     """Matches the "#1" part of a login password against a student's
@@ -114,6 +155,7 @@ def student_login_page(request: Request, error: str = None):
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Elimu Hub | Learner Portal</title>
+        {STUDENT_PWA_HEAD_SNIPPET}
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
     <body class="bg-slate-900 flex items-center justify-center min-h-screen font-sans p-4">
