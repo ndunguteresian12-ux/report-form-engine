@@ -42,6 +42,7 @@ from shared import (
     get_current_session_user, get_teacher_class_keys, teacher_can_access_class,
     is_teacher_of_this_class,
 )
+from finance_routes import _compute_balance_after
 
 router = APIRouter()
 
@@ -282,6 +283,195 @@ def student_logout():
     response = RedirectResponse(url="/student/login", status_code=303)
     response.delete_cookie("session_student_id")
     return response
+
+
+# ============================================================
+# The actual dashboard — everything a learner should see about
+# their own school life: performance, fees, school dates, and
+# progress over time. Nothing here is admin/staff-editable from
+# this side; it's read-only, scoped strictly to the logged-in
+# learner's own records.
+# ============================================================
+
+@router.get("/student/dashboard", response_class=HTMLResponse)
+def student_dashboard(request: Request):
+    auth_error = require_student_session(request)
+    if auth_error:
+        return auth_error
+
+    student = get_current_student(request)
+    school_id = student['school_id']
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+
+            cur.execute("SELECT active_term, active_year, active_cycle, opening_date, closing_date FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings = cur.fetchone() or {}
+            active_term = settings.get('active_term') or 'Term 1'
+            active_year = settings.get('active_year') or 2026
+            active_cycle = settings.get('active_cycle') or 'Opener'
+
+            grade_name = student['class_grade_name']
+            education_level = student['class_education_level']
+
+            # --- Fees: what's due this term, and the running balance for each category ---
+            cur.execute("""
+                SELECT fc.id AS category_id, fc.name, fs.amount
+                FROM fee_structures fs
+                JOIN fee_categories fc ON fs.fee_category_id = fc.id
+                WHERE fs.school_id = %s AND fs.grade_name = %s AND fs.term = %s AND fs.year = %s
+                ORDER BY fc.name ASC;
+            """, (school_id, grade_name, active_term, active_year))
+            fee_categories_due = cur.fetchall()
+
+            fee_rows = []
+            total_balance = 0.0
+            for fc in fee_categories_due:
+                balance = _compute_balance_after(cur, school_id, student['id'], grade_name, fc['category_id'], active_term, active_year)
+                total_balance += balance
+                fee_rows.append({'name': fc['name'], 'amount': fc['amount'], 'balance': balance})
+
+            cur.execute("""
+                SELECT fp.amount, fp.payment_method, fp.paid_at, fc.name AS category_name
+                FROM fee_payments fp
+                LEFT JOIN fee_categories fc ON fp.fee_category_id = fc.id
+                WHERE fp.student_id = %s AND fp.term = %s AND fp.year = %s
+                ORDER BY fp.paid_at DESC;
+            """, (student['id'], active_term, active_year))
+            payment_history = cur.fetchall()
+
+            # --- Performance: this term's marks, current assessment phase ---
+            cur.execute("""
+                SELECT la.name AS subject_name, sc.raw_score
+                FROM student_scores sc
+                JOIN learning_areas la ON sc.learning_area_id = la.id
+                WHERE sc.student_id = %s AND sc.term = %s AND sc.year = %s AND sc.cycle_name = %s
+                ORDER BY la.name ASC;
+            """, (student['id'], active_term, active_year, active_cycle))
+            current_marks = cur.fetchall()
+
+            # --- Progress over time: this student's own average across every subject, cycle by cycle ---
+            cur.execute("""
+                SELECT sc.cycle_name, AVG(sc.raw_score) AS avg_score
+                FROM student_scores sc
+                WHERE sc.student_id = %s AND sc.term = %s AND sc.year = %s
+                  AND sc.cycle_name IN ('Opener', 'Midterm', 'End Term')
+                GROUP BY sc.cycle_name;
+            """, (student['id'], active_term, active_year))
+            progress_rows = cur.fetchall()
+
+    CYCLE_ORDER = ['Opener', 'Midterm', 'End Term']
+    progress_by_cycle = {r['cycle_name']: float(r['avg_score']) for r in progress_rows}
+    progress_data = [progress_by_cycle.get(c) for c in CYCLE_ORDER]
+    has_progress_data = any(v is not None for v in progress_data)
+
+    marks_rows_html = "".join(
+        f"<tr class='border-b border-slate-100'><td class='p-2.5 text-sm font-semibold text-slate-700'>{esc(m['subject_name'])}</td><td class='p-2.5 text-sm font-bold text-right text-emerald-700'>{float(m['raw_score']):.1f}</td></tr>"
+        for m in current_marks
+    ) or "<tr><td colspan='2' class='p-4 text-center text-slate-400 italic text-xs'>No marks recorded yet for this assessment phase.</td></tr>"
+
+    fee_rows_html = "".join(
+        f"""<tr class='border-b border-slate-100'>
+            <td class='p-2.5 text-sm font-semibold text-slate-700'>{esc(f['name'])}</td>
+            <td class='p-2.5 text-sm text-right text-slate-500'>KES {float(f['amount']):,.0f}</td>
+            <td class='p-2.5 text-sm font-bold text-right {"text-rose-600" if f['balance'] > 0 else "text-emerald-700"}'>{"KES " + format(float(f['balance']), ",.0f") if f['balance'] > 0 else ("Credit KES " + format(abs(float(f['balance'])), ",.0f") if f['balance'] < 0 else "Paid in full")}</td>
+        </tr>"""
+        for f in fee_rows
+    ) or "<tr><td colspan='3' class='p-4 text-center text-slate-400 italic text-xs'>No fee structure set for your grade this term yet.</td></tr>"
+
+    payment_rows_html = "".join(
+        f"<tr class='border-b border-slate-100'><td class='p-2.5 text-xs text-slate-500'>{p['paid_at'].strftime('%d %b %Y')}</td><td class='p-2.5 text-xs text-slate-600'>{esc(p['category_name'] or 'General')}</td><td class='p-2.5 text-xs font-bold text-right text-emerald-700'>KES {float(p['amount']):,.0f}</td></tr>"
+        for p in payment_history
+    ) or "<tr><td colspan='3' class='p-4 text-center text-slate-400 italic text-xs'>No payments recorded yet this term.</td></tr>"
+
+    progress_chart_html = ""
+    progress_chart_script = ""
+    if has_progress_data:
+        progress_chart_html = """
+        <div class="relative h-48">
+            <canvas id="progressChart"></canvas>
+        </div>
+        """
+        progress_chart_script = f"""
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+        <script>
+        new Chart(document.getElementById('progressChart'), {{
+            type: 'line',
+            data: {{
+                labels: {CYCLE_ORDER},
+                datasets: [{{ label: 'Your Average', data: {progress_data}, fill: false, tension: 0.3, borderWidth: 2, pointRadius: 4, borderColor: '#047857', backgroundColor: '#047857' }}]
+            }},
+            options: {{ responsive: true, maintainAspectRatio: false, scales: {{ y: {{ beginAtZero: true, max: 100 }} }}, plugins: {{ legend: {{ display: false }} }} }}
+        }});
+        </script>
+        """
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Elimu Hub | My Portal</title>
+        {STUDENT_PWA_HEAD_SNIPPET}
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    </head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-emerald-800 px-5 py-4 flex justify-between items-center">
+            <div>
+                <p class="text-white font-black text-base">🎒 {esc(full_student_name(student))}</p>
+                <p class="text-emerald-200 text-xs">{esc(school['name'] if school else '')} — {esc(grade_name or '')} · Adm. No. {esc(student['admission_number'])}</p>
+            </div>
+            <a href="/student/logout" class="bg-white/10 hover:bg-white/20 text-white text-xs font-bold px-3 py-2 rounded-xl transition">Log Out</a>
+        </header>
+
+        <div class="p-4 sm:p-6 max-w-3xl mx-auto space-y-4">
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4 flex flex-col sm:flex-row sm:justify-between gap-2">
+                <div>
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">This Term</p>
+                    <p class="text-sm font-bold text-slate-800">{esc(active_term)} {active_year} — {esc(active_cycle)}</p>
+                </div>
+                <div class="text-left sm:text-right">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">School Opens / Closes</p>
+                    <p class="text-sm font-bold text-slate-800">{esc(str(settings.get('opening_date')) if settings.get('opening_date') else '—')} → {esc(str(settings.get('closing_date')) if settings.get('closing_date') else '—')}</p>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📊 Performance — {esc(active_cycle)}</h2>
+                <table class="w-full border-collapse"><tbody>{marks_rows_html}</tbody></table>
+            </div>
+
+            {f'''<div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📈 Your Progress This Term</h2>
+                {progress_chart_html}
+            </div>''' if has_progress_data else ''}
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">💰 Fees Structure &amp; Balance</h2>
+                <table class="w-full border-collapse">
+                    <thead><tr class="text-[10px] uppercase text-slate-400 border-b-2"><th class="p-2 text-left">Category</th><th class="p-2 text-right">Amount</th><th class="p-2 text-right">Balance</th></tr></thead>
+                    <tbody>{fee_rows_html}</tbody>
+                    {f"<tfoot><tr><td class='p-2.5 text-sm font-black text-slate-800' colspan='2'>Total Balance</td><td class='p-2.5 text-sm font-black text-right {'text-rose-600' if total_balance > 0 else 'text-emerald-700'}'>KES {abs(total_balance):,.0f}{' (owed)' if total_balance > 0 else (' (credit)' if total_balance < 0 else '')}</td></tr></tfoot>" if fee_categories_due else ""}
+                </table>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">🧾 Fees Statement — Payment History</h2>
+                <table class="w-full border-collapse">
+                    <thead><tr class="text-[10px] uppercase text-slate-400 border-b-2"><th class="p-2 text-left">Date</th><th class="p-2 text-left">Category</th><th class="p-2 text-right">Amount Paid</th></tr></thead>
+                    <tbody>{payment_rows_html}</tbody>
+                </table>
+            </div>
+
+            <p class="text-center text-[11px] text-slate-300 pt-4 pb-2">Powered by Elimu Hub</p>
+        </div>
+        {progress_chart_script}
+    </body>
+    </html>
+    """)
 
 
 # ============================================================
