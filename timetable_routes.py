@@ -2834,7 +2834,7 @@ def subject_availability_picker(school_id: int, request: Request):
 
 
 @router.get("/timetable/subject-availability/{school_id}/{learning_area_id}", response_class=HTMLResponse)
-def subject_availability_grid(school_id: int, learning_area_id: int, request: Request):
+def subject_availability_grid(school_id: int, learning_area_id: int, request: Request, plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2852,21 +2852,24 @@ def subject_availability_grid(school_id: int, learning_area_id: int, request: Re
             if not subject:
                 raise HTTPException(status_code=404, detail="Subject not found.")
 
-            days = get_school_days(cur, school_id)
+            resolved_plan_id = resolve_plan_id(cur, school_id, subject['education_level'], plan_id)
+            plan_options_html = get_plan_options_html(cur, school_id, subject['education_level'], resolved_plan_id)
+
+            days = get_school_days(cur, school_id, resolved_plan_id)
             conn.commit()
 
-            periods = [p for p in get_periods_for_level(cur, school_id, subject['education_level']) if p['is_teaching_period']]
+            periods = [p for p in get_periods_for_level(cur, school_id, subject['education_level'], resolved_plan_id) if p['is_teaching_period']]
 
             if is_custom:
                 cur.execute("""
                     SELECT day_of_week, period_id, status FROM subject_availability
-                    WHERE school_id = %s AND custom_subject_id = %s;
-                """, (school_id, real_custom_id))
+                    WHERE school_id = %s AND custom_subject_id = %s AND plan_id = %s;
+                """, (school_id, real_custom_id, resolved_plan_id))
             else:
                 cur.execute("""
                     SELECT day_of_week, period_id, status FROM subject_availability
-                    WHERE school_id = %s AND learning_area_id = %s;
-                """, (school_id, learning_area_id))
+                    WHERE school_id = %s AND learning_area_id = %s AND plan_id = %s;
+                """, (school_id, learning_area_id, resolved_plan_id))
             current = {(r['day_of_week'], r['period_id']): r['status'] for r in cur.fetchall()}
 
     status_options = [("available", "✅ Available"), ("conditional", "❔ Conditional"), ("not_available", "❌ Not Available")]
@@ -2886,10 +2889,17 @@ def subject_availability_grid(school_id: int, learning_area_id: int, request: Re
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Time Off — {esc(subject['name'])}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
-        <div class="max-w-4xl mx-auto bg-white p-6 rounded-2xl border shadow-xs">
+        <div class="max-w-4xl mx-auto space-y-4">
+            <div class="bg-indigo-50 border border-indigo-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+                <label class="text-xs font-bold text-indigo-800 shrink-0">📋 Working on plan:</label>
+                <form method="get" action="/timetable/subject-availability/{school_id}/{learning_area_id}" class="flex-1 flex gap-2">
+                    <select name="plan_id" onchange="this.form.submit()" class="flex-1 border border-indigo-200 bg-white p-2 rounded-xl text-xs font-semibold">{plan_options_html}</select>
+                </form>
+            </div>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
             <h2 class="text-lg font-black text-slate-800">📚 {esc(subject['name'])} — Time Off</h2>
             <p class="text-xs text-slate-400 mb-4">"Not Available" is a hard block the generator and manual editor will never use for this subject. "Conditional" is a soft preference — used only if nothing better fits.</p>
-            <form action="/api/v1/timetable/subject-availability/update/{school_id}/{learning_area_id}" method="post">
+            <form action="/api/v1/timetable/subject-availability/update/{school_id}/{learning_area_id}?plan_id={resolved_plan_id}" method="post">
                 <div class="overflow-x-auto">
                     <table class="w-full border-collapse text-xs">
                         <thead><tr><th class="p-2 sticky left-0 bg-white"></th>{header_cells}</tr></thead>
@@ -2901,6 +2911,7 @@ def subject_availability_grid(school_id: int, learning_area_id: int, request: Re
                     <a href="/timetable/subject-availability/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition">← Back</a>
                 </div>
             </form>
+            </div>
         </div>
     </body>
     </html>
@@ -2908,7 +2919,7 @@ def subject_availability_grid(school_id: int, learning_area_id: int, request: Re
 
 
 @router.post("/api/v1/timetable/subject-availability/update/{school_id}/{learning_area_id}")
-async def save_subject_availability(school_id: int, learning_area_id: int, request: Request):
+async def save_subject_availability(school_id: int, learning_area_id: int, request: Request, plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2919,7 +2930,7 @@ async def save_subject_availability(school_id: int, learning_area_id: int, reque
     form = await request.form()
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             if is_custom:
                 cur.execute("SELECT education_level FROM timetable_custom_subjects WHERE id = %s AND school_id = %s;", (real_custom_id, school_id))
             else:
@@ -2927,17 +2938,13 @@ async def save_subject_availability(school_id: int, learning_area_id: int, reque
             subject_row = cur.fetchone()
             if not subject_row:
                 raise HTTPException(status_code=404, detail="Subject not found.")
-            subject_level = subject_row[0]
+            subject_level = subject_row['education_level']
 
-            cur.execute("""
-                SELECT id FROM timetable_periods WHERE school_id = %s AND is_teaching_period = TRUE
-                AND education_level = (
-                    CASE WHEN EXISTS (SELECT 1 FROM timetable_periods WHERE school_id = %s AND education_level = %s)
-                         THEN %s ELSE 'ALL' END
-                );
-            """, (school_id, school_id, subject_level, subject_level))
-            period_ids = [r[0] for r in cur.fetchall()]
-            days = get_school_days(cur, school_id)
+            resolved_plan_id = resolve_plan_id(cur, school_id, subject_level, plan_id)
+
+            periods = [p for p in get_periods_for_level(cur, school_id, subject_level, resolved_plan_id) if p['is_teaching_period']]
+            period_ids = [p['id'] for p in periods]
+            days = get_school_days(cur, school_id, resolved_plan_id)
 
             for day in days:
                 for period_id in period_ids:
@@ -2948,8 +2955,8 @@ async def save_subject_availability(school_id: int, learning_area_id: int, reque
                         if status == "available":
                             cur.execute("""
                                 DELETE FROM subject_availability
-                                WHERE school_id = %s AND custom_subject_id = %s AND day_of_week = %s AND period_id = %s;
-                            """, (school_id, real_custom_id, day, period_id))
+                                WHERE school_id = %s AND custom_subject_id = %s AND day_of_week = %s AND period_id = %s AND plan_id = %s;
+                            """, (school_id, real_custom_id, day, period_id, resolved_plan_id))
                         else:
                             # Check-then-update-or-insert rather than
                             # ON CONFLICT — this targets a partial unique
@@ -2960,32 +2967,41 @@ async def save_subject_availability(school_id: int, learning_area_id: int, reque
                             # safe to avoid entirely.
                             cur.execute("""
                                 SELECT id FROM subject_availability
-                                WHERE school_id = %s AND custom_subject_id = %s AND day_of_week = %s AND period_id = %s;
-                            """, (school_id, real_custom_id, day, period_id))
+                                WHERE school_id = %s AND custom_subject_id = %s AND day_of_week = %s AND period_id = %s AND plan_id = %s;
+                            """, (school_id, real_custom_id, day, period_id, resolved_plan_id))
                             existing_row = cur.fetchone()
                             if existing_row:
-                                cur.execute("UPDATE subject_availability SET status = %s WHERE id = %s;", (status, existing_row[0]))
+                                cur.execute("UPDATE subject_availability SET status = %s WHERE id = %s;", (status, existing_row['id']))
                             else:
                                 cur.execute("""
-                                    INSERT INTO subject_availability (school_id, custom_subject_id, day_of_week, period_id, status)
-                                    VALUES (%s, %s, %s, %s, %s);
-                                """, (school_id, real_custom_id, day, period_id, status))
+                                    INSERT INTO subject_availability (school_id, custom_subject_id, day_of_week, period_id, status, plan_id)
+                                    VALUES (%s, %s, %s, %s, %s, %s);
+                                """, (school_id, real_custom_id, day, period_id, status, resolved_plan_id))
                     else:
                         if status == "available":
                             cur.execute("""
                                 DELETE FROM subject_availability
-                                WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s;
-                            """, (school_id, learning_area_id, day, period_id))
+                                WHERE school_id = %s AND learning_area_id = %s AND day_of_week = %s AND period_id = %s AND plan_id = %s;
+                            """, (school_id, learning_area_id, day, period_id, resolved_plan_id))
                         else:
+                            # ON CONFLICT targets the actual current unique
+                            # constraint — widened to include plan_id when
+                            # multi-plan support was added. The 4-column
+                            # version this used to say no longer matches
+                            # any real constraint on the table at all —
+                            # every save through this exact path was
+                            # failing outright with a live Postgres error
+                            # until this fix, the same bug pattern already
+                            # found and fixed twice elsewhere.
                             cur.execute("""
-                                INSERT INTO subject_availability (school_id, learning_area_id, day_of_week, period_id, status)
-                                VALUES (%s, %s, %s, %s, %s)
-                                ON CONFLICT (school_id, learning_area_id, day_of_week, period_id)
+                                INSERT INTO subject_availability (school_id, learning_area_id, day_of_week, period_id, status, plan_id)
+                                VALUES (%s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (school_id, learning_area_id, day_of_week, period_id, plan_id)
                                 DO UPDATE SET status = EXCLUDED.status;
-                            """, (school_id, learning_area_id, day, period_id, status))
+                            """, (school_id, learning_area_id, day, period_id, status, resolved_plan_id))
             conn.commit()
 
-    return RedirectResponse(url=f"/timetable/subject-availability/{school_id}/{learning_area_id}", status_code=303)
+    return RedirectResponse(url=f"/timetable/subject-availability/{school_id}/{learning_area_id}?plan_id={resolved_plan_id}", status_code=303)
 
 
 @router.get("/timetable/sync-rules/{school_id}", response_class=HTMLResponse)
