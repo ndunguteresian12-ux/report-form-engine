@@ -10,6 +10,8 @@ stdlib / third-party imports, no dependency on main.py's globals).
 import os
 import html
 import bcrypt
+import logging
+import requests as http_requests
 import psycopg2
 from psycopg2 import pool as psycopg2_pool
 from psycopg2.extras import RealDictCursor
@@ -17,6 +19,12 @@ from contextlib import contextmanager
 
 from fastapi import Request, HTTPException
 from fastapi.responses import RedirectResponse
+
+# Same logger name as main.py — logging.getLogger caches by name, so this
+# is the SAME underlying logger instance, not a separate one; log lines
+# from here show up interleaved with main.py's own, exactly as if this
+# code still lived there.
+logger = logging.getLogger("cbe_engine")
 
 # Used throughout the HTML-rendering routes to escape user-supplied text
 # before splicing it into inline HTML (prevents XSS).
@@ -86,6 +94,65 @@ def is_teacher_of_this_class(cur, school_id: int, user_id: int, grade_name: str,
     target_stream = _normalize_stream_for_match(stream)
     cur.execute("SELECT stream FROM class_teachers WHERE school_id = %s AND teacher_user_id = %s AND grade_name = %s AND education_level = %s;", (school_id, user_id, grade_name, education_level))
     return any(_normalize_stream_for_match(r['stream']) == target_stream for r in cur.fetchall())
+
+
+# Moved here from main.py so a new route module (notifications_routes.py,
+# for bulk SMS to parents) can send SMS without importing from main.py
+# directly — that would create exactly the circular import this file
+# exists to avoid.
+# --- SMS provider configuration (Africa's Talking) ---
+# Set these on Render to enable real SMS delivery. Until then, messages
+# are only logged server-side (a clearly-labeled simulation) so features
+# built on top of this can be tested end-to-end without a live account.
+AT_USERNAME = (os.getenv("AFRICASTALKING_USERNAME") or "").strip() or None
+AT_API_KEY = (os.getenv("AFRICASTALKING_API_KEY") or "").strip() or None
+AT_SENDER_ID = (os.getenv("AFRICASTALKING_SENDER_ID") or "").strip() or None
+_sms_configured = bool(AT_USERNAME and AT_API_KEY)
+
+if _sms_configured:
+    logger.info("Africa's Talking SMS configured — messages will be sent via real SMS.")
+else:
+    logger.warning(
+        "Africa's Talking SMS NOT configured (AFRICASTALKING_USERNAME / AFRICASTALKING_API_KEY missing). "
+        "Messages will only be logged server-side (simulated SMS) until configured."
+    )
+
+_last_sms_error = None
+
+def send_sms(phone_number: str, message: str) -> bool:
+    """Sends an SMS via Africa's Talking if configured; otherwise logs the
+    message as a simulated send. Returns True if a real send succeeded or a
+    simulated send was logged, False only on a genuine sending failure."""
+    global _last_sms_error
+
+    if not _sms_configured:
+        logger.info(f"[SIMULATED SMS] To: {phone_number} | Message: {message}")
+        return True
+
+    try:
+        response = http_requests.post(
+            "https://api.africastalking.com/version1/messaging",
+            headers={
+                "apiKey": AT_API_KEY,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            data={
+                "username": AT_USERNAME,
+                "to": phone_number,
+                "message": message,
+                **({"from": AT_SENDER_ID} if AT_SENDER_ID else {}),
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        _last_sms_error = None
+        return True
+    except Exception as sms_err:
+        _last_sms_error = f"{type(sms_err).__name__}: {sms_err}"
+        logger.error(f"SMS send failed: {_last_sms_error}")
+        return False
+
 
 # --- Database Setup ---
 DATABASE_URL = os.getenv("DATABASE_URL")

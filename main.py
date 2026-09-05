@@ -118,60 +118,9 @@ else:
 # via /admin/system/diagnostics/{school_id} without needing server log access.
 _last_storage_error = None
 
-# --- SMS provider configuration (Africa's Talking) ---
-# Set these on Render to enable real SMS delivery for password-reset codes.
-# Until then, reset codes are only logged server-side (a clearly-labeled
-# simulation) so the feature can be tested end-to-end without a live account.
-AT_USERNAME = (os.getenv("AFRICASTALKING_USERNAME") or "").strip() or None
-AT_API_KEY = (os.getenv("AFRICASTALKING_API_KEY") or "").strip() or None
-AT_SENDER_ID = (os.getenv("AFRICASTALKING_SENDER_ID") or "").strip() or None
-_sms_configured = bool(AT_USERNAME and AT_API_KEY)
-
-if _sms_configured:
-    logger.info("Africa's Talking SMS configured — password-reset codes will be sent via real SMS.")
-else:
-    logger.warning(
-        "Africa's Talking SMS NOT configured (AFRICASTALKING_USERNAME / AFRICASTALKING_API_KEY missing). "
-        "Password-reset codes will only be logged server-side (simulated SMS) until configured."
-    )
-
-# Tracks the most recent SMS send error/result, same self-diagnosis pattern as Supabase Storage.
-_last_sms_error = None
-
-def send_sms(phone_number: str, message: str) -> bool:
-    """Sends an SMS via Africa's Talking if configured; otherwise logs the
-    message as a simulated send. Returns True if a real send succeeded or a
-    simulated send was logged, False only on a genuine sending failure."""
-    global _last_sms_error
-
-    if not _sms_configured:
-        logger.info(f"[SIMULATED SMS] To: {phone_number} | Message: {message}")
-        return True
-
-    try:
-        response = http_requests.post(
-            "https://api.africastalking.com/version1/messaging",
-            headers={
-                "apiKey": AT_API_KEY,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-            data={
-                "username": AT_USERNAME,
-                "to": phone_number,
-                "message": message,
-                **({"from": AT_SENDER_ID} if AT_SENDER_ID else {}),
-            },
-            timeout=10,
-        )
-        response.raise_for_status()
-        _last_sms_error = None
-        return True
-    except Exception as sms_err:
-        _last_sms_error = f"{type(sms_err).__name__}: {sms_err}"
-        logger.error(f"SMS send failed: {_last_sms_error}")
-        return False
-
+# send_sms and its Africa's Talking configuration now live in shared.py
+# (imported above) — moved there so notifications_routes.py can send SMS
+# without a circular import with main.py.
 
 # --- Email provider configuration (SMTP — Gmail / Google Workspace) ---
 # Set these on Render to enable real email delivery. Gmail requires an App
@@ -701,6 +650,7 @@ from shared import (
     get_teacher_class_keys,
     teacher_can_access_class,
     is_teacher_of_this_class,
+    send_sms,
 )
 
 
@@ -1172,6 +1122,11 @@ app.include_router(mpesa_router)
 # definition.
 from student_portal_routes import router as student_portal_router
 app.include_router(student_portal_router)
+
+# --- Bulk SMS Notifications (extracted to its own file — see notifications_routes.py) ---
+from notifications_routes import router as notifications_router, bootstrap_notifications_schema
+bootstrap_notifications_schema()
+app.include_router(notifications_router)
 
 # --- Core Business & CBE Analytics Helper Logic ---
 def log_audit_action(cur, request: Request, school_id: int, action: str, details: str = ""):
@@ -2327,6 +2282,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <div class='grid grid-cols-2 sm:grid-cols-3 gap-2 mt-5'>
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
                     <a href='/admin/students/manage/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-fuchsia-700 hover:bg-fuchsia-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Manage Students</a>
+                    <a href='/admin/notifications/progress-reports/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>📲 Send Reports</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
                     <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
@@ -2385,6 +2341,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <span class="{('bg-gradient-to-r from-emerald-500 to-emerald-600' if school.get('subscription_expires_at') and school['subscription_expires_at'] > datetime.now() else 'bg-gradient-to-r from-rose-500 to-rose-600') if BILLING_ENFORCED else 'bg-gradient-to-r from-slate-500 to-slate-600'} text-white px-3 py-2 rounded-xl shadow-xs">{(('✅ Active until ' + school['subscription_expires_at'].strftime('%d %b %Y')) if school.get('subscription_expires_at') and school['subscription_expires_at'] > datetime.now() else '⚠️ No active subscription') if BILLING_ENFORCED else '💳 Subscriptions launching soon'}</span>
                 <span class="bg-gradient-to-r from-violet-500 to-violet-600 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
                 <a href="/admin/school-settings/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">⚙️ School Settings</a>
+                <a href="/admin/notifications/custom/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📢 Send Notification</a>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📅 Timetable</a>
                 <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
                 <a href="/admin/audit-log/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📋 Activity Log</a>
@@ -3488,6 +3445,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                 <div class='grid grid-cols-2 sm:grid-cols-3 gap-2 mt-5'>
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
                     <a href='/admin/students/manage/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-fuchsia-700 hover:bg-fuchsia-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Manage Students</a>
+                    <a href='/admin/notifications/progress-reports/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-teal-700 hover:bg-teal-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>📲 Send Reports</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
                     <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
