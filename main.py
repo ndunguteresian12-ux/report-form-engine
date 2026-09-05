@@ -697,6 +697,10 @@ from shared import (
     get_password_hash,
     verify_password,
     get_current_session_user,
+    _normalize_stream_for_match,
+    get_teacher_class_keys,
+    teacher_can_access_class,
+    is_teacher_of_this_class,
 )
 
 
@@ -1243,50 +1247,10 @@ def is_paper_based_subject(subject_name: str, education_level: str) -> bool:
     return (subject_name or "").strip().lower().rstrip(".") in PAPER_BASED_SUBJECTS
 
 
-def _normalize_stream_for_match(stream) -> str:
-    """Treats 'SINGLE STREAM' (the placeholder this app uses throughout
-    its URLs/forms for a class with no real sub-streams) as equivalent to
-    a blank/NULL stream value — teacher_subject_assignments and
-    class_teachers always store a literal stream string, while
-    students.stream is often genuinely blank/NULL for a school with no
-    real sub-streams. Comparing these directly without normalizing is
-    exactly the bug class that broke scheme-of-work visibility earlier in
-    this project; every access-control check here goes through this."""
-    return None if (not stream or not stream.strip() or stream.strip().upper() == "SINGLE STREAM") else stream.strip()
-
-
-def get_teacher_class_keys(cur, school_id: int, user_id: int) -> set:
-    """Every (grade_name, education_level, normalized_stream) this staff
-    member is connected to — either as the assigned class (homeroom)
-    teacher, or as a subject teacher with at least one teaching
-    assignment there (from the timetable module's own teacher_subject_
-    assignments table — the single source of truth for "who teaches
-    what", reused here rather than building a second one). Only call
-    this to restrict role == 'staff' — admins and super admins are never
-    restricted by this."""
-    cur.execute("SELECT grade_name, education_level, stream FROM class_teachers WHERE school_id = %s AND teacher_user_id = %s;", (school_id, user_id))
-    rows = list(cur.fetchall())
-    cur.execute("SELECT DISTINCT grade_name, education_level, stream FROM teacher_subject_assignments WHERE school_id = %s AND staff_user_id = %s;", (school_id, user_id))
-    rows += list(cur.fetchall())
-    return {(r['grade_name'], r['education_level'], _normalize_stream_for_match(r['stream'])) for r in rows}
-
-
-def teacher_can_access_class(class_keys: set, grade_name: str, education_level: str, stream: str) -> bool:
-    """Checks a specific class against a teacher's allowed set, built by
-    get_teacher_class_keys."""
-    return (grade_name, education_level, _normalize_stream_for_match(stream)) in class_keys
-
-
-def is_teacher_of_this_class(cur, school_id: int, user_id: int, grade_name: str, education_level: str, stream: str) -> bool:
-    """Is this staff member the assigned class (homeroom) teacher for this
-    exact class? A class teacher gets full access to every subject for
-    their own class — see get_teacher_learning_area_ids — unlike a
-    subject-only teacher, who's restricted to just what they're assigned
-    to teach."""
-    target_stream = _normalize_stream_for_match(stream)
-    cur.execute("SELECT stream FROM class_teachers WHERE school_id = %s AND teacher_user_id = %s AND grade_name = %s AND education_level = %s;", (school_id, user_id, grade_name, education_level))
-    return any(_normalize_stream_for_match(r['stream']) == target_stream for r in cur.fetchall())
-
+# _normalize_stream_for_match / get_teacher_class_keys /
+# teacher_can_access_class / is_teacher_of_this_class now live in
+# shared.py (imported above) — moved there so student_portal_routes.py
+# can use the same class-teacher scoping without a circular import.
 
 def get_teacher_registerable_class_ids(cur, school_id: int, user_id: int) -> set:
     """Every classes.id this staff member can register new students into —
@@ -2362,6 +2326,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 </div>
                 <div class='grid grid-cols-2 sm:grid-cols-3 gap-2 mt-5'>
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
+                    <a href='/admin/students/manage/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-fuchsia-700 hover:bg-fuchsia-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Manage Students</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
                     <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>
@@ -3502,6 +3467,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                 </div>
                 <div class='grid grid-cols-2 sm:grid-cols-3 gap-2 mt-5'>
                     <a href='/staff/bulk-entry/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-indigo-900 hover:bg-indigo-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Bulk Entry</a>
+                    <a href='/admin/students/manage/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' class='bg-fuchsia-700 hover:bg-fuchsia-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Manage Students</a>
                     <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-slate-700 hover:bg-slate-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Class List</a>
                     <a href='/api/v1/reports/bulk-print/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' class='bg-emerald-600 text-white text-center text-xs py-2 rounded-xl font-semibold hover:bg-emerald-700 transition shadow-xs'>Bulk Print</a>
                     <a href='/admin/reports/merit-list/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}' target='_blank' class='bg-violet-700 hover:bg-violet-800 text-white text-center text-xs py-2 rounded-xl font-semibold transition shadow-xs'>Merit List</a>

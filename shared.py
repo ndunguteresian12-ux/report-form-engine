@@ -36,6 +36,57 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verifies a password against a stored hash."""
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
+
+# Moved here from main.py for the same reason as get_password_hash above —
+# student_portal_routes.py needs these too (to let a class teacher, not
+# just an admin, manage their own students' parent contacts), and
+# importing from main.py directly would create a circular import.
+def _normalize_stream_for_match(stream) -> str:
+    """Treats 'SINGLE STREAM' (the placeholder this app uses throughout
+    its URLs/forms for a class with no real sub-streams) as equivalent to
+    a blank/NULL stream value — teacher_subject_assignments and
+    class_teachers always store a literal stream string, while
+    students.stream is often genuinely blank/NULL for a school with no
+    real sub-streams. Comparing these directly without normalizing is
+    exactly the bug class that broke scheme-of-work visibility earlier in
+    this project; every access-control check here goes through this."""
+    return None if (not stream or not stream.strip() or stream.strip().upper() == "SINGLE STREAM") else stream.strip()
+
+
+def get_teacher_class_keys(cur, school_id: int, user_id: int) -> set:
+    """Every (grade_name, education_level, normalized_stream) this staff
+    member is connected to — either as the assigned class (homeroom)
+    teacher, or as a subject teacher with at least one teaching
+    assignment there (from the timetable module's own teacher_subject_
+    assignments table — the single source of truth for "who teaches
+    what", reused here rather than building a second one). Only call
+    this to restrict role == 'staff' — admins and super admins are never
+    restricted by this."""
+    cur.execute("SELECT grade_name, education_level, stream FROM class_teachers WHERE school_id = %s AND teacher_user_id = %s;", (school_id, user_id))
+    rows = list(cur.fetchall())
+    cur.execute("SELECT DISTINCT grade_name, education_level, stream FROM teacher_subject_assignments WHERE school_id = %s AND staff_user_id = %s;", (school_id, user_id))
+    rows += list(cur.fetchall())
+    return {(r['grade_name'], r['education_level'], _normalize_stream_for_match(r['stream'])) for r in rows}
+
+
+def teacher_can_access_class(class_keys: set, grade_name: str, education_level: str, stream: str) -> bool:
+    """Checks a specific class against a teacher's allowed set, built by
+    get_teacher_class_keys."""
+    return (grade_name, education_level, _normalize_stream_for_match(stream)) in class_keys
+
+
+def is_teacher_of_this_class(cur, school_id: int, user_id: int, grade_name: str, education_level: str, stream: str) -> bool:
+    """Is this staff member the assigned class (homeroom) teacher for this
+    exact class? A class teacher gets full access to every subject for
+    their own class — unlike a subject-only teacher, who's restricted to
+    just what they're assigned to teach, and (in student_portal_routes.py)
+    is NOT allowed to edit a student's parent contact details — that's
+    kept to the homeroom teacher and admins only, not every subject
+    teacher who happens to teach a class once a week."""
+    target_stream = _normalize_stream_for_match(stream)
+    cur.execute("SELECT stream FROM class_teachers WHERE school_id = %s AND teacher_user_id = %s AND grade_name = %s AND education_level = %s;", (school_id, user_id, grade_name, education_level))
+    return any(_normalize_stream_for_match(r['stream']) == target_stream for r in cur.fetchall())
+
 # --- Database Setup ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:

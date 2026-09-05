@@ -39,6 +39,8 @@ from psycopg2.extras import RealDictCursor
 from shared import (
     esc, get_db_connection,
     require_school_session, require_admin_session, full_student_name,
+    get_current_session_user, get_teacher_class_keys, teacher_can_access_class,
+    is_teacher_of_this_class,
 )
 
 router = APIRouter()
@@ -241,14 +243,92 @@ def student_logout():
 
 
 # ============================================================
-# Admin-side setup: set/reset a student's portal phone numbers
-# and passphrase. Lives here (not main.py), reachable via a
-# link from the student's existing profile page.
+# Manage Students — a real, interactive list linking to each
+# student's Edit Profile and Portal Access pages. Neither admins
+# nor class teachers previously had any way to reach an
+# individual student's profile through the UI at all — this is
+# genuinely new navigation, not just a portal-access shortcut.
 # ============================================================
+
+@router.get("/admin/students/manage/{school_id}", response_class=HTMLResponse)
+def manage_students_list(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    viewer = get_current_session_user(request)
+    is_class_teacher_here = False
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if viewer and viewer.get('role') == 'staff':
+                # Any teacher connected to this class (homeroom or
+                # subject) can at least VIEW the list — editing a
+                # student's parent contacts specifically is further
+                # restricted to the homeroom teacher inside the portal-
+                # access routes themselves, not gated here.
+                class_keys = get_teacher_class_keys(cur, school_id, viewer['id'])
+                if not teacher_can_access_class(class_keys, grade_name, education_level, stream):
+                    raise HTTPException(status_code=403, detail="You're not connected to this class.")
+                is_class_teacher_here = is_teacher_of_this_class(cur, school_id, viewer['id'], grade_name, education_level, stream)
+            else:
+                is_class_teacher_here = True  # admins/super admins always can
+
+            cur.execute("""
+                SELECT id, admission_number, first_name, middle_name, last_name, mother_phone, father_phone
+                FROM students
+                WHERE school_id = %s AND class_id = (SELECT id FROM classes WHERE grade_name = %s AND education_level = %s LIMIT 1)
+                  AND (%s = 'SINGLE STREAM' OR stream = %s) AND (status IS NULL OR status != 'GRADUATED')
+                ORDER BY admission_number ASC;
+            """, (school_id, grade_name, education_level, stream, stream))
+            roster_students = cur.fetchall()
+
+    rows_html = ""
+    for s in roster_students:
+        has_contact = bool(s['mother_phone'] or s['father_phone'])
+        contact_badge = (
+            "<span class='text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full'>Portal ready</span>"
+            if has_contact else
+            "<span class='text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full'>No parent phone yet</span>"
+        )
+        portal_link = (
+            f"<a href='/admin/student/portal-access/{school_id}/{s['id']}' class='text-xs font-bold text-indigo-700 hover:underline'>Portal Access</a>"
+            if is_class_teacher_here else
+            "<span class='text-xs text-slate-300' title=\"Only this learner's class teacher (or an admin) can set this up\">Portal Access</span>"
+        )
+        rows_html += f"""
+        <tr class="border-b border-slate-100 text-sm">
+            <td class="p-3 font-mono text-xs text-slate-400">{esc(s['admission_number'])}</td>
+            <td class="p-3 font-bold text-slate-800">{esc(full_student_name(s))}</td>
+            <td class="p-3">{contact_badge}</td>
+            <td class="p-3"><a href="/admin/student/edit/{school_id}/{s['id']}" class="text-xs font-bold text-slate-600 hover:underline">Edit Profile</a></td>
+            <td class="p-3">{portal_link}</td>
+        </tr>
+        """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Manage Students</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-3xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">👤 Manage Students — {esc(grade_name)}{' — ' + esc(stream) if stream != 'SINGLE STREAM' else ''}</h2>
+                <p class="text-xs text-slate-400">{esc(education_level)}</p>
+            </div>
+            <div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+                <table class="w-full text-left border-collapse">
+                    <thead><tr class="border-b-2 text-[11px] uppercase text-slate-400"><th class="p-3">Adm. No.</th><th class="p-3">Name</th><th class="p-3">Portal Status</th><th class="p-3">Profile</th><th class="p-3">Parent Contacts</th></tr></thead>
+                    <tbody>{rows_html or "<tr><td colspan='5' class='p-4 text-center text-slate-400 italic text-xs'>No students in this class yet.</td></tr>"}</tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
 @router.get("/admin/student/portal-access/{school_id}/{student_id}", response_class=HTMLResponse)
 def student_portal_access_form(school_id: int, student_id: int, request: Request, done: str = None):
-    auth_error = require_admin_session(request, school_id)
+    auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
 
@@ -262,6 +342,16 @@ def student_portal_access_form(school_id: int, student_id: int, request: Request
             student = cur.fetchone()
             if not student:
                 raise HTTPException(status_code=404, detail="Student not found.")
+
+            # A staff member can only manage parent contacts for a
+            # student in a class they're the assigned class (homeroom)
+            # teacher for — not just any subject teacher who happens to
+            # teach them once a week. Admins and super admins are never
+            # restricted by this.
+            viewer = get_current_session_user(request)
+            if viewer and viewer.get('role') == 'staff':
+                if not is_teacher_of_this_class(cur, school_id, viewer['id'], student['grade_name'], student['education_level'], student['stream']):
+                    raise HTTPException(status_code=403, detail="You're not the class teacher for this learner. Ask your admin, or the learner's own class teacher, to set this up.")
 
     # The derived password — always this candidate's own admission
     # number + current grade, never something an admin sets or a hash
@@ -312,7 +402,7 @@ def student_portal_access_form(school_id: int, student_id: int, request: Request
 
 @router.post("/api/v1/student/portal-access/{school_id}/{student_id}")
 async def student_portal_access_save(school_id: int, student_id: int, request: Request):
-    auth_error = require_admin_session(request, school_id)
+    auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
 
@@ -321,10 +411,20 @@ async def student_portal_access_save(school_id: int, student_id: int, request: R
     father_phone = (form.get("father_phone") or "").strip() or None
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM students WHERE id = %s AND school_id = %s;", (student_id, school_id))
-            if not cur.fetchone():
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT s.id, s.education_level, s.stream, c.grade_name FROM students s
+                LEFT JOIN classes c ON s.class_id = c.id
+                WHERE s.id = %s AND s.school_id = %s;
+            """, (student_id, school_id))
+            student = cur.fetchone()
+            if not student:
                 raise HTTPException(status_code=404, detail="Student not found.")
+
+            viewer = get_current_session_user(request)
+            if viewer and viewer.get('role') == 'staff':
+                if not is_teacher_of_this_class(cur, school_id, viewer['id'], student['grade_name'], student['education_level'], student['stream']):
+                    raise HTTPException(status_code=403, detail="You're not the class teacher for this learner.")
 
             cur.execute(
                 "UPDATE students SET mother_phone = %s, father_phone = %s WHERE id = %s;",
