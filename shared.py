@@ -9,6 +9,7 @@ stdlib / third-party imports, no dependency on main.py's globals).
 
 import os
 import html
+import bcrypt
 import psycopg2
 from psycopg2 import pool as psycopg2_pool
 from psycopg2.extras import RealDictCursor
@@ -20,6 +21,20 @@ from fastapi.responses import RedirectResponse
 # Used throughout the HTML-rendering routes to escape user-supplied text
 # before splicing it into inline HTML (prevents XSS).
 esc = html.escape
+
+# Moved here from main.py so a new route module (e.g.
+# student_portal_routes.py) can hash/verify a password without importing
+# from main.py directly — that would create exactly the circular import
+# this file exists to avoid. Behavior is unchanged; every existing call
+# site in main.py now imports these from here instead of defining them
+# locally.
+def get_password_hash(password: str) -> str:
+    """Hashes a password using bcrypt."""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifies a password against a stored hash."""
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 # --- Database Setup ---
 DATABASE_URL = os.getenv("DATABASE_URL")

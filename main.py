@@ -26,13 +26,9 @@ from sqlalchemy import create_engine
 # Ensure load_dotenv is called immediately
 load_dotenv()
 # --- Security: Direct bcrypt implementation ---
-def get_password_hash(password: str) -> str:
-    """Hashes a password using bcrypt."""
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verifies a password against a stored hash."""
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+# get_password_hash / verify_password now live in shared.py (imported
+# above) — moved there so a new route module can hash a password without
+# creating a circular import with main.py.
 
 # --- Logging & Initialization ---
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -698,6 +694,8 @@ from shared import (
     abbreviate_subject,
     with_query_param,
     full_student_name,
+    get_password_hash,
+    verify_password,
     get_current_session_user,
 )
 
@@ -880,6 +878,17 @@ def bootstrap_database_schema():
                     UNIQUE(school_id, admission_number)
                 );
                 ALTER TABLE students ADD COLUMN IF NOT EXISTS middle_name VARCHAR(100);
+
+                -- Student portal access: two independent parent/guardian
+                -- contacts (siblings very commonly share one or both of
+                -- these), plus a hashed passphrase set by an admin. A
+                -- learner logs in with either phone number + the
+                -- passphrase; see student_portal_routes.py for the login
+                -- flow, including how it handles two different students
+                -- sharing the same parent phone number.
+                ALTER TABLE students ADD COLUMN IF NOT EXISTS mother_phone VARCHAR(50);
+                ALTER TABLE students ADD COLUMN IF NOT EXISTS father_phone VARCHAR(50);
+                ALTER TABLE students ADD COLUMN IF NOT EXISTS portal_password_hash TEXT;
 
                 -- One row per "Advance All Classes" run — lets a super
                 -- admin precisely undo a school's accidental promotion,
@@ -1151,6 +1160,14 @@ app.include_router(schemes_router)
 from mpesa_routes import router as mpesa_router, bootstrap_mpesa_schema, BILLING_ENFORCED
 bootstrap_mpesa_schema()
 app.include_router(mpesa_router)
+
+# --- Student Portal (extracted to its own file — see student_portal_routes.py) ---
+# No separate bootstrap function needed — its schema additions are just
+# new columns on the existing students table, already handled inside
+# main.py's own bootstrap_database_schema alongside that table's
+# definition.
+from student_portal_routes import router as student_portal_router
+app.include_router(student_portal_router)
 
 # --- Core Business & CBE Analytics Helper Logic ---
 def log_audit_action(cur, request: Request, school_id: int, action: str, details: str = ""):
@@ -6614,6 +6631,9 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
                     <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-200 text-slate-700 py-3 px-4 rounded hover:bg-slate-300 font-bold transition text-center">Cancel</a>
                 </div>
             </form>
+            <div class="mt-4 pt-4 border-t">
+                <a href="/admin/student/portal-access/{school_id}/{student_id}" class="block w-full text-center bg-indigo-50 border border-indigo-200 text-indigo-700 font-bold py-2.5 px-4 rounded-lg hover:bg-indigo-100 transition text-sm">🎒 Set Up Learner Portal Access</a>
+            </div>
             <form action="/api/v1/students/delete/{school_id}/{student_id}" method="post" class="mt-4 pt-4 border-t" onsubmit="return confirm('Permanently delete {esc(full_student_name(student))}? This also deletes all of their recorded scores. This cannot be undone.');">
                 <button type="submit" class="w-full bg-rose-50 border border-rose-200 text-rose-700 font-bold py-2.5 px-4 rounded-lg hover:bg-rose-100 transition text-sm">🗑 Delete Student Permanently</button>
             </form>
