@@ -10,6 +10,9 @@ import functools
 import bcrypt
 import psycopg2
 import requests as http_requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile
@@ -171,6 +174,65 @@ def send_sms(phone_number: str, message: str) -> bool:
     except Exception as sms_err:
         _last_sms_error = f"{type(sms_err).__name__}: {sms_err}"
         logger.error(f"SMS send failed: {_last_sms_error}")
+        return False
+
+
+# --- Email provider configuration (SMTP — Gmail / Google Workspace) ---
+# Set these on Render to enable real email delivery. Gmail requires an App
+# Password here, NOT the account's normal login password — that only
+# works once 2-Step Verification is turned on for the Google account
+# (myaccount.google.com/apppasswords). The regular password will not
+# work for SMTP; Google blocks it. Until these are set, emails are only
+# logged server-side (a clearly-labeled simulation) so the feature can be
+# tested end-to-end without a live account, matching the SMS pattern above.
+SMTP_HOST = (os.getenv("SMTP_HOST") or "smtp.gmail.com").strip()
+SMTP_PORT = int((os.getenv("SMTP_PORT") or "587").strip())
+SMTP_USERNAME = (os.getenv("SMTP_USERNAME") or "").strip() or None
+SMTP_PASSWORD = (os.getenv("SMTP_PASSWORD") or "").strip() or None
+SMTP_FROM_NAME = (os.getenv("SMTP_FROM_NAME") or "Elimu Hub").strip()
+_email_configured = bool(SMTP_USERNAME and SMTP_PASSWORD)
+
+if _email_configured:
+    logger.info(f"SMTP configured ({SMTP_HOST}) — emails will be sent for real.")
+else:
+    logger.warning(
+        "SMTP NOT configured (SMTP_USERNAME / SMTP_PASSWORD missing). "
+        "Emails will only be logged server-side (simulated) until configured."
+    )
+
+_last_email_error = None
+
+def send_email(to_email: str, subject: str, body_html: str) -> bool:
+    """Sends an email via SMTP (Gmail/Google Workspace by default) if
+    configured; otherwise logs the message as a simulated send. Returns
+    True if a real send succeeded or a simulated send was logged, False
+    only on a genuine sending failure. Mirrors send_sms's exact
+    configured-check / simulate / real-send / error-tracking pattern,
+    for the same reason: lets the whole flow be built and tested before
+    real credentials exist, and self-diagnoses cleanly once they do."""
+    global _last_email_error
+
+    if not _email_configured:
+        logger.info(f"[SIMULATED EMAIL] To: {to_email} | Subject: {subject} | Body: {body_html}")
+        return True
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_USERNAME}>"
+        msg["To"] = to_email
+        msg.attach(MIMEText(body_html, "html"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_USERNAME, [to_email], msg.as_string())
+
+        _last_email_error = None
+        return True
+    except Exception as email_err:
+        _last_email_error = f"{type(email_err).__name__}: {email_err}"
+        logger.error(f"Email send failed: {_last_email_error}")
         return False
 
 
@@ -1475,7 +1537,7 @@ def forgot_password_form(sent: str = None):
     if sent == "1":
         notice_html = """
         <div class="bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg mb-4">
-            If that email is on file with a phone number, a reset code has been sent via SMS. Enter it on the next screen.
+            If that email has an account, a reset code has been sent to it. Enter it on the next screen.
         </div>
         """
     return f"""
@@ -1489,7 +1551,7 @@ def forgot_password_form(sent: str = None):
     <body class="bg-slate-900 flex items-center justify-center h-screen font-sans">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Forgot Password</h2>
-            <p class="text-xs text-slate-400 mb-6">Enter the email on your account. We'll text a reset code to the phone number on file.</p>
+            <p class="text-xs text-slate-400 mb-6">Enter the email on your account. We'll email you a reset code.</p>
             {notice_html}
             <form action="/api/v1/auth/forgot-password" method="post" class="space-y-4">
                 <div>
@@ -1512,11 +1574,19 @@ def forgot_password_submit(email: str = Form(...)):
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, phone_number FROM users WHERE email = %s;", (email,))
+            cur.execute("SELECT id, phone_number, full_name FROM users WHERE email = %s;", (email,))
             user = cur.fetchone()
 
-            if user and user.get('phone_number'):
-                # Invalidate any previous unused codes for this account first.
+            # Previously gated entirely behind having a phone number on
+            # file — a user with no phone number got no code generated at
+            # all, with no way to tell (the same generic response is
+            # always shown, on purpose, so an attacker can't use it to
+            # find out which emails have accounts). Email is guaranteed
+            # to exist for every account (it's the login identifier
+            # itself), so it's now always sent; SMS goes out too when a
+            # phone number happens to be on file, as a bonus, not a
+            # requirement.
+            if user:
                 cur.execute("DELETE FROM password_resets WHERE user_id = %s AND used = FALSE;", (user['id'],))
 
                 reset_code = f"{random.randint(0, 999999):06d}"
@@ -1527,11 +1597,24 @@ def forgot_password_submit(email: str = Form(...)):
                 """, (user['id'], reset_code, expires_at))
                 conn.commit()
 
-                send_sms(
-                    user['phone_number'],
-                    f"Your Elimu Hub password reset code is {reset_code}. It expires in 15 minutes. "
-                    f"If you didn't request this, ignore this message."
+                send_email(
+                    email,
+                    "Your Elimu Hub password reset code",
+                    f"""
+                    <p>Hi {esc((user['full_name'] or email).split(' ')[0])},</p>
+                    <p>Your Elimu Hub password reset code is:</p>
+                    <p style="font-size:22px;font-weight:bold;background:#f1f5f9;padding:10px 16px;border-radius:8px;display:inline-block;letter-spacing:2px;">{esc(reset_code)}</p>
+                    <p>It expires in 15 minutes.</p>
+                    <p>If you didn't request this, you can safely ignore this email.</p>
+                    """
                 )
+
+                if user.get('phone_number'):
+                    send_sms(
+                        user['phone_number'],
+                        f"Your Elimu Hub password reset code is {reset_code}. It expires in 15 minutes. "
+                        f"If you didn't request this, ignore this message."
+                    )
 
     # Always the same response, regardless of whether the email was found —
     # this avoids revealing which emails have accounts on the system.
@@ -1543,7 +1626,7 @@ def reset_password_form(email: str = "", sent: str = None):
     if sent == "1":
         notice_html = """
         <div class="bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg mb-4">
-            If that email is on file with a phone number, a reset code has been sent via SMS.
+            If that email has an account, a reset code has been sent to it.
         </div>
         """
     return f"""
@@ -3135,14 +3218,14 @@ def superadmin_reset_admin_password_form(school_id: int, request: Request, done:
 
     result_html = ""
     if done == "1" and admin:
-        # The generated password is passed through a one-time query param
-        # from the POST handler's redirect and shown exactly once.
-        new_password = request.query_params.get("pwd", "")
+        # The new password itself is never shown here or passed through
+        # the URL — it's emailed straight to the admin's own account, so
+        # the super admin never sees it at all, matching how a real
+        # password reset should work.
         result_html = f"""
         <div class="bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-lg mb-4">
-            <p class="font-bold mb-1">New password generated:</p>
-            <p class="font-mono text-base bg-white border border-emerald-300 rounded px-3 py-2 inline-block">{esc(new_password)}</p>
-            <p class="text-xs mt-2">Copy this now and relay it to the admin securely — it will not be shown again. They can change it after logging in.</p>
+            <p class="font-bold">New password emailed to {esc(admin['email'])}.</p>
+            <p class="text-xs mt-1">They can log in with it and change it afterward. It was never shown here.</p>
         </div>
         """
 
@@ -3151,8 +3234,8 @@ def superadmin_reset_admin_password_form(school_id: int, request: Request, done:
     else:
         admin_block = f"""
         <p class="text-xs text-slate-500 mb-4">Admin account: <b>{esc(admin['full_name'] or admin['email'])}</b> ({esc(admin['email'])})</p>
-        <form action="/api/v1/superadmin/school/reset-admin-password/{school_id}" method="post" onsubmit="return confirm('Generate a new password for this admin? Their current password will stop working immediately.');">
-            <button type="submit" class="w-full bg-indigo-700 text-white p-3 rounded-lg font-black tracking-wide hover:bg-indigo-800 transition shadow-md">Generate New Password</button>
+        <form action="/api/v1/superadmin/school/reset-admin-password/{school_id}" method="post" onsubmit="return confirm('Generate a new password for this admin and email it to {esc(admin["email"])}? Their current password will stop working immediately.');">
+            <button type="submit" class="w-full bg-indigo-700 text-white p-3 rounded-lg font-black tracking-wide hover:bg-indigo-800 transition shadow-md">Generate New Password &amp; Email It</button>
         </form>
         """
 
@@ -3190,15 +3273,34 @@ def superadmin_reset_admin_password_submit(school_id: int, request: Request):
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id FROM users WHERE school_id = %s AND role = 'admin' ORDER BY id ASC LIMIT 1;", (school_id,))
+            cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'admin' ORDER BY id ASC LIMIT 1;", (school_id,))
             admin = cur.fetchone()
             if not admin:
                 raise HTTPException(status_code=404, detail="No admin account found for this school.")
             cur.execute("UPDATE users SET password_hash = %s WHERE id = %s;", (hashed_password, admin['id']))
             conn.commit()
 
+            # Emailed directly to the account holder — never shown to the
+            # super admin at all, on-screen or otherwise. Previously this
+            # was passed back through the URL and displayed on the super
+            # admin's own screen for manual relay, which meant a stranger
+            # to the account was the one actually seeing the password.
+            greeting_name = (admin['full_name'] or admin['email']).split(" ")[0]
+            send_email(
+                admin['email'],
+                "Your Elimu Hub password has been reset",
+                f"""
+                <p>Hi {esc(greeting_name)},</p>
+                <p>Your Elimu Hub administrator password was just reset. Your new temporary password is:</p>
+                <p style="font-size:18px;font-weight:bold;background:#f1f5f9;padding:10px 16px;border-radius:8px;display:inline-block;">{esc(new_password)}</p>
+                <p>Log in and change it to something memorable as soon as you can.</p>
+                <p>If you didn't request this, contact your Elimu Hub administrator right away.</p>
+                """
+            )
+
+
     return RedirectResponse(
-        url=f"/superadmin/school/reset-admin-password/{school_id}?done=1&pwd={urllib.parse.quote(new_password)}",
+        url=f"/superadmin/school/reset-admin-password/{school_id}?done=1",
         status_code=303
     )
 
