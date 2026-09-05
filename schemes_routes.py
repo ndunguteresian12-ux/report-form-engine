@@ -292,7 +292,25 @@ def _fix_letter_spacing(text):
     return _LETTER_SPACING_PATTERN.sub(lambda m: m.group(0).replace(" ", ""), text)
 
 
+
+# A genuine header cell is always a short label ("Learning Outcomes",
+# 17 chars) — never a full sentence. Real CBC lesson content routinely
+# USES these same words in ordinary prose ("formative assessment",
+# "available resources", "learners reflect on the sub-strand") — and the
+# substring-matching fallback below, needed to catch real header
+# variations, means a genuine data row can rack up 4+ "matches" purely
+# from mentioning these words in passing. Confirmed against a completely
+# ordinary, realistic data row: it hit 6/10 field matches before this
+# cap existed, comfortably clearing the 4-match confidence threshold and
+# getting itself mistaken for a brand new header — silently corrupting
+# the column mapping for every row after it on that page and beyond.
+# That's the actual, confirmed mechanism behind rows coming out blank.
+MAX_HEADER_CELL_LENGTH = 40
+
+
 def _match_column_to_field(header_text):
+    if header_text and len(header_text.strip()) > MAX_HEADER_CELL_LENGTH:
+        return None  # too long to plausibly be a header label — this is what a data cell looks like
     normalized = _normalize_header(header_text)
     if not normalized:
         return None
@@ -348,6 +366,15 @@ def parse_scheme_pdf(filepath: str):
             # bug against an actual scheme PDF.
             MIN_CONFIDENT_HEADER_MATCHES = 4
 
+            # Once a column mapping is already working, overwriting it is
+            # the single riskiest moment in this whole function — a wrong
+            # re-detection here doesn't just fail to find a header, it
+            # actively corrupts every row that follows. So re-detection
+            # requires a distinctly higher bar than the first detection
+            # did — a second, independent layer of defense on top of the
+            # length cap above, not a replacement for it.
+            MIN_CONFIDENT_REDETECT_MATCHES = 7
+
             # Deliberately checks EVERY row for header-likeness, not just
             # each table's first row — this is what correctly handles a
             # real multi-page scheme: the true header might not be on
@@ -369,7 +396,8 @@ def parse_scheme_pdf(filepath: str):
                         candidate_map = [_match_column_to_field(cell) for cell in row]
                         matched_count = sum(1 for f in candidate_map if f)
 
-                        if matched_count >= MIN_CONFIDENT_HEADER_MATCHES:
+                        required_matches = MIN_CONFIDENT_HEADER_MATCHES if column_field_map is None else MIN_CONFIDENT_REDETECT_MATCHES
+                        if matched_count >= required_matches:
                             # A genuine header row — establishes (or
                             # re-confirms, on a later page) the column
                             # structure. Never treated as data itself.
