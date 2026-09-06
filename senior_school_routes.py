@@ -39,6 +39,19 @@ from shared import (
 
 router = APIRouter()
 
+# Every Senior School combination shares these 4 exactly the same way —
+# no school-to-school variation, so there's nothing for an admin to
+# choose here. These get added to every combination automatically,
+# always marked compulsory, without the admin re-ticking them each time.
+AUTO_COMPULSORY_SUBJECTS = ["English", "Kiswahili", "Community Service Learning", "Physical Education"]
+
+# Mathematics is compulsory too, but WHICH variant applies genuinely
+# differs by combination (a STEM track might use Core, another might use
+# Essential) — so this one still needs a choice, just a single required
+# one instead of a generic checkbox, and it's always compulsory once
+# picked.
+MATHEMATICS_VARIANTS = ["Mathematics (Core)", "Mathematics (Essential)", "Advanced Mathematics"]
+
 
 def bootstrap_senior_school_schema():
     """Creates/upgrades everything this module owns: the classes
@@ -105,9 +118,13 @@ def bootstrap_senior_school_schema():
 def subject_combinations_view(school_id: int, request: Request, grade_name: str = "Grade 10"):
     """Lets a school define its own Subject Combinations for Senior
     School — each with a name (used as that combination's `stream`
-    value) and a specific set of subjects, since real schools each offer
-    their own limited mix from the full Senior School pathway pool, not
-    a fixed set of 3 pathways."""
+    value) and a specific set of ELECTIVE subjects, since real schools
+    each offer their own limited mix from the full Senior School
+    pathway pool, not a fixed set of 3 pathways. The compulsory core
+    (English, Kiswahili, Community Service Learning, Physical Education,
+    plus a chosen Mathematics variant) is handled automatically — an
+    admin only ever picks electives here, never re-ticks the same
+    compulsory subjects for every combination."""
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -119,8 +136,15 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
-            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = 'Senior School' ORDER BY name ASC;")
-            subject_pool = cur.fetchall()
+            # Electives only — the auto-compulsory subjects and the
+            # Mathematics variants are handled separately below, never
+            # shown as pickable checkboxes here.
+            excluded_names = AUTO_COMPULSORY_SUBJECTS + MATHEMATICS_VARIANTS
+            cur.execute(
+                "SELECT id, name FROM learning_areas WHERE education_level = 'Senior School' AND name != ALL(%s) ORDER BY name ASC;",
+                (excluded_names,)
+            )
+            elective_pool = cur.fetchall()
 
             cur.execute("""
                 SELECT stream, la.id AS learning_area_id, la.name AS subject_name, cs.is_compulsory
@@ -160,15 +184,23 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
         </div>
         """
 
-    subject_checkboxes = "".join(
+    auto_compulsory_chips = "".join(
+        f"<span class='text-[11px] font-semibold px-2 py-1 rounded-full bg-indigo-100 text-indigo-700 mr-1 mb-1 inline-block'>{esc(name)}</span>"
+        for name in AUTO_COMPULSORY_SUBJECTS
+    )
+    math_variant_radios = "".join(
         f"""<label class="flex items-center gap-2 text-xs p-1.5 hover:bg-slate-50 rounded-lg cursor-pointer">
-            <input type="checkbox" name="subject_ids" value="{s['id']}" class="rounded">
-            <span>{esc(s['name'])}</span>
-            <span class="ml-auto flex items-center gap-1 text-[10px] text-slate-400">
-                <input type="checkbox" name="compulsory_{s['id']}" class="rounded"> compulsory
-            </span>
+            <input type="radio" name="math_variant" value="{esc(v)}" {"required" if i == 0 else ""} class="rounded">
+            <span>{esc(v)}</span>
         </label>"""
-        for s in subject_pool
+        for i, v in enumerate(MATHEMATICS_VARIANTS)
+    )
+    elective_checkboxes = "".join(
+        f"""<label class="flex items-center gap-2 text-xs p-1.5 hover:bg-slate-50 rounded-lg cursor-pointer">
+            <input type="checkbox" name="elective_ids" value="{s['id']}" class="rounded">
+            <span>{esc(s['name'])}</span>
+        </label>"""
+        for s in elective_pool
     )
 
     return f"""
@@ -179,7 +211,7 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
         <div class="max-w-3xl mx-auto space-y-4">
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">🎓 Subject Combinations</h2>
-                <p class="text-xs text-slate-400 mb-3">{esc(school['name'])} — define the specific combinations your school offers. Each becomes a schedulable stream, e.g. "{esc(grade_name)}" + "STEM - Medicine Track".</p>
+                <p class="text-xs text-slate-400 mb-3">{esc(school['name'])} — pick the electives your school offers; the compulsory core is added automatically. Each combination becomes a schedulable stream, e.g. "{esc(grade_name)}" + "STEM - Medicine Track".</p>
                 <div class="flex gap-2">{grade_tabs}</div>
             </div>
 
@@ -197,8 +229,16 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
                         <input type="text" name="stream" placeholder="e.g. STEM - Medicine Track" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
                     </div>
                     <div>
-                        <label class="text-xs font-bold text-slate-600">Subjects (tick "compulsory" for English, Kiswahili, Mathematics, CSL, PE — leave unticked for this combination's electives)</label>
-                        <div class="mt-1 border rounded-lg p-2 max-h-72 overflow-y-auto">{subject_checkboxes}</div>
+                        <label class="text-xs font-bold text-slate-600">Compulsory (every combination automatically includes these)</label>
+                        <div class="mt-1">{auto_compulsory_chips}</div>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-600">Mathematics — choose the variant this combination uses</label>
+                        <div class="mt-1 border rounded-lg p-2">{math_variant_radios}</div>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-600">Electives — tick the ones this combination offers</label>
+                        <div class="mt-1 border rounded-lg p-2 max-h-72 overflow-y-auto">{elective_checkboxes}</div>
                     </div>
                     <button type="submit" class="w-full bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 rounded-lg text-sm transition">Save Combination</button>
                 </form>
@@ -218,23 +258,44 @@ async def save_subject_combination(school_id: int, request: Request):
     form = await request.form()
     grade_name = form.get("grade_name", "").strip()
     stream = form.get("stream", "").strip()
-    subject_ids = form.getlist("subject_ids")
+    math_variant = form.get("math_variant", "").strip()
+    elective_ids = form.getlist("elective_ids")
 
     if not grade_name or not stream:
         raise HTTPException(status_code=400, detail="Grade and combination name are both required.")
-    if not subject_ids:
-        raise HTTPException(status_code=400, detail="Select at least one subject for this combination.")
+    if not math_variant or math_variant not in MATHEMATICS_VARIANTS:
+        raise HTTPException(status_code=400, detail="Choose which Mathematics variant this combination uses.")
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            for sid in subject_ids:
-                is_compulsory = form.get(f"compulsory_{sid}") is not None
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Resolve the auto-compulsory subject names (fixed, same for
+            # every combination) plus the chosen Mathematics variant into
+            # their learning_area ids — these are never shown as
+            # checkboxes, so there's nothing for the admin to submit for
+            # them; they're always compulsory=True whenever a
+            # combination is saved.
+            compulsory_names = AUTO_COMPULSORY_SUBJECTS + [math_variant]
+            cur.execute(
+                "SELECT id FROM learning_areas WHERE education_level = 'Senior School' AND name = ANY(%s);",
+                (compulsory_names,)
+            )
+            compulsory_ids = [r['id'] for r in cur.fetchall()]
+
+            for lid in compulsory_ids:
                 cur.execute("""
                     INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
-                    VALUES (%s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, TRUE)
                     ON CONFLICT (school_id, grade_name, stream, learning_area_id)
-                    DO UPDATE SET is_compulsory = EXCLUDED.is_compulsory;
-                """, (school_id, grade_name, stream, int(sid), is_compulsory))
+                    DO UPDATE SET is_compulsory = TRUE;
+                """, (school_id, grade_name, stream, lid))
+
+            for eid in elective_ids:
+                cur.execute("""
+                    INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
+                    VALUES (%s, %s, %s, %s, FALSE)
+                    ON CONFLICT (school_id, grade_name, stream, learning_area_id)
+                    DO UPDATE SET is_compulsory = FALSE;
+                """, (school_id, grade_name, stream, int(eid)))
             conn.commit()
 
     return RedirectResponse(url=f"/timetable/combinations/{school_id}?grade_name={urllib.parse.quote(grade_name)}", status_code=303)

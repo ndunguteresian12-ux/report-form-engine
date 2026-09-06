@@ -812,6 +812,7 @@ def timetable_workspace_hub(school_id: int, request: Request):
             <div class="flex items-center justify-between mb-3">
                 <h2 class="text-sm font-black text-slate-700">{esc(level_name)}</h2>
                 <div class="flex gap-2">
+                    {'<a href="/timetable/combinations/' + str(school_id) + '" class="bg-indigo-700 hover:bg-indigo-800 text-white px-3.5 py-1.5 rounded-xl text-xs font-bold transition shadow-sm">🎓 Subject Combinations</a>' if level_name == "Senior School" else ""}
                     <a href="/timetable/print-all/{school_id}?education_level={urllib.parse.quote(level_name)}" target="_blank" class="bg-slate-800 hover:bg-slate-900 text-white px-3.5 py-1.5 rounded-xl text-xs font-bold transition shadow-sm">🖨 Print All</a>
                     <form action="/api/v1/timetable/test-and-generate-level/{school_id}" method="post" onsubmit="return confirm('Test and generate every class in {esc(level_name)}?');">
                         <input type="hidden" name="education_level" value="{esc(level_name)}">
@@ -846,7 +847,6 @@ def timetable_workspace_hub(school_id: int, request: Request):
                 <a href="/timetable/plans/{school_id}" class="bg-indigo-700 hover:bg-indigo-800 text-white px-3.5 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🗂 Timetable Plans</a>
                 <a href="/timetable/subjects-config/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🎨 Subjects</a>
                 <a href="/timetable/custom-subjects/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">➕ Custom Subjects</a>
-                <a href="/timetable/combinations/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🎓 Subject Combinations</a>
                 <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods &amp; Days</a>
                 <a href="/timetable/availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🧑‍🏫 Teacher Availability</a>
                 <a href="/timetable/subject-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>
