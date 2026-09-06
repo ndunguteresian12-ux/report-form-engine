@@ -469,17 +469,53 @@ LOADING_STATES_SCRIPT = r"""
 """
 
 
-def _inject_help_widget(html: str) -> str:
-    """Inserts the help widget, nav sidebar, loading-states script, and
-    (only if one isn't already present) a toast container, right before
-    </body>. Checking for an existing toast-container first avoids a
-    duplicate element on the handful of pages that already include one
-    manually. Returns the HTML unchanged if there's no </body> tag to
-    anchor on (e.g. a fragment, not a full page)."""
+BACK_BUTTON_SCRIPT_TEMPLATE = """
+<script>
+// A PWA in standalone display mode hides the browser's own back button
+// entirely — normal <a href> links still work, but there's otherwise no
+// way to step back to the previous page short of closing and reopening
+// the app. This floating button uses the browser's own history, so it
+// works on every page without needing a hardcoded "back to X" link
+// built into each page individually. Injected globally by the
+// middleware below rather than into each page's own HTML, since
+// touching every single route function in every file would be
+// impractical. Only shown: (1) in standalone mode specifically — a
+// normal browser tab already has its own working back button, so this
+// would just be a redundant second one; (2) when there's actually a
+// previous page in this session to go back to.
+(function() {
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+    if (!isStandalone || window.history.length <= 1) return;
+    const backBtn = document.createElement('button');
+    backBtn.setAttribute('aria-label', 'Back');
+    backBtn.style.cssText = 'position:fixed;top:12px;left:12px;z-index:9998;background:{color};color:white;border:none;width:40px;height:40px;border-radius:50%;font-size:20px;font-weight:bold;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.2);display:flex;align-items:center;justify-content:center;';
+    backBtn.textContent = '\u2039';
+    backBtn.onclick = () => window.history.back();
+    document.addEventListener('DOMContentLoaded', () => document.body.appendChild(backBtn));
+    if (document.readyState !== 'loading') document.body.appendChild(backBtn);
+})();
+</script>
+"""
+
+
+def _inject_help_widget(html: str, request_path: str = "") -> str:
+    """Inserts the help widget, nav sidebar, loading-states script, (only
+    if one isn't already present) a toast container, and a floating
+    standalone-PWA back button, right before </body>. Checking for an
+    existing toast-container first avoids a duplicate element on the
+    handful of pages that already include one manually. Returns the HTML
+    unchanged if there's no </body> tag to anchor on (e.g. a fragment,
+    not a full page)."""
     if "</body>" not in html:
         return html
 
-    injected = HELP_WIDGET_HTML + NAV_SIDEBAR_HTML + LOADING_STATES_SCRIPT
+    # Different accent color per app — emerald for the learner portal,
+    # teal for everything else — matching each app's own established
+    # brand color rather than one generic color for both.
+    back_button_color = "rgba(4,120,87,0.92)" if request_path.startswith("/student/") else "rgba(13,148,136,0.92)"
+    back_button_script = BACK_BUTTON_SCRIPT_TEMPLATE.replace("{color}", back_button_color)
+
+    injected = HELP_WIDGET_HTML + NAV_SIDEBAR_HTML + LOADING_STATES_SCRIPT + back_button_script
     if 'id="toast-container"' not in html:
         injected += TOAST_CONTAINER_HTML
 
@@ -506,7 +542,7 @@ async def inject_help_widget_middleware(request: Request, call_next):
         # through completely unchanged rather than risk corrupting it.
         return Response(content=body, status_code=response.status_code, headers=dict(response.headers), media_type=response.media_type)
 
-    new_html = _inject_help_widget(html)
+    new_html = _inject_help_widget(html, request.url.path)
     new_body = new_html.encode("utf-8")
 
     headers = dict(response.headers)
@@ -625,23 +661,12 @@ function showUpdateBanner() {
     document.body.appendChild(banner);
     document.getElementById('elimu-update-btn').onclick = () => window.location.reload();
 }
-
-// See student_portal_routes.py's STUDENT_PWA_HEAD_SNIPPET for the full
-// rationale — standalone PWA mode hides the browser's own back button
-// entirely, so this floating one (using ordinary browser history) is
-// what lets someone step back to the previous page without closing and
-// reopening the app. Only appears in standalone mode, and only once
-// there's an actual previous page in this session to return to.
-(function() {
-    const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
-    if (!isStandalone || window.history.length <= 1) return;
-    const backBtn = document.createElement('button');
-    backBtn.setAttribute('aria-label', 'Back');
-    backBtn.style.cssText = 'position:fixed;top:12px;left:12px;z-index:9998;background:rgba(13,148,136,0.92);color:white;border:none;width:40px;height:40px;border-radius:50%;font-size:20px;font-weight:bold;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.2);display:flex;align-items:center;justify-content:center;';
-    backBtn.textContent = '‹';
-    backBtn.onclick = () => window.history.back();
-    document.addEventListener('DOMContentLoaded', () => document.body.appendChild(backBtn));
-})();
+// The standalone-PWA floating back button used to live here, injected
+// on just the 3 pages that included this snippet. It's now injected
+// globally, on every single page across the whole app, by
+// _inject_help_widget's middleware instead — see BACK_BUTTON_SCRIPT_TEMPLATE
+// above. Removed from here to avoid two back buttons showing up on the
+// same page.
 </script>
 """
 
@@ -2514,6 +2539,12 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
     auth_error = require_superadmin_session(request)
     if auth_error:
         return auth_error
+
+    # Trims accidental leading/trailing whitespace from the table name —
+    # a stray space (e.g. from not fully clearing the box before typing
+    # a new name) makes this look for a table that can never exist,
+    # which reads exactly like a genuinely missing table otherwise.
+    table = table.strip()
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:

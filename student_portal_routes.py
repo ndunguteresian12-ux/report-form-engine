@@ -84,28 +84,13 @@ function showStudentUpdateBanner() {
     document.body.appendChild(banner);
     document.getElementById('elimu-learner-update-btn').onclick = () => window.location.reload();
 }
-
-// A PWA in standalone display mode hides the browser's own back button
-// entirely — normal <a href> links still work, but there's otherwise no
-// way to step back to the previous page short of closing and reopening
-// the app. This floating button uses the browser's own history, so it
-// works everywhere, on every page, without needing a hardcoded "back to
-// X" link built into each page individually. Only shown: (1) in
-// standalone mode specifically — a normal browser tab already has its
-// own working back button, so this would just be a redundant second one;
-// (2) when there's actually a previous page in this session to go back
-// to, since forcing it on the very first page (e.g. the login screen)
-// would go nowhere useful.
-(function() {
-    const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
-    if (!isStandalone || window.history.length <= 1) return;
-    const backBtn = document.createElement('button');
-    backBtn.setAttribute('aria-label', 'Back');
-    backBtn.style.cssText = 'position:fixed;top:12px;left:12px;z-index:9998;background:rgba(4,120,87,0.92);color:white;border:none;width:40px;height:40px;border-radius:50%;font-size:20px;font-weight:bold;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.2);display:flex;align-items:center;justify-content:center;';
-    backBtn.textContent = '‹';
-    backBtn.onclick = () => window.history.back();
-    document.addEventListener('DOMContentLoaded', () => document.body.appendChild(backBtn));
-})();
+// The standalone-PWA floating back button used to live here, injected
+// only on this file's own two pages. It's now injected globally, on
+// every single page across the whole app (this router included, since
+// it's registered on the same FastAPI app instance main.py's own
+// middleware wraps), by _inject_help_widget's middleware in main.py
+// instead. Removed from here to avoid two back buttons showing up on
+// the same page.
 </script>
 """
 
