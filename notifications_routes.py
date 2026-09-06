@@ -40,6 +40,29 @@ from shared import (
 
 router = APIRouter()
 
+# Temporarily disabled while switching SMS providers to Celcom Africa —
+# all the working code below (Progress Reports, Custom Notification) is
+# left completely intact, just gated behind this single flag. Flip back
+# to True once the new provider is actually configured; nothing else
+# needs to change.
+NOTIFICATIONS_FEATURE_ENABLED = False
+
+
+def _coming_soon_page(title: str) -> HTMLResponse:
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | {esc(title)}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
+        <div class="bg-white p-8 rounded-2xl border shadow-xs w-full max-w-md text-center">
+            <p class="text-4xl mb-3">🚧</p>
+            <h2 class="text-lg font-black text-slate-800">{esc(title)}</h2>
+            <p class="text-sm text-slate-500 mt-2">Coming soon — we're setting up a new SMS provider to make this even more reliable. Thanks for your patience!</p>
+        </div>
+    </body>
+    </html>
+    """)
+
 
 def bootstrap_notifications_schema():
     """One new table: a log of every bulk send, for accountability and so
@@ -124,6 +147,8 @@ def progress_reports_preview(school_id: int, request: Request, grade_name: str, 
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
+    if not NOTIFICATIONS_FEATURE_ENABLED:
+        return _coming_soon_page("Send Progress Reports")
 
     viewer = get_current_session_user(request)
     if viewer and viewer.get('role') == 'staff':
@@ -213,6 +238,8 @@ async def progress_reports_send(school_id: int, request: Request, background_tas
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
+    if not NOTIFICATIONS_FEATURE_ENABLED:
+        raise HTTPException(status_code=503, detail="Sending progress reports is temporarily unavailable while we switch SMS providers. Coming back soon!")
 
     form = await request.form()
     grade_name = form.get("grade_name", "")
@@ -284,6 +311,8 @@ def custom_notification_form(school_id: int, request: Request, sent: str = None)
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
+    if not NOTIFICATIONS_FEATURE_ENABLED:
+        return _coming_soon_page("Send Notification")
 
     viewer = get_current_session_user(request)
     is_admin = not (viewer and viewer.get('role') == 'staff')
@@ -351,6 +380,8 @@ async def custom_notification_send(school_id: int, request: Request, background_
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
+    if not NOTIFICATIONS_FEATURE_ENABLED:
+        raise HTTPException(status_code=503, detail="Sending notifications is temporarily unavailable while we switch SMS providers. Coming back soon!")
 
     form = await request.form()
     audience = (form.get("audience") or "").strip()
@@ -406,5 +437,3 @@ async def custom_notification_send(school_id: int, request: Request, background_
     background_tasks.add_task(_send_bulk_sms_task, recipients, message, log_id)
 
     return RedirectResponse(url=f"/admin/notifications/custom/{school_id}?sent=1", status_code=303)
-
-
