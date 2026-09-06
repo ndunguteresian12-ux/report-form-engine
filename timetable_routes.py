@@ -1366,10 +1366,21 @@ def validate_timetable_setup(cur, school_id: int, grade_name: str, education_lev
 
     total_available_slots = len(days) * len(teaching_periods)
 
-    cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
-    subjects = sort_subjects_for_display(cur.fetchall(), education_level)
-    if not subjects:
-        errors.append(f"No subjects exist for {education_level}. This shouldn't normally happen — contact support if you see this.")
+    if education_level == "Senior School":
+        cur.execute("""
+            SELECT la.id, la.name FROM combination_subjects cs
+            JOIN learning_areas la ON cs.learning_area_id = la.id
+            WHERE cs.school_id = %s AND cs.grade_name = %s AND cs.stream = %s
+            ORDER BY cs.is_compulsory DESC, la.name ASC;
+        """, (school_id, grade_name, stream))
+        subjects = cur.fetchall()
+        if not subjects:
+            errors.append(f'No subjects have been set up yet for the combination "{stream}". Go to Subject Combinations and add its subjects first.')
+    else:
+        cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
+        subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+        if not subjects:
+            errors.append(f"No subjects exist for {education_level}. This shouldn't normally happen — contact support if you see this.")
         return errors, warnings
 
     cur.execute("""
@@ -1701,8 +1712,23 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
             resolved_plan_id = resolve_plan_id(cur, school_id, education_level, plan_id)
             plan_options_html = get_plan_options_html(cur, school_id, education_level, resolved_plan_id)
 
-            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
-            subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+            # Senior School doesn't have one fixed subject list per level —
+            # each stream IS a specific subject combination (e.g. "STEM -
+            # Medicine Track"), so the subject list here has to come from
+            # combination_subjects for this exact (grade, stream), not
+            # every Senior School subject in existence. Every other level
+            # keeps its existing behavior — one fixed list per level.
+            if education_level == "Senior School":
+                cur.execute("""
+                    SELECT la.id, la.name FROM combination_subjects cs
+                    JOIN learning_areas la ON cs.learning_area_id = la.id
+                    WHERE cs.school_id = %s AND cs.grade_name = %s AND cs.stream = %s
+                    ORDER BY cs.is_compulsory DESC, la.name ASC;
+                """, (school_id, grade_name, stream))
+                subjects = cur.fetchall()
+            else:
+                cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
+                subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
             cur.execute("SELECT id, name FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s AND plan_id = %s ORDER BY name ASC;", (school_id, education_level, resolved_plan_id))
             custom_subjects = cur.fetchall()
@@ -1767,7 +1793,7 @@ def teacher_assignments_view(school_id: int, request: Request, grade_name: str, 
                 <input type="hidden" name="education_level" value="{esc(education_level)}">
                 <input type="hidden" name="stream" value="{esc(stream)}">
                 <input type="hidden" name="plan_id" value="{resolved_plan_id}">
-                {rows_html or "<p class='text-slate-400 text-xs italic'>No subjects configured for this education level.</p>"}
+                {rows_html or (f"<p class='text-slate-400 text-xs italic'>No subjects defined for \"{esc(stream)}\" yet. <a href='/timetable/combinations/{school_id}?grade_name={urllib.parse.quote(grade_name)}' class='text-indigo-700 font-bold hover:underline'>Set up this combination's subjects →</a></p>" if education_level == "Senior School" else "<p class='text-slate-400 text-xs italic'>No subjects configured for this education level.</p>")}
                 {f'''<p class="text-[10px] font-bold uppercase tracking-wider text-slate-400 pt-4 pb-1">Custom Subjects (non-examinable / split subjects)</p>{custom_rows_html}''' if custom_subjects else ""}
                 <p class="text-[11px] text-slate-400 pt-3">Need a subject that isn't listed — like splitting Creative Arts into Music/Art/PE, or adding a non-graded subject like PPI? <a href="/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(education_level)}&plan_id={resolved_plan_id}" class="text-indigo-700 font-bold hover:underline">Add a Custom Subject →</a></p>
                 <div class="pt-4 flex gap-3">
@@ -3319,8 +3345,17 @@ def subject_constraints_view(school_id: int, request: Request, grade_name: str, 
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
-            subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+            if education_level == "Senior School":
+                cur.execute("""
+                    SELECT la.id, la.name FROM combination_subjects cs
+                    JOIN learning_areas la ON cs.learning_area_id = la.id
+                    WHERE cs.school_id = %s AND cs.grade_name = %s AND cs.stream = %s
+                    ORDER BY cs.is_compulsory DESC, la.name ASC;
+                """, (school_id, grade_name, stream))
+                subjects = cur.fetchall()
+            else:
+                cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
+                subjects = sort_subjects_for_display(cur.fetchall(), education_level)
             subject_names = {s['id']: s['name'] for s in subjects}
 
             cur.execute("""
@@ -3487,8 +3522,17 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
 
             periods = get_periods_for_level(cur, school_id, education_level)
 
-            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
-            subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+            if education_level == "Senior School":
+                cur.execute("""
+                    SELECT la.id, la.name FROM combination_subjects cs
+                    JOIN learning_areas la ON cs.learning_area_id = la.id
+                    WHERE cs.school_id = %s AND cs.grade_name = %s AND cs.stream = %s
+                    ORDER BY cs.is_compulsory DESC, la.name ASC;
+                """, (school_id, grade_name, stream))
+                subjects = cur.fetchall()
+            else:
+                cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
+                subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
             cur.execute(
                 "SELECT id, name FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s ORDER BY name ASC;",
@@ -4148,8 +4192,25 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
 
             teaching_periods = [p for p in get_periods_for_level(cur, school_id, education_level) if p['is_teaching_period']]
 
-            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
-            subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+            # Same reasoning as Teaching Assignments: Senior School has no
+            # one fixed subject list per level — each stream IS a specific
+            # subject combination, so the subject queue generation works
+            # from has to come from combination_subjects for this exact
+            # (grade, stream), not every Senior School subject in
+            # existence. Without this, the generator would try to
+            # schedule (and warn about missing teachers for) subjects
+            # that aren't even part of this stream's combination.
+            if education_level == "Senior School":
+                cur.execute("""
+                    SELECT la.id, la.name FROM combination_subjects cs
+                    JOIN learning_areas la ON cs.learning_area_id = la.id
+                    WHERE cs.school_id = %s AND cs.grade_name = %s AND cs.stream = %s
+                    ORDER BY cs.is_compulsory DESC, la.name ASC;
+                """, (school_id, grade_name, stream))
+                subjects = cur.fetchall()
+            else:
+                cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
+                subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
             # Custom subjects (a school-specific split like Music/Art/PE out
             # of "Creative Arts and Sports", or a non-examinable subject
