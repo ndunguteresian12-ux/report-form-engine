@@ -811,10 +811,13 @@ def timetable_workspace_hub(school_id: int, request: Request):
         <div class="mb-6">
             <div class="flex items-center justify-between mb-3">
                 <h2 class="text-sm font-black text-slate-700">{esc(level_name)}</h2>
-                <form action="/api/v1/timetable/test-and-generate-level/{school_id}" method="post" onsubmit="return confirm('Test and generate every class in {esc(level_name)}?');">
-                    <input type="hidden" name="education_level" value="{esc(level_name)}">
-                    <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-3.5 py-1.5 rounded-xl text-xs font-bold transition shadow-sm">🧪 Test &amp; Generate Level</button>
-                </form>
+                <div class="flex gap-2">
+                    <a href="/timetable/print-all/{school_id}?education_level={urllib.parse.quote(level_name)}" target="_blank" class="bg-slate-800 hover:bg-slate-900 text-white px-3.5 py-1.5 rounded-xl text-xs font-bold transition shadow-sm">🖨 Print All</a>
+                    <form action="/api/v1/timetable/test-and-generate-level/{school_id}" method="post" onsubmit="return confirm('Test and generate every class in {esc(level_name)}?');">
+                        <input type="hidden" name="education_level" value="{esc(level_name)}">
+                        <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white px-3.5 py-1.5 rounded-xl text-xs font-bold transition shadow-sm">🧪 Test &amp; Generate Level</button>
+                    </form>
+                </div>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">{cards_html}</div>
         </div>
@@ -1883,7 +1886,14 @@ def sync_teacher_names_into_slots(school_id: int, request: Request, grade_name: 
         return auth_error
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # RETURNING the affected teacher ids so we can check, right
+            # after this update, whether any of them are now booked into
+            # two classes at once — this UPDATE previously had NO
+            # collision check at all. A teacher reassigned onto a subject
+            # here could silently end up double-booked against a class
+            # they already teach at the same real time, with no warning
+            # to the admin at all.
             cur.execute("""
                 UPDATE timetable_slots ts
                 SET staff_user_id = tsa.staff_user_id
@@ -1895,16 +1905,24 @@ def sync_teacher_names_into_slots(school_id: int, request: Request, grade_name: 
                         (ts.learning_area_id IS NOT NULL AND ts.learning_area_id = tsa.learning_area_id)
                         OR
                         (ts.custom_subject_id IS NOT NULL AND ts.custom_subject_id = tsa.custom_subject_id)
-                      );
+                      )
+                RETURNING tsa.staff_user_id;
             """, (school_id, grade_name, education_level, stream))
-            synced_count = cur.rowcount
+            synced_teacher_ids = {r['staff_user_id'] for r in cur.fetchall() if r['staff_user_id']}
+            synced_count = len(synced_teacher_ids) if synced_teacher_ids else cur.rowcount
             conn.commit()
+
+            new_collisions = []
+            if synced_teacher_ids:
+                all_collisions = _find_timetable_collisions(cur, school_id, None)
+                new_collisions = [c for c in all_collisions if c[0]['staff_user_id'] in synced_teacher_ids]
 
     encoded_grade = urllib.parse.quote(grade_name)
     encoded_level = urllib.parse.quote(education_level)
     encoded_stream = urllib.parse.quote(stream)
     sync_result = "none" if synced_count == 0 else "ok"
-    return RedirectResponse(url=f"/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}&synced={sync_result}", status_code=303)
+    collision_flag = "&collisions=1" if new_collisions else ""
+    return RedirectResponse(url=f"/timetable/grade/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}&synced={sync_result}{collision_flag}", status_code=303)
 
 
 @router.get("/timetable/availability/{school_id}", response_class=HTMLResponse)
@@ -3425,7 +3443,7 @@ def delete_subject_constraint(
 # ============================================================
 
 @router.get("/timetable/grade/{school_id}", response_class=HTMLResponse)
-def timetable_grade_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str, test_issues: str = None, synced: str = None):
+def timetable_grade_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str, test_issues: str = None, synced: str = None, collisions: str = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -3641,6 +3659,7 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
         </header>
         {"<div class='text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4' style=\"background:#EAF2EC;border:1px solid #C9DFCE;color:#1D5C34;\">✅ Teacher names synced from current Assignments — day/period placement was left untouched.</div>" if synced == "ok" else ""}
         {"<div class='text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4' style=\"background:#F6EDD9;border:1px solid #E5D6AE;color:#7A5A0E;\">⚠️ Nothing to sync — no timetable has been generated for this class yet. Use Test &amp; Generate first.</div>" if synced == "none" else ""}
+        {f"<div class='text-sm px-4 py-3 rounded-xl mb-3 mx-6 mt-4' style=\"background:#FEE2E2;border:1px solid #FECACA;color:#991B1B;\">🚨 One or more teachers just synced onto this class are now double-booked against a class they already teach at the same time. <a href='/timetable/collision-check/{school_id}' style='text-decoration:underline;font-weight:bold;'>Check the full collision report →</a></div>" if collisions == "1" else ""}
         {test_issues_html}
         <div class="p-4 sm:p-8 max-w-6xl mx-auto overflow-x-auto">
             <table class="w-full border-collapse rounded-2xl overflow-hidden text-xs" style="min-width:700px;background:#FFFDF8;border:1px solid #E4DFD3;box-shadow:0 1px 3px rgba(43,38,32,0.06);">
@@ -3787,7 +3806,15 @@ def test_and_generate_whole_level(school_id: int, request: Request, education_le
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            collisions = _find_timetable_collisions(cur, school_id, education_level)
+            # Deliberately no education_level filter here, even though
+            # this run only generated ONE level — a teacher double-booked
+            # against a DIFFERENT level (one who teaches across levels,
+            # e.g. both Lower Primary and Junior School) would never be
+            # caught if this check only looked within the level just
+            # generated. Same reasoning already applied in
+            # test_and_generate_whole_school; this was the one place it
+            # had been missed.
+            collisions = _find_timetable_collisions(cur, school_id, None)
 
     import base64
     payload = base64.b64encode(json.dumps({
@@ -5256,30 +5283,39 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
     the cool slate-gray defaults most generated UI reaches for, since this
     is meant to read like a physical school document, not a SaaS export."""
     header_cells = "".join(
-        f"<th style='padding:12px 10px;font-size:17px;color:#2B2620;{'background:#EFEAE0;' if not p['is_teaching_period'] else ''}'>{esc(p['short_label'] or p['label'])}</th>"
+        f"<th style='padding:12px 10px;font-size:17px;color:#2B2620;border:2px solid #2B2620;{'background:#EFEAE0;' if not p['is_teaching_period'] else ''}'>{esc(p['short_label'] or p['label'])}</th>"
         for p in periods
     )
     time_cells = "".join(
-        f"<th style='font-weight:normal;font-size:13px;color:#8A7F6C;padding-bottom:8px;'>{esc(p['start_time'] or '')}-{esc(p['end_time'] or '')}</th>"
+        f"<th style='font-weight:normal;font-size:13px;color:#8A7F6C;padding-bottom:8px;border:2px solid #2B2620;'>{esc(p['start_time'] or '')}-{esc(p['end_time'] or '')}</th>"
         for p in periods
     )
 
+    # Borders are deliberately dark and fairly thick (not the light taupe
+    # used elsewhere in this palette) — this grid needs to stay fully
+    # legible on a black-and-white printer, where every subject's colored
+    # background disappears entirely and a thin light-colored line can
+    # wash out or vanish altogether. A strong, dark grid line is what
+    # keeps the actual structure (which day, which period) readable
+    # regardless of how it's printed.
+    CELL_BORDER = "2px solid #2B2620"
+
     body_rows = ""
     for day_i, day in enumerate(days):
-        row = f"<td style='padding:18px 16px;font-weight:bold;font-size:17px;white-space:nowrap;border:1px solid #E4DFD3;background:#EAF2EC;color:#1D5C34;'>{esc(day[:2].upper())}</td>"
+        row = f"<td style='padding:18px 16px;font-weight:bold;font-size:17px;white-space:nowrap;border:{CELL_BORDER};background:#EAF2EC;color:#1D5C34;'>{esc(day[:2].upper())}</td>"
         for p in periods:
             p_type = p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')
             if p_type == 'break':
                 if day_i == 0:
                     row += (
-                        f"<td rowspan='{len(days)}' style='border:1px solid #E4DFD3;text-align:center;background:#F2EEE4;'>"
+                        f"<td rowspan='{len(days)}' style='border:{CELL_BORDER};text-align:center;background:#F2EEE4;'>"
                         f"<div style='writing-mode:vertical-rl;transform:rotate(180deg);font-size:15px;font-weight:bold;"
                         f"color:#8A7F6C;white-space:nowrap;margin:0 auto;'>{esc(p['label'])}</div></td>"
                     )
                 continue  # subsequent days: cell already covered by row 1's rowspan
             if p_type == 'prep':
                 row += (
-                    "<td style='padding:18px 10px;text-align:center;border:1px solid #E4DFD3;background:#EBE1EA;'>"
+                    f"<td style='padding:18px 10px;text-align:center;border:{CELL_BORDER};background:#EBE1EA;'>"
                     "<span style='font-size:14px;font-weight:bold;color:#5B3560;'>PREP</span></td>"
                 )
                 continue
@@ -5292,13 +5328,13 @@ def _build_timetable_grid_html(days, periods, cell_lookup_fn):
             else:
                 content = result
             content = content or "<span style='color:#C9C0AE;'>-</span>"
-            row += f"<td style='padding:18px 10px;text-align:center;border:1px solid #E4DFD3;{cell_bg}'>{content}</td>"
+            row += f"<td style='padding:18px 10px;text-align:center;border:{CELL_BORDER};{cell_bg}'>{content}</td>"
         body_rows += f"<tr>{row}</tr>"
 
     return f"""
-    <table style="width:100%;height:100%;border-collapse:collapse;font-size:19px;margin-top:18px;table-layout:fixed;font-family:'Plus Jakarta Sans',sans-serif;">
+    <table style="width:100%;height:100%;border-collapse:collapse;border:3px solid #2B2620;font-size:19px;margin-top:18px;table-layout:fixed;font-family:'Plus Jakarta Sans',sans-serif;">
         <thead>
-            <tr style="background:#F2EEE4;"><th style="padding:10px;"></th>{header_cells}</tr>
+            <tr style="background:#F2EEE4;"><th style="padding:10px;border:{CELL_BORDER};"></th>{header_cells}</tr>
             <tr style="background:#F2EEE4;"><th></th>{time_cells}</tr>
         </thead>
         <tbody>{body_rows}</tbody>
@@ -5537,6 +5573,173 @@ def print_timetable(school_id: int, request: Request, grade_name: str, education
                 <span>{esc(school['name'] if school else '')} — Powered by Elimu Hub</span>
             </div>
         </div>
+    </body>
+    </html>
+    """
+
+
+@router.get("/timetable/print-all/{school_id}", response_class=HTMLResponse)
+def print_all_level_timetables(school_id: int, request: Request, education_level: str):
+    """One combined document: every class's timetable in this education
+    level, followed by every teacher connected to it — each timetable on
+    its own printed page (page-break-after between each one), so saving
+    this as a single PDF gives a school everything for a level in one
+    file instead of clicking through each class and teacher separately.
+    Reuses the exact same per-class and per-teacher grid-building logic
+    as the individual print routes, just looped and concatenated."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name, logo_url FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+
+            days = get_school_days(cur, school_id)
+            periods = get_periods_for_level(cur, school_id, education_level)
+
+            cur.execute("""
+                SELECT DISTINCT c.grade_name, s.stream
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND c.education_level = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                ORDER BY c.grade_name ASC, s.stream ASC;
+            """, (school_id, education_level))
+            sections = cur.fetchall()
+
+            # Every teacher connected to this level, either as a subject
+            # teacher (has a teaching assignment here) or as a class
+            # (homeroom) teacher — a class teacher with no subject
+            # assignment of their own would otherwise be missed entirely.
+            cur.execute("""
+                SELECT DISTINCT staff_user_id FROM teacher_subject_assignments
+                WHERE school_id = %s AND education_level = %s AND staff_user_id IS NOT NULL
+                UNION
+                SELECT DISTINCT teacher_user_id FROM class_teachers
+                WHERE school_id = %s AND education_level = %s AND teacher_user_id IS NOT NULL;
+            """, (school_id, education_level, school_id, education_level))
+            teacher_ids = [r['staff_user_id'] for r in cur.fetchall()]
+
+            cur.execute("SELECT id, full_name, email FROM users WHERE id = ANY(%s) ORDER BY full_name NULLS LAST, email ASC;", (teacher_ids,)) if teacher_ids else None
+            teachers = cur.fetchall() if teacher_ids else []
+
+            class_sections_html = []
+            for sec in sections:
+                grade_name, stream = sec['grade_name'], sec['stream']
+                cur.execute("""
+                    SELECT ts.day_of_week, ts.period_id,
+                           COALESCE(la.name, cs.name, ca.name) AS subject_name, u.full_name, u.email
+                    FROM timetable_slots ts
+                    LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                    LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+                    LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
+                    LEFT JOIN users u ON ts.staff_user_id = u.id
+                    WHERE ts.school_id = %s AND ts.grade_name = %s AND ts.education_level = %s AND ts.stream = %s;
+                """, (school_id, grade_name, education_level, stream))
+                slot_map = {(r['day_of_week'], r['period_id']): r for r in cur.fetchall()}
+
+                def _class_cell(day, p, slot_map=slot_map):
+                    slot = slot_map.get((day, p['id']))
+                    if not slot or not slot['subject_name']:
+                        return None
+                    teacher_short = (slot['full_name'] or slot['email'] or "").split(" ")[-1] if (slot['full_name'] or slot['email']) else ""
+                    teacher_line = f"<br><span style='font-size:13px;color:#64748b;'>{esc(teacher_short)}</span>" if teacher_short else ""
+                    bg_color, text_color = get_subject_color(slot['subject_name'])
+                    content = f"<b style='color:{text_color};font-size:20px;'>{esc(abbreviate_subject(slot['subject_name']))}</b>{teacher_line}"
+                    return (content, bg_color)
+
+                grid = _build_timetable_grid_html(days, periods, _class_cell) if periods else "<p style='padding:24px;text-align:center;color:#94a3b8;font-style:italic;'>No periods configured yet.</p>"
+                class_sections_html.append((f"Class Timetable — {esc(_section_label(grade_name, stream))} ({esc(education_level)})", grid))
+
+            teacher_sections_html = []
+            for teacher in teachers:
+                teacher_id = teacher['id']
+                cur.execute("""
+                    SELECT ts.day_of_week, ts.period_id, ts.grade_name, ts.stream, ts.education_level,
+                           COALESCE(la.name, cs.name, ca.name) AS subject_name
+                    FROM timetable_slots ts
+                    LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                    LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+                    LEFT JOIN co_curricular_activities ca ON ts.co_curricular_activity_id = ca.id
+                    WHERE ts.school_id = %s AND ts.staff_user_id = %s;
+                """, (school_id, teacher_id))
+                teacher_slots = cur.fetchall()
+
+                levels_taught = sorted({s['education_level'] for s in teacher_slots if s['education_level']}) or [education_level]
+                level_grids = []
+                for level in levels_taught:
+                    level_periods = get_periods_for_level(cur, school_id, level)
+                    t_slot_map = {(r['day_of_week'], r['period_id']): r for r in teacher_slots if r['education_level'] == level}
+
+                    def _teacher_cell(day, p, t_slot_map=t_slot_map):
+                        slot = t_slot_map.get((day, p['id']))
+                        if not slot or not slot['subject_name']:
+                            return None
+                        class_label = _section_label(slot['grade_name'], slot['stream'])
+                        bg_color, text_color = get_subject_color(slot['subject_name'])
+                        content = f"<b style='color:{text_color};font-size:20px;'>{esc(abbreviate_subject(slot['subject_name']))}</b><br><span style='font-size:13px;color:#64748b;'>{esc(class_label)}</span>"
+                        return (content, bg_color)
+
+                    grid = _build_timetable_grid_html(days, level_periods, _teacher_cell) if level_periods else ""
+                    level_grids.append(f"<h3 style='margin:16px 0 6px;font-size:13px;font-weight:bold;color:#1D5C34;'>{esc(level)}</h3>{grid}")
+
+                teacher_name = teacher['full_name'] or teacher['email']
+                teacher_sections_html.append((f"Teacher Timetable — {esc(teacher_name)}", "".join(level_grids)))
+
+    logo_html = ""
+    if school and school.get('logo_url'):
+        logo_src = school['logo_url']
+        final_src = logo_src if logo_src.startswith("http") else f"/{logo_src.lstrip('/')}"
+        logo_html = f"<img src='{final_src}' style='width:56px;height:56px;object-fit:contain;' />"
+
+    def _page(title, grid_html, is_last):
+        page_break = "" if is_last else "page-break-after: always;"
+        return f"""
+        <div class="print-page" style="{page_break}">
+            <div style="display:flex;align-items:center;gap:16px;border-bottom:3px solid #046A38;padding-bottom:14px;">
+                {logo_html}
+                <div>
+                    <h1 style="margin:0;font-family:'Zilla Slab',serif;font-weight:700;font-size:23px;color:#2B2620;">{esc(school['name'] if school else '')}</h1>
+                    <p style="margin:4px 0 0;font-size:14px;font-weight:600;color:#1D5C34;letter-spacing:0.2px;">{title}</p>
+                </div>
+            </div>
+            {grid_html}
+            <div style="display:flex;justify-content:space-between;margin-top:16px;font-size:9px;color:#A79C87;">
+                <span>Timetable generated: {esc(__import__('datetime').date.today().strftime('%-d/%-m/%Y'))}</span>
+                <span>{esc(school['name'] if school else '')} — Powered by Elimu Hub</span>
+            </div>
+        </div>
+        """
+
+    all_sections = class_sections_html + teacher_sections_html
+    pages_html = "".join(
+        _page(title, grid, is_last=(i == len(all_sections) - 1))
+        for i, (title, grid) in enumerate(all_sections)
+    ) if all_sections else "<p style='padding:40px;text-align:center;color:#94a3b8;'>No classes or teachers found for this level.</p>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Elimu Hub | Print All — {esc(education_level)}</title>
+        <link href="https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+        <style>
+            @page {{ size: A4 landscape; margin: 5mm; }}
+            body {{ font-family: 'Plus Jakarta Sans', sans-serif; padding: 20px; color: #2B2620; background: #F5F1E8; }}
+            @media print {{ .no-print {{ display: none !important; }} body {{ background: white; padding: 0; }} }}
+            th {{ background: #F2EEE4; border-bottom: 2px solid #E4DFD3; font-size: 10px; text-transform: uppercase; color: #8A7F6C; }}
+            .print-page {{ max-width: 287mm; margin: 0 auto 20px; background: #FFFDF8; padding: 14mm; border-radius: 10px; box-shadow: 0 1px 3px rgba(43,38,32,0.1); }}
+            @media print {{ .print-page {{ box-shadow: none; border-radius: 0; padding: 0; max-width: 100%; margin-bottom: 0; }} }}
+        </style>
+    </head>
+    <body>
+        <div class="no-print" style="text-align:right; margin-bottom:16px; max-width:267mm; margin-left:auto; margin-right:auto;">
+            <button onclick="window.print()" style="background:#046A38;color:white;border:none;padding:10px 18px;border-radius:8px;font-weight:bold;cursor:pointer;font-family:'Plus Jakarta Sans',sans-serif;">🖨 Print / Save as PDF — {len(all_sections)} timetable(s)</button>
+            <p style="font-size:10px;color:#8A7F6C;margin:6px 0 0;">Tip: in the print dialog, choose "Save as PDF" as the destination to download one file with every class and teacher timetable for {esc(education_level)}.</p>
+        </div>
+        {pages_html}
     </body>
     </html>
     """
