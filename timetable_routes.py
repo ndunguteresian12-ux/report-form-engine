@@ -1381,7 +1381,6 @@ def validate_timetable_setup(cur, school_id: int, grade_name: str, education_lev
         subjects = sort_subjects_for_display(cur.fetchall(), education_level)
         if not subjects:
             errors.append(f"No subjects exist for {education_level}. This shouldn't normally happen — contact support if you see this.")
-        return errors, warnings
 
     cur.execute("""
         SELECT learning_area_id, staff_user_id, lessons_per_week, requires_double, double_lessons_count FROM teacher_subject_assignments

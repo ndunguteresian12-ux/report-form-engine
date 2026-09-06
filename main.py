@@ -470,6 +470,16 @@ LOADING_STATES_SCRIPT = r"""
 
 
 BACK_BUTTON_SCRIPT_TEMPLATE = """
+<style>
+/* This button should never appear in a printed page or a saved PDF —
+   the timetable print views ("Print", "Print All") and report-card
+   prints are core, physical deliverables, and a floating UI button
+   rendered on top of a printed school timetable would look like a
+   genuine defect, not a feature. */
+@media print {
+    #elimu-global-back-btn { display: none !important; }
+}
+</style>
 <script>
 // A PWA in standalone display mode hides the browser's own back button
 // entirely — normal <a href> links still work, but there's otherwise no
@@ -487,6 +497,7 @@ BACK_BUTTON_SCRIPT_TEMPLATE = """
     const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
     if (!isStandalone || window.history.length <= 1) return;
     const backBtn = document.createElement('button');
+    backBtn.id = 'elimu-global-back-btn';
     backBtn.setAttribute('aria-label', 'Back');
     backBtn.style.cssText = 'position:fixed;top:12px;left:12px;z-index:9998;background:{color};color:white;border:none;width:40px;height:40px;border-radius:50%;font-size:20px;font-weight:bold;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.2);display:flex;align-items:center;justify-content:center;';
     backBtn.textContent = '\u2039';
