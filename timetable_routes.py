@@ -44,7 +44,7 @@ from shared import (
 
 router = APIRouter()
 
-EDUCATION_LEVELS = ["ECDE", "Lower Primary", "Upper Primary", "Junior School"]
+EDUCATION_LEVELS = ["ECDE", "Lower Primary", "Upper Primary", "Junior School", "Senior School"]
 
 
 def _parse_time_to_minutes_shared(time_str):
@@ -846,6 +846,7 @@ def timetable_workspace_hub(school_id: int, request: Request):
                 <a href="/timetable/plans/{school_id}" class="bg-indigo-700 hover:bg-indigo-800 text-white px-3.5 py-2 rounded-xl text-xs font-bold text-center transition shadow-sm">🗂 Timetable Plans</a>
                 <a href="/timetable/subjects-config/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🎨 Subjects</a>
                 <a href="/timetable/custom-subjects/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">➕ Custom Subjects</a>
+                <a href="/timetable/combinations/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🎓 Subject Combinations</a>
                 <a href="/timetable/periods/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">⏱ Periods &amp; Days</a>
                 <a href="/timetable/availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">🧑‍🏫 Teacher Availability</a>
                 <a href="/timetable/subject-availability/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-3.5 py-2 rounded-xl text-xs font-bold text-center transition">📚 Subject Time-Off</a>

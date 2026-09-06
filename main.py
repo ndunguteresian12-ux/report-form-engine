@@ -1021,6 +1021,10 @@ def bootstrap_database_schema():
                 # report cards, finance) works exactly like any other
                 # level immediately.
                 (10, 'PP1', 'ECDE'), (11, 'PP2', 'ECDE'),
+                # Senior School (Grade 10-12) is bootstrapped separately —
+                # see senior_school_routes.py's own bootstrap function.
+                # Kept out of this list deliberately, so main.py doesn't
+                # grow at all for this feature.
             ]
             for class_id, grade, level in classes_payload:
                 cur.execute("INSERT INTO classes (id, grade_name, education_level) VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING;", (class_id, grade, level))
@@ -1040,6 +1044,8 @@ def bootstrap_database_schema():
                 ('ECDE', 'Language Activities'), ('ECDE', 'Mathematics Activities'),
                 ('ECDE', 'Environmental Activities'), ('ECDE', 'Creative Arts Activities'),
                 ('ECDE', 'Religious Education'),
+                # Senior School's subject pool is bootstrapped separately
+                # — see senior_school_routes.py's own bootstrap function.
             ]
             for lvl, name in subjects_payload:
                 cur.execute("INSERT INTO learning_areas (education_level, name) VALUES (%s, %s) ON CONFLICT (education_level, name) DO NOTHING;", (lvl, name))
@@ -1144,6 +1150,11 @@ app.include_router(student_portal_router)
 from notifications_routes import router as notifications_router, bootstrap_notifications_schema
 bootstrap_notifications_schema()
 app.include_router(notifications_router)
+
+# --- Senior School / CBC Grade 10-12 (extracted to its own file — see senior_school_routes.py) ---
+from senior_school_routes import router as senior_school_router, bootstrap_senior_school_schema
+bootstrap_senior_school_schema()
+app.include_router(senior_school_router)
 
 # --- Core Business & CBE Analytics Helper Logic ---
 def log_audit_action(cur, request: Request, school_id: int, action: str, details: str = ""):
