@@ -625,6 +625,23 @@ function showUpdateBanner() {
     document.body.appendChild(banner);
     document.getElementById('elimu-update-btn').onclick = () => window.location.reload();
 }
+
+// See student_portal_routes.py's STUDENT_PWA_HEAD_SNIPPET for the full
+// rationale — standalone PWA mode hides the browser's own back button
+// entirely, so this floating one (using ordinary browser history) is
+// what lets someone step back to the previous page without closing and
+// reopening the app. Only appears in standalone mode, and only once
+// there's an actual previous page in this session to return to.
+(function() {
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+    if (!isStandalone || window.history.length <= 1) return;
+    const backBtn = document.createElement('button');
+    backBtn.setAttribute('aria-label', 'Back');
+    backBtn.style.cssText = 'position:fixed;top:12px;left:12px;z-index:9998;background:rgba(13,148,136,0.92);color:white;border:none;width:40px;height:40px;border-radius:50%;font-size:20px;font-weight:bold;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.2);display:flex;align-items:center;justify-content:center;';
+    backBtn.textContent = '‹';
+    backBtn.onclick = () => window.history.back();
+    document.addEventListener('DOMContentLoaded', () => document.body.appendChild(backBtn));
+})();
 </script>
 """
 
