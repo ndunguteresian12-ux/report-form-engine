@@ -742,6 +742,17 @@ def bootstrap_database_schema():
                 ALTER TABLE schools ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
                 ALTER TABLE schools ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMP;
 
+                -- 'comprehensive' (ECDE through Junior School, the
+                -- default — every existing school already works this
+                -- way) or 'senior_school' (Grade 10-12 only, a genuinely
+                -- separate physical institution under Kenya's CBC
+                -- structure). Used to decide which education levels a
+                -- school even sees — a comprehensive school never sees
+                -- Senior School or Subject Combinations at all, and a
+                -- standalone Senior School never sees ECDE/Primary/
+                -- Junior School options either.
+                ALTER TABLE schools ADD COLUMN IF NOT EXISTS school_type VARCHAR(20) NOT NULL DEFAULT 'comprehensive';
+
                 CREATE TABLE IF NOT EXISTS school_settings (
                     school_id INTEGER PRIMARY KEY REFERENCES schools(id) ON DELETE CASCADE,
                     active_year INTEGER DEFAULT 2026,
@@ -1119,7 +1130,7 @@ bootstrap_database_schema()
 bootstrap_super_admin()
 
 # --- Timetabling module (extracted to its own file — see timetable_routes.py) ---
-from timetable_routes import router as timetable_router, bootstrap_timetable_schema
+from timetable_routes import router as timetable_router, bootstrap_timetable_schema, get_education_levels_for_school
 bootstrap_timetable_schema()
 app.include_router(timetable_router)
 
@@ -1742,6 +1753,19 @@ def public_registration_portal():
                 <div class="bg-slate-50 p-4 rounded-xl border space-y-3">
                     <h3 class="font-black text-slate-700 uppercase tracking-wide">🏫 School Profile Information</h3>
                     <div>
+                        <label class="block font-bold text-slate-600">School Type</label>
+                        <div class="grid grid-cols-2 gap-2 mt-1">
+                            <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer hover:bg-slate-50 has-[:checked]:border-emerald-600 has-[:checked]:bg-emerald-50">
+                                <input type="radio" name="school_type" value="comprehensive" checked class="mt-0.5">
+                                <span><b class="block">Comprehensive School</b><span class="text-[10px] text-slate-400">ECDE through Junior School (Grade 9)</span></span>
+                            </label>
+                            <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer hover:bg-slate-50 has-[:checked]:border-emerald-600 has-[:checked]:bg-emerald-50">
+                                <input type="radio" name="school_type" value="senior_school" class="mt-0.5">
+                                <span><b class="block">Senior School</b><span class="text-[10px] text-slate-400">Grade 10-12 only, a standalone institution</span></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div>
                         <label class="block font-bold text-slate-600">Official School Name</label>
                         <input type="text" name="school_name" placeholder="e.g. Kilimani Academy" class="w-full p-2.5 border rounded-lg mt-1 bg-white" required>
                     </div>
@@ -1812,6 +1836,7 @@ async def register_new_tenant_pipeline(
     admin_email: str = Form(...),
     admin_password: str = Form(...),
     admin_phone_number: str = Form(...),
+    school_type: str = Form("comprehensive"),
     accept_terms: str = Form(None),
     logo_file: UploadFile = File(None)
 ):
@@ -1821,6 +1846,9 @@ async def register_new_tenant_pipeline(
     admin_full_name = admin_full_name.strip()
     admin_phone_number = admin_phone_number.strip()
     admin_email = admin_email.strip().lower()
+    school_type = school_type.strip().lower()
+    if school_type not in ("comprehensive", "senior_school"):
+        school_type = "comprehensive"
 
     if not school_name or not sub_county or not physical_address:
         raise HTTPException(status_code=400, detail="School name, sub-county, and address are all required.")
@@ -1890,9 +1918,9 @@ async def register_new_tenant_pipeline(
                 raise HTTPException(status_code=400, detail="Registration Refused: Email already allocated.")
             
             cur.execute("""
-                INSERT INTO schools (name, sub_county, physical_address, logo_url, wallet_balance, theme_color, status, terms_accepted_at, subscription_expires_at)
-                VALUES (%s, %s, %s, %s, 0.00, 'emerald', 'pending', NOW(), NOW() + (%s || ' days')::INTERVAL) RETURNING id;
-            """, (school_name, sub_county, physical_address, logo_resolved_url, free_trial_days))
+                INSERT INTO schools (name, sub_county, physical_address, logo_url, wallet_balance, theme_color, status, terms_accepted_at, subscription_expires_at, school_type)
+                VALUES (%s, %s, %s, %s, 0.00, 'emerald', 'pending', NOW(), NOW() + (%s || ' days')::INTERVAL, %s) RETURNING id;
+            """, (school_name, sub_county, physical_address, logo_resolved_url, free_trial_days, school_type))
             new_school_id = cur.fetchone()['id']
 
             cur.execute("""
@@ -4848,7 +4876,12 @@ def add_student_view(school_id: int, request: Request):
             # here no matter what existed in the database. Queried
             # dynamically now, same as every other class-picker in this
             # app, ordered by id so grades stay in their natural sequence.
-            cur.execute("SELECT id, grade_name, education_level FROM classes ORDER BY id ASC;")
+            # Filtered to only the levels this specific school actually
+            # offers — a comprehensive school never sees Grade 10-12 as
+            # an option, and a standalone Senior School never sees
+            # ECDE/Primary/Junior School.
+            allowed_levels = get_education_levels_for_school(cur, school_id)
+            cur.execute("SELECT id, grade_name, education_level FROM classes WHERE education_level = ANY(%s) ORDER BY id ASC;", (allowed_levels,))
             all_classes = cur.fetchall()
 
             # A class (homeroom) teacher can register students into their
@@ -6162,12 +6195,14 @@ def class_teachers_view(school_id: int, request: Request):
             cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'staff' AND is_verified = TRUE ORDER BY full_name NULLS LAST, email ASC;", (school_id,))
             staff_members = cur.fetchall()
 
+            allowed_levels = get_education_levels_for_school(cur, school_id)
             cur.execute("""
                 SELECT DISTINCT c.grade_name, c.education_level, COALESCE(s.stream, 'SINGLE STREAM') AS stream
                 FROM classes c
                 LEFT JOIN students s ON s.class_id = c.id AND s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                WHERE c.education_level = ANY(%s)
                 ORDER BY c.grade_name ASC, stream ASC;
-            """, (school_id,))
+            """, (school_id, allowed_levels))
             classes = cur.fetchall()
 
             cur.execute("SELECT grade_name, education_level, stream, teacher_user_id FROM class_teachers WHERE school_id = %s;", (school_id,))
@@ -6558,7 +6593,8 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
             if not student:
                 raise HTTPException(status_code=404, detail="Student not found.")
 
-            cur.execute("SELECT id, grade_name FROM classes ORDER BY id ASC;")
+            allowed_levels = get_education_levels_for_school(cur, school_id)
+            cur.execute("SELECT id, grade_name FROM classes WHERE education_level = ANY(%s) ORDER BY id ASC;", (allowed_levels,))
             classes = cur.fetchall()
 
             cur.execute("SELECT is_single_stream FROM school_settings WHERE school_id = %s;", (school_id,))

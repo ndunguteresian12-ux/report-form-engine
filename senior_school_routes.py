@@ -131,10 +131,12 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, name FROM schools WHERE id = %s;", (school_id,))
+            cur.execute("SELECT id, name, school_type FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
+            if school['school_type'] != 'senior_school':
+                raise HTTPException(status_code=403, detail="Subject Combinations are only available for Senior School institutions. Change this school's type in its registration profile if this is incorrect.")
 
             # Electives only — the auto-compulsory subjects and the
             # Mathematics variants are handled separately below, never
@@ -268,6 +270,11 @@ async def save_subject_combination(school_id: int, request: Request):
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT school_type FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school or school['school_type'] != 'senior_school':
+                raise HTTPException(status_code=403, detail="Subject Combinations are only available for Senior School institutions.")
+
             # Resolve the auto-compulsory subject names (fixed, same for
             # every combination) plus the chosen Mathematics variant into
             # their learning_area ids — these are never shown as
@@ -312,7 +319,12 @@ async def delete_subject_combination(school_id: int, request: Request):
     stream = form.get("stream", "").strip()
 
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT school_type FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school or school['school_type'] != 'senior_school':
+                raise HTTPException(status_code=403, detail="Subject Combinations are only available for Senior School institutions.")
+
             cur.execute("DELETE FROM combination_subjects WHERE school_id = %s AND grade_name = %s AND stream = %s;", (school_id, grade_name, stream))
             conn.commit()
 

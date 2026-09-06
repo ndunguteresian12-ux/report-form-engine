@@ -47,6 +47,23 @@ router = APIRouter()
 EDUCATION_LEVELS = ["ECDE", "Lower Primary", "Upper Primary", "Junior School", "Senior School"]
 
 
+def get_education_levels_for_school(cur, school_id: int) -> list:
+    """The set of education levels a specific school actually offers,
+    based on schools.school_type. A 'comprehensive' school (the default —
+    every school before this existed worked this way) never sees Senior
+    School or its Subject Combinations at all; a standalone 'senior_school'
+    never sees ECDE/Primary/Junior School options either. Every place that
+    used to loop over the flat EDUCATION_LEVELS constant now calls this
+    instead, so which levels appear is always correct for the specific
+    school being viewed, not a fixed global list."""
+    cur.execute("SELECT school_type FROM schools WHERE id = %s;", (school_id,))
+    row = cur.fetchone()
+    school_type = (row['school_type'] if row else None) or "comprehensive"
+    if school_type == "senior_school":
+        return ["Senior School"]
+    return ["ECDE", "Lower Primary", "Upper Primary", "Junior School"]
+
+
 def _parse_time_to_minutes_shared(time_str):
     """Module-level version of the time-parsing helper duplicated locally
     in a few places in this file (generate_draft_timetable,
@@ -887,6 +904,8 @@ def timetable_plans_view(request: Request, school_id: int, created: str = None):
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
+            education_levels = get_education_levels_for_school(cur, school_id)
+
             cur.execute("SELECT * FROM timetable_plans WHERE school_id = %s ORDER BY education_level ASC, is_active DESC, created_at ASC;", (school_id,))
             plans = cur.fetchall()
 
@@ -898,7 +917,7 @@ def timetable_plans_view(request: Request, school_id: int, created: str = None):
     default_days = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"}
 
     level_sections_html = ""
-    for level in EDUCATION_LEVELS:
+    for level in education_levels:
         level_plans = plans_by_level.get(level, [])
         plan_cards = ""
         for p in level_plans:
@@ -1248,10 +1267,12 @@ def subjects_config_view(school_id: int, request: Request, education_level: str 
             cur.execute("SELECT learning_area_id, short_code, color_hex FROM timetable_subject_config WHERE school_id = %s;", (school_id,))
             existing = {r['learning_area_id']: r for r in cur.fetchall()}
 
+            education_levels = get_education_levels_for_school(cur, school_id)
+
     level_tabs = "".join(
         f"""<a href="/timetable/subjects-config/{school_id}?education_level={urllib.parse.quote(lvl)}"
                class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-indigo-800 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
-        for lvl in EDUCATION_LEVELS
+        for lvl in education_levels
     )
 
     rows_html = ""
@@ -1441,6 +1462,8 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
 
             periods = get_periods_for_level(cur, school_id, education_level, resolved_plan_id)
 
+            education_levels = get_education_levels_for_school(cur, school_id)
+
     all_seven_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     day_checkboxes = "".join(
         f"<label class='flex items-center gap-1.5 text-xs font-semibold text-slate-600'><input type='checkbox' name='days' value='{d}' {'checked' if d in current_days else ''}> {d}</label>"
@@ -1450,7 +1473,7 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
     level_tabs = "".join(
         f"""<a href="/timetable/periods/{school_id}?education_level={urllib.parse.quote(lvl)}"
                class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-indigo-700 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
-        for lvl in EDUCATION_LEVELS
+        for lvl in education_levels
     )
 
     period_rows = ""
@@ -2050,7 +2073,7 @@ def teacher_workload_report(school_id: int, request: Request):
 
             days = get_school_days(cur, school_id)
             capacity_by_level = {}
-            for level in EDUCATION_LEVELS:
+            for level in get_education_levels_for_school(cur, school_id):
                 teaching_periods = [p for p in get_periods_for_level(cur, school_id, level) if p['is_teaching_period']]
                 capacity_by_level[level] = len(teaching_periods) * len(days)
 
@@ -2222,6 +2245,7 @@ def timetable_collision_check(school_id: int, request: Request, education_level:
                 raise HTTPException(status_code=404, detail="School not found.")
 
             collisions = _find_timetable_collisions(cur, school_id, education_level)
+            education_levels = get_education_levels_for_school(cur, school_id)
 
     # Sort collisions for a stable, readable report: by day, then period, then teacher.
     day_order = {d: i for i, d in enumerate(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"])}
@@ -2250,7 +2274,7 @@ def timetable_collision_check(school_id: int, request: Request, education_level:
     level_tabs = "".join(
         f"""<a href="/timetable/collision-check/{school_id}?education_level={urllib.parse.quote(lvl)}"
                class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-rose-700 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
-        for lvl in EDUCATION_LEVELS
+        for lvl in education_levels
     )
 
     return f"""
@@ -2309,10 +2333,12 @@ def custom_subjects_view(school_id: int, request: Request, education_level: str 
             )
             custom_subjects = cur.fetchall()
 
+            education_levels = get_education_levels_for_school(cur, school_id)
+
     level_tabs = "".join(
         f"""<a href="/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(lvl)}"
                class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-teal-700 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
-        for lvl in EDUCATION_LEVELS
+        for lvl in education_levels
     )
 
     rows_html = "".join(f"""
@@ -2698,12 +2724,14 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request,
             """, (school_id, teacher_id, resolved_plan_id))
             current = {(r['day_of_week'], r['period_id']): r['status'] for r in cur.fetchall()}
 
+            education_levels = get_education_levels_for_school(cur, school_id)
+
     status_options = [("available", "✅ Available"), ("conditional", "❔ Conditional"), ("not_available", "❌ Not Available")]
 
     level_tabs = "".join(
         f"""<a href="/timetable/availability/{school_id}/{teacher_id}?education_level={urllib.parse.quote(lvl)}"
                class="px-3 py-1.5 rounded-lg text-xs font-bold transition {'bg-indigo-700 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
-        for lvl in EDUCATION_LEVELS
+        for lvl in education_levels
     )
 
     header_cells = "".join(f"<th class='p-2 text-center text-xs'>{d}</th>" for d in days)
@@ -3036,7 +3064,7 @@ def subject_sync_rules_view(school_id: int, request: Request):
 
             periods_by_level = {
                 lvl: [p for p in get_periods_for_level(cur, school_id, lvl) if p['is_teaching_period']]
-                for lvl in EDUCATION_LEVELS
+                for lvl in get_education_levels_for_school(cur, school_id)
             }
 
             cur.execute("SELECT id, name, education_level FROM learning_areas ORDER BY education_level ASC, name ASC;")
@@ -3853,8 +3881,12 @@ def test_and_generate_whole_school(school_id: int, request: Request):
     if auth_error:
         return auth_error
 
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            education_levels = get_education_levels_for_school(cur, school_id)
+
     all_class_results = []
-    for education_level in EDUCATION_LEVELS:
+    for education_level in education_levels:
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
@@ -5437,10 +5469,12 @@ def timetable_subject_perspective(school_id: int, request: Request, education_le
                         f"{_section_label(row['grade_name'], row['stream'])}" + (f" ({row['teacher_name']})" if row['teacher_name'] else "")
                     ]
 
+            education_levels = get_education_levels_for_school(cur, school_id)
+
     level_tabs = "".join(
         f"""<a href="/timetable/view/subjects/{school_id}?education_level={urllib.parse.quote(lvl)}"
                class="px-4 py-2 rounded-xl text-xs font-bold transition {'bg-indigo-800 text-white' if lvl == education_level else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">{lvl}</a>"""
-        for lvl in EDUCATION_LEVELS
+        for lvl in education_levels
     )
     subject_options = "".join(
         f"<option value='{s['id']}' {'selected' if s['id'] == learning_area_id else ''}>{esc(s['name'])}</option>"
@@ -5905,16 +5939,17 @@ def timetable_master_view(school_id: int, request: Request):
             # Only true breaks are excluded here — prep and co-curricular
             # periods still show as real columns since they can carry actual
             # scheduled content worth seeing at a glance.
+            education_levels = get_education_levels_for_school(cur, school_id)
             periods_by_level = {
                 level: [p for p in get_periods_for_level(cur, school_id, level) if (p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')) != 'break']
-                for level in EDUCATION_LEVELS
+                for level in education_levels
             }
 
     if not sections:
         body_html = "<p class='text-slate-400 text-sm italic text-center py-16'>Nothing to show yet — add students to at least one class first.</p>"
     else:
         level_tables = []
-        for level in EDUCATION_LEVELS:
+        for level in education_levels:
             level_sections = [s for s in sections if s['education_level'] == level]
             periods = periods_by_level.get(level, [])
             if not level_sections:
@@ -6037,13 +6072,14 @@ def timetable_master_print(school_id: int, request: Request):
                 key = (row['grade_name'], row['education_level'], row['stream'], row['day_of_week'], row['period_id'])
                 slot_map[key] = row
 
+            education_levels = get_education_levels_for_school(cur, school_id)
             periods_by_level = {
                 level: [p for p in get_periods_for_level(cur, school_id, level) if (p.get('period_type') or ('teaching' if p['is_teaching_period'] else 'break')) != 'break']
-                for level in EDUCATION_LEVELS
+                for level in education_levels
             }
 
     level_tables = []
-    for level in EDUCATION_LEVELS:
+    for level in education_levels:
         level_sections = [s for s in sections if s['education_level'] == level]
         periods = periods_by_level.get(level, [])
         if not level_sections or not periods:
