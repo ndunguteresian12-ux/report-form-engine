@@ -150,14 +150,30 @@ def get_subject_color(name: str):
 
 
 def _widen_unique_constraint(cur, table_name, old_columns, new_columns):
-    """Finds whatever unique constraint currently covers exactly
-    old_columns on table_name — regardless of its auto-generated name,
-    which Postgres decides and isn't safe to guess — and replaces it with
-    one covering new_columns instead (adding plan_id). Wrapped by the
-    caller in a try/except: this touches constraints on live tables, and
-    a startup migration must never be able to crash the whole app if
-    something about a specific school's data doesn't match what this
-    expects.
+    """Finds whatever unique constraint OR plain unique index currently
+    covers exactly old_columns on table_name — regardless of its name,
+    which Postgres decides (or whoever created it chose) and isn't safe
+    to guess — and replaces it with one covering new_columns instead
+    (adding plan_id). Wrapped by the caller in a try/except: this touches
+    constraints on live tables, and a startup migration must never be
+    able to crash the whole app if something about a specific school's
+    data doesn't match what this expects.
+
+    Searches pg_index directly, NOT information_schema.table_constraints.
+    That view only ever lists constraints created via the formal
+    ALTER TABLE ... ADD CONSTRAINT path — a plain CREATE UNIQUE INDEX
+    (which is exactly how some of this app's older uniqueness rules were
+    originally set up, before this migration helper existed) never
+    appears there at all, even though it enforces uniqueness identically
+    and produces the exact same UniqueViolation error. This was a real,
+    confirmed bug in production: teacher_subject_assignments still had
+    its original 5-column ux_teacher_subject_assignments_slot index
+    silently surviving every previous run of this function, because the
+    old constraints-only search could never see it — so multi-plan
+    inserts kept failing with a duplicate-key error the fixed ON
+    CONFLICT clause should have prevented. pg_index sees both a formal
+    constraint's backing index AND a plain manually-created one, so this
+    version catches either kind the same way.
 
     kcu.column_name is Postgres's internal sql_identifier type, not plain
     text — comparing array_agg(...) directly against a Python list (which
@@ -167,26 +183,46 @@ def _widen_unique_constraint(cur, table_name, old_columns, new_columns):
     tested against a real Postgres instance rather than trusted by
     inspection."""
     cur.execute("""
-        SELECT tc.constraint_name
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_name = kcu.table_name
-        WHERE tc.table_name = %s AND tc.constraint_type = 'UNIQUE'
-        GROUP BY tc.constraint_name
-        HAVING array_agg(kcu.column_name::text ORDER BY kcu.column_name::text) = %s;
+        SELECT ic.relname
+        FROM pg_index i
+        JOIN pg_class ic ON i.indexrelid = ic.oid
+        JOIN pg_class tc ON i.indrelid = tc.oid
+        JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attnum = ANY(i.indkey)
+        WHERE tc.relname = %s AND i.indisunique = TRUE AND NOT i.indisprimary
+        GROUP BY ic.relname
+        HAVING array_agg(a.attname::text ORDER BY a.attname::text) = %s;
     """, (table_name, sorted(old_columns)))
     row = cur.fetchone()
     if row:
-        cur.execute(f'ALTER TABLE {table_name} DROP CONSTRAINT "{row[0]}";')
+        index_name = row[0]
+        # Does a formal constraint back this exact index? If so it must
+        # be dropped as a constraint — Postgres refuses a plain DROP
+        # INDEX on a constraint-backing index. If not, it's a plain
+        # index (exactly what ux_teacher_subject_assignments_slot turned
+        # out to be) and DROP INDEX is the correct, and only, way to
+        # remove it.
+        cur.execute("""
+            SELECT con.conname FROM pg_constraint con
+            JOIN pg_class ic ON con.conindid = ic.oid
+            WHERE ic.relname = %s;
+        """, (index_name,))
+        constraint_row = cur.fetchone()
+        if constraint_row:
+            cur.execute(f'ALTER TABLE {table_name} DROP CONSTRAINT "{constraint_row[0]}";')
+        else:
+            cur.execute(f'DROP INDEX "{index_name}";')
 
     # Only add the new constraint if nothing already covers exactly
     # new_columns — makes this safe to re-run on every future deploy.
     cur.execute("""
-        SELECT tc.constraint_name
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_name = kcu.table_name
-        WHERE tc.table_name = %s AND tc.constraint_type = 'UNIQUE'
-        GROUP BY tc.constraint_name
-        HAVING array_agg(kcu.column_name::text ORDER BY kcu.column_name::text) = %s;
+        SELECT ic.relname
+        FROM pg_index i
+        JOIN pg_class ic ON i.indexrelid = ic.oid
+        JOIN pg_class tc ON i.indrelid = tc.oid
+        JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attnum = ANY(i.indkey)
+        WHERE tc.relname = %s AND i.indisunique = TRUE AND NOT i.indisprimary
+        GROUP BY ic.relname
+        HAVING array_agg(a.attname::text ORDER BY a.attname::text) = %s;
     """, (table_name, sorted(new_columns)))
     if not cur.fetchone():
         cur.execute(f"ALTER TABLE {table_name} ADD CONSTRAINT {table_name}_{'_'.join(new_columns)}_key UNIQUE ({', '.join(new_columns)});")
