@@ -750,6 +750,40 @@ def record_failed_login(cur, identifier: str):
 def clear_failed_logins(cur, identifier: str):
     cur.execute("DELETE FROM login_attempts WHERE identifier = %s;", (identifier,))
 
+
+def _fix_foreign_key_on_delete(cur, table_name, column_name, referenced_table, on_delete_action):
+    """Finds the foreign key constraint on table_name.column_name by its
+    actual structure (via pg_constraint, not a guessed name) and
+    recreates it with the given ON DELETE behavior if it doesn't already
+    have it. Wrapped by the caller in a try/except, same reasoning as
+    _widen_unique_constraint in timetable_routes.py: a startup migration
+    must never be able to crash the whole app.
+
+    This exists because student_scores.entered_by_user_id was created
+    with no ON DELETE behavior at all — Postgres's default in that case
+    is to BLOCK the delete outright with a foreign key violation. Since
+    this column records which staff member entered a student's marks,
+    and any actual active teacher has almost certainly entered marks for
+    someone, deleting a real staff account was silently guaranteed to
+    crash with an unhandled 500 the moment it happened — confirmed the
+    hard way against a real database, not assumed. Fixed to SET NULL,
+    matching every other "who did this" reference elsewhere in this
+    app: the marks themselves (an actual academic record) are always
+    preserved; only the "entered by" attribution is lost once that
+    specific staff member is gone."""
+    cur.execute("""
+        SELECT con.conname, pg_get_constraintdef(con.oid) AS condef
+        FROM pg_constraint con
+        JOIN pg_class tc ON con.conrelid = tc.oid
+        JOIN pg_attribute a ON a.attrelid = tc.oid AND a.attnum = ANY(con.conkey)
+        WHERE tc.relname = %s AND con.contype = 'f' AND a.attname = %s;
+    """, (table_name, column_name))
+    row = cur.fetchone()
+    if row and f"ON DELETE {on_delete_action}" not in row[1].upper():
+        cur.execute(f'ALTER TABLE {table_name} DROP CONSTRAINT "{row[0]}";')
+        cur.execute(f'ALTER TABLE {table_name} ADD CONSTRAINT {table_name}_{column_name}_fkey FOREIGN KEY ({column_name}) REFERENCES {referenced_table}(id) ON DELETE {on_delete_action};')
+
+
 # 2. Bootstrap Function
 def bootstrap_database_schema():
     """Initializes tables and populates base data."""
@@ -826,6 +860,15 @@ def bootstrap_database_schema():
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(255);
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS tsc_number VARCHAR(100);
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number VARCHAR(50);
+                -- Presence tracking for the super admin "who's online now"
+                -- view. Sessions here are stateless (just a user-id cookie,
+                -- verified fresh against this table on every request) — this
+                -- column is what actually lets "currently active" mean
+                -- anything at all. Updated (throttled) inside
+                -- get_current_session_user in shared.py, the single
+                -- function every authenticated page already funnels
+                -- through, rather than a new middleware layer.
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP;
 
                 -- Which staff member is the CLASS teacher (homeroom) for a
                 -- given class+stream — distinct from subject-teaching
@@ -1124,6 +1167,23 @@ def bootstrap_database_schema():
             # overwriting the previous term's.
             cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_term_year_student ON student_scores (term, year, student_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_paper_scores_term_year_student ON paper_based_scores (term, year, student_id);")
+
+            # Fixes a real, confirmed bug: entered_by_user_id above was
+            # originally created with no ON DELETE behavior at all, which
+            # defaults to blocking the delete outright — meaning deleting
+            # any staff member who had ever entered a student's marks
+            # (i.e. almost any real, active teacher) crashed with an
+            # unhandled foreign key violation. See
+            # _fix_foreign_key_on_delete's own docstring for the full
+            # story; wrapped here the same way every other live-schema
+            # migration in this app is, so a problem on one specific
+            # school's data can never crash startup for every school.
+            try:
+                _fix_foreign_key_on_delete(cur, "student_scores", "entered_by_user_id", "users", "SET NULL")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"[student_scores entered_by_user_id migration] Could not fix ON DELETE behavior: {e}")
 
             conn.commit()
             logger.info("Database initialized successfully.")
@@ -2841,6 +2901,7 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
             <h1 class="text-base font-bold tracking-tight">🛡️ Super Admin Portal</h1>
             <div class="flex items-center gap-2">
                 <a href="/superadmin/schemes/list" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">📘 Schemes of Work</a>
+                <a href="/superadmin/active-users" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">🟢 Active Users</a>
                 <a href="/superadmin/billing/settings" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">💰 Billing Settings</a>
                 <a href="/superadmin/db-diagnostic" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl text-xs font-bold transition">🔍 DB Diagnostic</a>
                 <form action="/api/v1/superadmin/backup-now" method="post" onsubmit="return confirm('Trigger an on-demand database backup now? This runs in the background via GitHub Actions and does not affect any school\\'s live data.');">
@@ -2935,6 +2996,93 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
 
             {support_contact_html()}
             <p class="text-center text-[11px] text-slate-500 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-300">Elimu Hub</span></p>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.get("/superadmin/active-users", response_class=HTMLResponse)
+def superadmin_active_users(request: Request, window_minutes: int = 5):
+    """"Currently online" is necessarily an approximation, not an exact
+    fact — sessions here are stateless (just a cookie, verified fresh
+    against the database each time), so there's no real "connection" to
+    count. This defines it the same way most "who's online" features
+    do: anyone whose last_active_at falls within the chosen window is
+    shown as active. The window is adjustable (2/5/15/30 min) rather than
+    a single fixed definition, since what counts as "active" reasonably
+    differs by how the number will be used."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    window_minutes = window_minutes if window_minutes in (2, 5, 15, 30) else 5
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT u.id, u.full_name, u.email, u.role, u.last_active_at, sc.name AS school_name,
+                       EXTRACT(EPOCH FROM (NOW() - u.last_active_at))::INT AS seconds_ago
+                FROM users u
+                LEFT JOIN schools sc ON u.school_id = sc.id
+                WHERE u.last_active_at > NOW() - (%s || ' minutes')::INTERVAL
+                ORDER BY u.last_active_at DESC;
+            """, (window_minutes,))
+            active_users = cur.fetchall()
+
+    def _format_ago(seconds):
+        if seconds < 60:
+            return f"{seconds}s ago"
+        return f"{seconds // 60}m {seconds % 60}s ago"
+
+    rows_html = "".join(f"""
+        <tr class="border-b border-slate-100 text-sm">
+            <td class="p-3 font-semibold text-slate-800">{esc(u['full_name'] or u['email'])}</td>
+            <td class="p-3 text-xs text-slate-500">{esc(u['school_name'] or ('Platform' if u['role'] == 'superadmin' else '—'))}</td>
+            <td class="p-3 text-xs"><span class="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 font-bold uppercase text-[10px]">{esc(u['role'])}</span></td>
+            <td class="p-3 text-xs text-emerald-600 font-bold">{_format_ago(u['seconds_ago'])}</td>
+        </tr>
+        """ for u in active_users)
+
+    window_tabs = "".join(
+        f"""<a href="/superadmin/active-users?window_minutes={w}"
+               class="px-3 py-1.5 rounded-lg text-xs font-bold transition {'bg-emerald-700 text-white' if w == window_minutes else 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">Last {w} min</a>"""
+        for w in (2, 5, 15, 30)
+    )
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta http-equiv="refresh" content="10">
+        <title>Elimu Hub | Active Users</title>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    </head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <div class="flex justify-between items-start">
+                    <div>
+                        <h2 class="text-lg font-black text-slate-800">🟢 Active Users</h2>
+                        <p class="text-xs text-slate-400">Refreshes automatically every 10 seconds.</p>
+                    </div>
+                    <a href="/superadmin/dashboard" class="text-xs text-slate-400 hover:text-slate-600 hover:underline">← Back</a>
+                </div>
+                <div class="flex gap-2 mt-3">{window_tabs}</div>
+            </div>
+
+            <div class="bg-emerald-700 text-white p-6 rounded-2xl text-center">
+                <p class="text-4xl font-black">{len(active_users)}</p>
+                <p class="text-xs font-bold uppercase tracking-wide opacity-80">Active in the last {window_minutes} minute(s)</p>
+            </div>
+
+            <div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+                <table class="w-full text-left border-collapse">
+                    <thead><tr class="border-b-2 text-[11px] uppercase text-slate-400"><th class="p-3">Name</th><th class="p-3">School</th><th class="p-3">Role</th><th class="p-3">Last Seen</th></tr></thead>
+                    <tbody>{rows_html or "<tr><td colspan='4' class='p-6 text-center text-slate-400 italic text-xs'>No one active in this window right now.</td></tr>"}</tbody>
+                </table>
+            </div>
         </div>
     </body>
     </html>
@@ -6826,11 +6974,24 @@ def add_staff_node(
             cur.execute("SELECT id FROM users WHERE email = %s;", (email,))
             if cur.fetchone():
                 raise HTTPException(status_code=400, detail="That email is already registered to an account.")
-            cur.execute("""
-                INSERT INTO users (email, password_hash, role, school_id, is_verified, full_name, tsc_number, phone_number)
-                VALUES (%s, %s, 'staff', %s, FALSE, %s, %s, %s);
-            """, (email, hashed_password, school_id, full_name, tsc_number, phone_number))
-            conn.commit()
+            # The check above is a courtesy for the common case (shows a
+            # clean message immediately) — it can't fully close the race
+            # window between two near-simultaneous submissions with the
+            # same email, since neither has committed yet when both
+            # checks run. The unique constraint on users.email is the
+            # real guarantee; this catches that specific failure and
+            # turns it into the same clean message instead of an
+            # unhandled 500, rather than assuming the check above alone
+            # is sufficient.
+            try:
+                cur.execute("""
+                    INSERT INTO users (email, password_hash, role, school_id, is_verified, full_name, tsc_number, phone_number)
+                    VALUES (%s, %s, 'staff', %s, FALSE, %s, %s, %s);
+                """, (email, hashed_password, school_id, full_name, tsc_number, phone_number))
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                raise HTTPException(status_code=400, detail="That email is already registered to an account.")
             log_audit_action(cur, request, school_id, "staff_added", f"Registered staff account for {full_name} ({email})")
             conn.commit()
     return RedirectResponse(url=f"/admin/dashboard/{school_id}?staff_added=1", status_code=303)
