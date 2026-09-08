@@ -2692,6 +2692,7 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-school-settings' onsubmit=\"return confirm('Add marks_entry_deadline column to school_settings on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add marks_entry_deadline to school_settings now</button></form>" if table == "school_settings" and not any(c['column_name'] == 'marks_entry_deadline' for c in columns) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-students-portal' onsubmit=\"return confirm('Add mother_phone, father_phone, portal_password_hash columns to students on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add student portal columns now</button></form>" if table == "students" and not any(c['column_name'] == 'mother_phone' for c in columns) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-schools-type' onsubmit=\"return confirm('Add school_type column to schools on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add school_type to schools now</button></form>" if table == "schools" and not any(c['column_name'] == 'school_type' for c in columns) else ""}
+                {"<form method='post' action='/superadmin/db-diagnostic/fix-users-last-active' onsubmit=\"return confirm('Add last_active_at column to users on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add last_active_at to users now</button></form>" if table == "users" and not any(c['column_name'] == 'last_active_at' for c in columns) else ""}
                 <form method="get" action="/superadmin/db-diagnostic" class="flex gap-2">
                     <input type="text" name="table" value="{esc(table)}" class="flex-1 border border-slate-200 p-2 rounded-lg text-xs">
                     <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold px-4 py-2 rounded-lg">Check Table</button>
@@ -2794,6 +2795,22 @@ def fix_schools_school_type_column(request: Request):
             conn.commit()
 
     return RedirectResponse(url="/superadmin/db-diagnostic?table=schools", status_code=303)
+
+
+@app.post("/superadmin/db-diagnostic/fix-users-last-active")
+def fix_users_last_active_column(request: Request):
+    """Same self-service pattern — adds users.last_active_at directly
+    through the live app's own connection. Safe to run repeatedly."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP;")
+            conn.commit()
+
+    return RedirectResponse(url="/superadmin/db-diagnostic?table=users", status_code=303)
 
 
 @app.get("/superadmin/dashboard", response_class=HTMLResponse)
