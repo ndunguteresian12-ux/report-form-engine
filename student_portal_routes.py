@@ -369,6 +369,28 @@ def student_dashboard(request: Request):
             """, (student['id'], active_term, active_year))
             progress_rows = cur.fetchall()
 
+            # --- Notifications: this learner's own in-app messages ---
+            cur.execute("""
+                SELECT id, title, message, is_read, created_at FROM learner_notifications
+                WHERE student_id = %s ORDER BY created_at DESC LIMIT 20;
+            """, (student['id'],))
+            notifications = cur.fetchall()
+            unread_count = sum(1 for n in notifications if not n['is_read'])
+
+            # Marked as read AFTER computing unread_count above, so this
+            # exact page load still shows the "X new" badge for what the
+            # learner is about to see — only their NEXT visit shows 0.
+            if unread_count:
+                cur.execute("UPDATE learner_notifications SET is_read = TRUE WHERE student_id = %s AND is_read = FALSE;", (student['id'],))
+                conn.commit()
+
+            # --- Newsletter: the school's own published posts, same for every learner here ---
+            cur.execute("""
+                SELECT title, body, created_at FROM school_newsletters
+                WHERE school_id = %s ORDER BY created_at DESC LIMIT 10;
+            """, (school_id,))
+            newsletters = cur.fetchall()
+
     CYCLE_ORDER = ['Opener', 'Midterm', 'End Term']
     progress_by_cycle = {r['cycle_name']: float(r['avg_score']) for r in progress_rows}
     progress_data = [progress_by_cycle.get(c) for c in CYCLE_ORDER]
@@ -392,6 +414,27 @@ def student_dashboard(request: Request):
         f"<tr class='border-b border-slate-100'><td class='p-2.5 text-xs text-slate-500'>{p['paid_at'].strftime('%d %b %Y')}</td><td class='p-2.5 text-xs text-slate-600'>{esc(p['category_name'] or 'General')}</td><td class='p-2.5 text-xs font-bold text-right text-emerald-700'>KES {float(p['amount']):,.0f}</td></tr>"
         for p in payment_history
     ) or "<tr><td colspan='3' class='p-4 text-center text-slate-400 italic text-xs'>No payments recorded yet this term.</td></tr>"
+
+    notifications_html = "".join(
+        f"""<div class="p-3 rounded-xl mb-2 {'bg-emerald-50 border border-emerald-200' if not n['is_read'] else 'bg-slate-50 border border-slate-200'}">
+            <div class="flex justify-between items-start gap-2">
+                <p class="text-sm font-bold text-slate-800">{esc(n['title'])}</p>
+                {"<span class='w-2 h-2 rounded-full bg-emerald-600 shrink-0 mt-1.5'></span>" if not n['is_read'] else ""}
+            </div>
+            <p class="text-xs text-slate-600 mt-1">{esc(n['message'])}</p>
+            <p class="text-[10px] text-slate-400 mt-1.5">{n['created_at'].strftime('%d %b %Y, %I:%M %p')}</p>
+        </div>"""
+        for n in notifications
+    ) or "<p class='text-slate-400 italic text-xs text-center py-4'>No notifications yet.</p>"
+
+    newsletters_html = "".join(
+        f"""<div class="p-4 rounded-xl mb-3 bg-white border border-slate-200">
+            <p class="text-sm font-bold text-slate-800">{esc(nl['title'])}</p>
+            <p class="text-xs text-slate-600 mt-1.5 whitespace-pre-wrap">{esc(nl['body'])}</p>
+            <p class="text-[10px] text-slate-400 mt-2">{nl['created_at'].strftime('%d %b %Y')}</p>
+        </div>"""
+        for nl in newsletters
+    ) or "<p class='text-slate-400 italic text-xs text-center py-4'>No newsletter posts yet.</p>"
 
     progress_chart_html = ""
     progress_chart_script = ""
@@ -430,7 +473,10 @@ def student_dashboard(request: Request):
                 <p class="text-white font-black text-base">🎒 {esc(full_student_name(student))}</p>
                 <p class="text-emerald-200 text-xs">{esc(school['name'] if school else '')} — {esc(grade_name or '')} · Adm. No. {esc(student['admission_number'])}</p>
             </div>
-            <a href="/student/logout" class="bg-white/10 hover:bg-white/20 text-white text-xs font-bold px-3 py-2 rounded-xl transition">Log Out</a>
+            <div class="flex items-center gap-2">
+                {f"<span class='bg-white text-emerald-800 text-[10px] font-black w-5 h-5 rounded-full flex items-center justify-center'>{unread_count}</span>" if unread_count else ""}
+                <a href="/student/logout" class="bg-white/10 hover:bg-white/20 text-white text-xs font-bold px-3 py-2 rounded-xl transition">Log Out</a>
+            </div>
         </header>
 
         <div class="p-4 sm:p-6 max-w-3xl mx-auto space-y-4">
@@ -444,6 +490,16 @@ def student_dashboard(request: Request):
                     <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">School Opens / Closes</p>
                     <p class="text-sm font-bold text-slate-800">{esc(str(settings.get('opening_date')) if settings.get('opening_date') else '—')} → {esc(str(settings.get('closing_date')) if settings.get('closing_date') else '—')}</p>
                 </div>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">🔔 Notifications{f" ({unread_count} new)" if unread_count else ""}</h2>
+                {notifications_html}
+            </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">📰 School Newsletter</h2>
+                {newsletters_html}
             </div>
 
             <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-4">

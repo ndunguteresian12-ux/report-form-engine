@@ -40,12 +40,13 @@ from shared import (
 
 router = APIRouter()
 
-# Temporarily disabled while switching SMS providers to Celcom Africa —
-# all the working code below (Progress Reports, Custom Notification) is
-# left completely intact, just gated behind this single flag. Flip back
-# to True once the new provider is actually configured; nothing else
-# needs to change.
-NOTIFICATIONS_FEATURE_ENABLED = False
+# Temporarily disabled while switching SMS providers to Celcom Africa.
+# Unlike before, this now ONLY gates the SMS-sending step specifically —
+# in-app learner notifications and the pages themselves are fully live
+# regardless, since delivering a message inside the Learner Portal has
+# nothing to do with which SMS provider is configured. Flip back to True
+# once the new provider is actually set up to resume SMS sending too.
+SMS_SENDING_ENABLED = False
 
 
 def _coming_soon_page(title: str) -> HTMLResponse:
@@ -86,6 +87,40 @@ def bootstrap_notifications_schema():
                     sent_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
+
+                -- One row per RECIPIENT, unlike notification_log above
+                -- (one row per bulk SEND, aggregate counts only, no
+                -- per-student breakdown or full message text) — this is
+                -- what actually lets a learner see their own real
+                -- messages in their portal. Deliberately independent of
+                -- SMS delivery: this gets written regardless of whether
+                -- SMS is currently enabled, since in-app delivery has
+                -- nothing to do with which SMS provider is configured.
+                CREATE TABLE IF NOT EXISTS learner_notifications (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+                    title VARCHAR(200) NOT NULL,
+                    message TEXT NOT NULL,
+                    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_learner_notifications_student ON learner_notifications (student_id, created_at DESC);
+
+                -- School-published newsletter posts, visible to every
+                -- learner at the school — a different shape than
+                -- notifications (longer-form, not per-recipient, no
+                -- read/unread tracking needed since it's a shared feed
+                -- everyone sees the same version of).
+                CREATE TABLE IF NOT EXISTS school_newsletters (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    title VARCHAR(200) NOT NULL,
+                    body TEXT NOT NULL,
+                    posted_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_school_newsletters_school ON school_newsletters (school_id, created_at DESC);
             """)
             conn.commit()
 
@@ -147,8 +182,6 @@ def progress_reports_preview(school_id: int, request: Request, grade_name: str, 
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
-    if not NOTIFICATIONS_FEATURE_ENABLED:
-        return _coming_soon_page("Send Progress Reports")
 
     viewer = get_current_session_user(request)
     if viewer and viewer.get('role') == 'staff':
@@ -238,8 +271,6 @@ async def progress_reports_send(school_id: int, request: Request, background_tas
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
-    if not NOTIFICATIONS_FEATURE_ENABLED:
-        raise HTTPException(status_code=503, detail="Sending progress reports is temporarily unavailable while we switch SMS providers. Coming back soon!")
 
     form = await request.form()
     grade_name = form.get("grade_name", "")
@@ -280,6 +311,19 @@ async def progress_reports_send(school_id: int, request: Request, background_tas
             recipients = []
             for s in students:
                 student_name = full_student_name(s)
+                # In-app: always written, regardless of SMS status — a
+                # learner sees this the moment they next open their
+                # portal, independent of any SMS provider at all. Richer
+                # than the SMS version since there's no per-segment cost
+                # or length constraint here.
+                cur.execute("""
+                    INSERT INTO learner_notifications (school_id, student_id, title, message)
+                    VALUES (%s, %s, %s, %s);
+                """, (
+                    school_id, s['id'],
+                    f"{active_cycle} Results Ready",
+                    f"Your {active_cycle} results for {active_term} {active_year} are in — average {float(s['avg_score']):.0f}% across {s['subject_count']} subject(s). Check your Performance section for the full breakdown."
+                ))
                 for phone in _parent_phones_for_student(s):
                     recipients.append((phone, {
                         'school_name': school['name'] if school else 'Elimu Hub',
@@ -295,7 +339,8 @@ async def progress_reports_send(school_id: int, request: Request, background_tas
             log_id = cur.fetchone()['id']
             conn.commit()
 
-    background_tasks.add_task(_send_bulk_sms_task, recipients, _build_progress_report_message, log_id)
+    if SMS_SENDING_ENABLED:
+        background_tasks.add_task(_send_bulk_sms_task, recipients, _build_progress_report_message, log_id)
 
     encoded_grade, encoded_level, encoded_stream = urllib.parse.quote(grade_name), urllib.parse.quote(education_level), urllib.parse.quote(stream)
     return RedirectResponse(url=f"/admin/notifications/progress-reports/{school_id}?grade_name={encoded_grade}&education_level={encoded_level}&stream={encoded_stream}&sending=1", status_code=303)
@@ -311,8 +356,6 @@ def custom_notification_form(school_id: int, request: Request, sent: str = None)
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
-    if not NOTIFICATIONS_FEATURE_ENABLED:
-        return _coming_soon_page("Send Notification")
 
     viewer = get_current_session_user(request)
     is_admin = not (viewer and viewer.get('role') == 'staff')
@@ -380,8 +423,6 @@ async def custom_notification_send(school_id: int, request: Request, background_
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
-    if not NOTIFICATIONS_FEATURE_ENABLED:
-        raise HTTPException(status_code=503, detail="Sending notifications is temporarily unavailable while we switch SMS providers. Coming back soon!")
 
     form = await request.form()
     audience = (form.get("audience") or "").strip()
@@ -400,7 +441,7 @@ async def custom_notification_send(school_id: int, request: Request, background_
             if audience == "WHOLE_SCHOOL":
                 grade_name, education_level, stream = None, None, None
                 cur.execute("""
-                    SELECT s.mother_phone, s.father_phone FROM students s
+                    SELECT s.id, s.mother_phone, s.father_phone FROM students s
                     WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
                 """, (school_id,))
             else:
@@ -410,12 +451,23 @@ async def custom_notification_send(school_id: int, request: Request, background_
                     if not teacher_can_access_class(class_keys, grade_name, education_level, stream):
                         raise HTTPException(status_code=403, detail="You're not connected to this class.")
                 cur.execute("""
-                    SELECT s.mother_phone, s.father_phone FROM students s
+                    SELECT s.id, s.mother_phone, s.father_phone FROM students s
                     JOIN classes c ON s.class_id = c.id
                     WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
                       AND (%s = 'SINGLE STREAM' OR s.stream = %s) AND (s.status IS NULL OR s.status != 'GRADUATED');
                 """, (school_id, grade_name, education_level, stream, stream))
-            student_phone_rows = cur.fetchall()
+            student_rows = cur.fetchall()
+
+            # In-app: one row per STUDENT, not deduplicated by phone —
+            # unlike the SMS side below, each learner should see this in
+            # their own portal regardless of whether they share a parent
+            # phone with a sibling. Always written regardless of SMS
+            # status.
+            for s in student_rows:
+                cur.execute("""
+                    INSERT INTO learner_notifications (school_id, student_id, title, message)
+                    VALUES (%s, %s, %s, %s);
+                """, (school_id, s['id'], "School Notification", message))
 
             # Deduplicated across every student — unlike progress reports
             # (a personalized message per learner, where a shared phone
@@ -423,7 +475,7 @@ async def custom_notification_send(school_id: int, request: Request, background_
             # same message for everyone, so a parent with two children in
             # the audience should only be charged for it once.
             unique_phones = set()
-            for r in student_phone_rows:
+            for r in student_rows:
                 unique_phones.update(p for p in (r['mother_phone'], r['father_phone']) if p)
             recipients = [(phone, {}) for phone in unique_phones]
 
@@ -434,6 +486,123 @@ async def custom_notification_send(school_id: int, request: Request, background_
             log_id = cur.fetchone()['id']
             conn.commit()
 
-    background_tasks.add_task(_send_bulk_sms_task, recipients, message, log_id)
+    if SMS_SENDING_ENABLED:
+        background_tasks.add_task(_send_bulk_sms_task, recipients, message, log_id)
 
     return RedirectResponse(url=f"/admin/notifications/custom/{school_id}?sent=1", status_code=303)
+
+
+# ============================================================
+# School Newsletter — longer-form posts every learner at the
+# school sees in their portal. Admin-only to publish; every
+# student sees the same shared feed, unlike notifications
+# (per-recipient, with read/unread state).
+# ============================================================
+
+@router.get("/admin/newsletter/{school_id}", response_class=HTMLResponse)
+def newsletter_management(school_id: int, request: Request, posted: str = None):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+
+            cur.execute("""
+                SELECT n.id, n.title, n.body, n.created_at, u.full_name AS posted_by_name
+                FROM school_newsletters n LEFT JOIN users u ON n.posted_by_user_id = u.id
+                WHERE n.school_id = %s ORDER BY n.created_at DESC LIMIT 20;
+            """, (school_id,))
+            posts = cur.fetchall()
+
+    posts_html = "".join(f"""
+        <div class="bg-white p-4 rounded-2xl border shadow-xs mb-3">
+            <div class="flex justify-between items-start">
+                <h3 class="text-sm font-black text-slate-800">{esc(p['title'])}</h3>
+                <form action="/api/v1/newsletter/delete/{school_id}/{p['id']}" method="post" onsubmit="return confirm('Delete this newsletter post? It will disappear from every learner\\'s portal immediately.');">
+                    <button type="submit" class="text-[11px] font-bold text-rose-600 hover:underline">Delete</button>
+                </form>
+            </div>
+            <p class="text-xs text-slate-600 mt-1.5 whitespace-pre-wrap">{esc(p['body'])}</p>
+            <p class="text-[10px] text-slate-400 mt-2">{p['created_at'].strftime('%d %b %Y, %I:%M %p')}{f" — posted by {esc(p['posted_by_name'])}" if p['posted_by_name'] else ""}</p>
+        </div>
+        """ for p in posts)
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | School Newsletter</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">📰 School Newsletter</h2>
+                <p class="text-xs text-slate-400">{esc(school['name'] if school else '')} — every learner sees these posts in their Learner Portal.</p>
+            </div>
+
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2.5 rounded-xl'>✅ Posted — every learner will see this the next time they open their portal.</div>" if posted else ""}
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-sm font-black text-slate-800 mb-3">+ New Post</h3>
+                <form action="/api/v1/newsletter/{school_id}" method="post" class="space-y-3">
+                    <div>
+                        <label class="text-xs font-bold text-slate-600">Title</label>
+                        <input type="text" name="title" placeholder="e.g. Term 2 Sports Day" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-600">Body</label>
+                        <textarea name="body" rows="5" placeholder="Write the full post here — no length limit, unlike SMS." class="w-full border p-2.5 rounded-lg mt-1 text-sm" required></textarea>
+                    </div>
+                    <button type="submit" class="w-full bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 rounded-lg text-sm transition">Publish</button>
+                </form>
+            </div>
+
+            <div>
+                <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Published Posts</h3>
+                {posts_html or "<p class='text-xs text-slate-400 italic px-1'>Nothing published yet.</p>"}
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@router.post("/api/v1/newsletter/{school_id}")
+async def newsletter_publish(school_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form = await request.form()
+    title = (form.get("title") or "").strip()
+    body = (form.get("body") or "").strip()
+    if not title or not body:
+        raise HTTPException(status_code=400, detail="Title and body are both required.")
+
+    viewer = get_current_session_user(request)
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO school_newsletters (school_id, title, body, posted_by_user_id)
+                VALUES (%s, %s, %s, %s);
+            """, (school_id, title, body, viewer['id'] if viewer else None))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/newsletter/{school_id}?posted=1", status_code=303)
+
+
+@router.post("/api/v1/newsletter/delete/{school_id}/{post_id}")
+def newsletter_delete(school_id: int, post_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM school_newsletters WHERE id = %s AND school_id = %s;", (post_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/newsletter/{school_id}", status_code=303)
+

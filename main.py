@@ -2494,6 +2494,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <span class="bg-gradient-to-r from-violet-500 to-violet-600 text-white px-3 py-2 rounded-xl shadow-xs">{st['active_term']} • {st['active_cycle']}</span>
                 <a href="/admin/school-settings/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">⚙️ School Settings</a>
                 <a href="/admin/notifications/custom/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📢 Send Notification</a>
+                <a href="/admin/newsletter/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📰 Newsletter</a>
                 <a href="/timetable/dashboard/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📅 Timetable</a>
                 <a href="/admin/reports/marks-supervision/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🔍 Marks Supervision</a>
                 <a href="/admin/audit-log/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📋 Activity Log</a>
