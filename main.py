@@ -2398,6 +2398,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <p class="text-[10px] text-slate-500 mt-0.5">TSC No: <span class="font-semibold text-slate-600">{esc(tsc_display)}</span> • {esc(phone_display)}</p>
                 <p class="text-[10px] text-slate-400 truncate">{esc(m['email'])}</p>
                 <div class="flex items-center gap-3 shrink-0 text-[10px] font-bold mt-1.5">
+                    <a href="/admin/staff/edit/{school_id}/{m['id']}" class="text-indigo-700 hover:text-indigo-900">Edit</a>
                     <form action="/api/v1/staff/toggle-status/{m['id']}/{school_id}" method="post">
                         <button type="submit" class="{toggle_classes}">{toggle_label}</button>
                     </form>
@@ -6996,6 +6997,111 @@ def add_staff_node(
             log_audit_action(cur, request, school_id, "staff_added", f"Registered staff account for {full_name} ({email})")
             conn.commit()
     return RedirectResponse(url=f"/admin/dashboard/{school_id}?staff_added=1", status_code=303)
+
+
+@app.get("/admin/staff/edit/{school_id}/{staff_id}", response_class=HTMLResponse)
+def edit_staff_form(school_id: int, staff_id: int, request: Request, error: str = None):
+    """Was a real, missing gap before this — admins could only add or
+    delete a staff account, never fix a typo'd name or update a phone
+    number without deleting and re-adding the whole account."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, email, full_name, tsc_number, phone_number FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (staff_id, school_id))
+            staff = cur.fetchone()
+            if not staff:
+                raise HTTPException(status_code=404, detail="Staff member not found.")
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Edit Staff</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
+        <div class="bg-white p-8 rounded-2xl border shadow-xs w-full max-w-md">
+            <h2 class="text-lg font-black text-slate-800">Edit Staff</h2>
+            <p class="text-xs text-slate-400 mb-4">{esc(staff['full_name'] or staff['email'])}</p>
+            {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-3 py-2.5 rounded-lg mb-4'>{esc(error)}</div>" if error else ""}
+            <form action="/api/v1/staff/edit/{school_id}/{staff_id}" method="post" class="space-y-3">
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Full Name</label>
+                    <input type="text" name="full_name" value="{esc(staff['full_name'] or '')}" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">TSC Number</label>
+                    <input type="text" name="tsc_number" value="{esc(staff['tsc_number'] or '')}" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Phone Number</label>
+                    <input type="tel" name="phone_number" value="{esc(staff['phone_number'] or '')}" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Email (login)</label>
+                    <input type="email" name="email" value="{esc(staff['email'])}" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">New Password</label>
+                    <input type="text" name="password" placeholder="Leave blank to keep the current password" class="w-full border p-2.5 rounded-lg mt-1 text-sm">
+                    <p class="text-[10px] text-slate-400 mt-1">Shown in plain text here since you're setting it, not them — only fill this in if you actually want to change it.</p>
+                </div>
+                <div class="flex gap-3 pt-2">
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 px-5 rounded-lg text-sm transition">Save Changes</button>
+                    <a href="/admin/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-lg text-sm transition">Cancel</a>
+                </div>
+            </form>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/api/v1/staff/edit/{school_id}/{staff_id}")
+async def edit_staff_save(school_id: int, staff_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form = await request.form()
+    full_name = (form.get("full_name") or "").strip()
+    tsc_number = (form.get("tsc_number") or "").strip()
+    phone_number = (form.get("phone_number") or "").strip()
+    email = (form.get("email") or "").strip().lower()
+    new_password = (form.get("password") or "").strip()
+
+    if not full_name or not tsc_number or not phone_number or not email:
+        return RedirectResponse(url=f"/admin/staff/edit/{school_id}/{staff_id}?error=All+fields+except+password+are+required.", status_code=303)
+    if new_password and len(new_password) < 8:
+        return RedirectResponse(url=f"/admin/staff/edit/{school_id}/{staff_id}?error=New+password+must+be+at+least+8+characters+long.", status_code=303)
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (staff_id, school_id))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Staff member not found.")
+
+            try:
+                if new_password:
+                    hashed_password = get_password_hash(new_password[:72])
+                    cur.execute(
+                        "UPDATE users SET full_name = %s, tsc_number = %s, phone_number = %s, email = %s, password_hash = %s WHERE id = %s;",
+                        (full_name, tsc_number, phone_number, email, hashed_password, staff_id)
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE users SET full_name = %s, tsc_number = %s, phone_number = %s, email = %s WHERE id = %s;",
+                        (full_name, tsc_number, phone_number, email, staff_id)
+                    )
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                return RedirectResponse(url=f"/admin/staff/edit/{school_id}/{staff_id}?error=That+email+is+already+registered+to+a+different+account.", status_code=303)
+
+            log_audit_action(cur, request, school_id, "staff_edited", f"Updated staff account details for {full_name} ({email})")
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
 
 @app.post("/api/v1/staff/toggle-verification/{school_id}")
 def toggle_staff_verification(school_id: int, request: Request, user_id: int = Form(...)):
