@@ -2664,6 +2664,19 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             """)
             has_staff_category_column = cur.fetchone() is not None
 
+            # Shows the ACTUAL data in last_active_at, unfiltered by any
+            # time window — the only way to directly answer "is this
+            # column ever getting populated at all?" rather than
+            # continuing to reason about the update/read logic in the
+            # abstract.
+            last_active_sample = []
+            if any(c['column_name'] == 'last_active_at' for c in columns):
+                cur.execute("""
+                    SELECT id, full_name, email, role, last_active_at
+                    FROM users ORDER BY last_active_at DESC NULLS LAST LIMIT 5;
+                """)
+                last_active_sample = cur.fetchall()
+
     ecde_status_html = f"""
     <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-3">
         <h2 class="text-lg font-black text-slate-800">🎯 Direct Checks</h2>
@@ -2683,6 +2696,10 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             </p>
             {'' if has_staff_category_column else '<a href="/superadmin/db-diagnostic?table=fee_categories" class="text-[11px] font-bold text-rose-700 underline">Fix this now →</a>'}
         </div>
+        {f'''<div class="p-3 rounded-xl bg-slate-50 border border-slate-200">
+            <p class="text-xs font-bold text-slate-700 mb-2">🕒 Top 5 users by last_active_at (unfiltered, includes NULLs) — direct proof of whether this is being written at all:</p>
+            <table class="w-full text-[11px]"><tbody>{"".join(f"<tr class='border-b border-slate-200'><td class='py-1 pr-3 font-bold'>{esc(u['full_name'] or u['email'])}</td><td class='py-1 pr-3 text-slate-400'>{esc(u['role'])}</td><td class='py-1'>{u['last_active_at'].strftime('%d %b %Y, %H:%M:%S') if u['last_active_at'] else 'never'}</td></tr>" for u in last_active_sample)}</tbody></table>
+        </div>''' if last_active_sample else ""}
     </div>
     """
 
