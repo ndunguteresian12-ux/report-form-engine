@@ -171,9 +171,28 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
             server.starttls()
             server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.sendmail(SMTP_USERNAME, [to_email], msg.as_string())
+            # sendmail()'s return value was previously ignored entirely.
+            # It only RAISES if every recipient is refused — with a
+            # single recipient (always the case here), that means "no
+            # exception" was being treated as full proof of acceptance.
+            # Logging the return value explicitly (an empty dict means
+            # genuinely accepted; a non-empty one names exactly which
+            # recipient was refused and why, even though no exception
+            # was raised) gives real visibility into a case that
+            # otherwise looks identical to a successful send from this
+            # function's own perspective — useful for a "reported success
+            # but the recipient says it never arrived" report, where the
+            # actual cause turned out to be entirely downstream of this
+            # function (the receiving server's own filtering), not
+            # something this code could detect on its own either way.
+            refused = server.sendmail(SMTP_USERNAME, [to_email], msg.as_string())
+            if refused:
+                _last_email_error = f"Recipient refused by their mail server: {refused}"
+                logger.warning(f"Email to {to_email} was submitted but refused by the recipient's server: {refused}")
+                return False
 
         _last_email_error = None
+        logger.info(f"Email successfully submitted to {SMTP_HOST} for delivery to {to_email} (subject: {subject!r}).")
         return True
     except Exception as email_err:
         _last_email_error = f"{type(email_err).__name__}: {email_err}"
