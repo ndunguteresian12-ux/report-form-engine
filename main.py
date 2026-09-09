@@ -1236,7 +1236,7 @@ bootstrap_finance_schema()
 app.include_router(finance_router)
 
 # --- Schemes of Work module (extracted to its own file — see schemes_routes.py) ---
-from schemes_routes import router as schemes_router, bootstrap_schemes_schema
+from schemes_routes import router as schemes_router, bootstrap_schemes_schema, roll_forward_scheme_copies
 bootstrap_schemes_schema()
 app.include_router(schemes_router)
 
@@ -6581,7 +6581,15 @@ def update_settings_endpoint(
                     head_teacher_name = EXCLUDED.head_teacher_name,
                     marks_entry_deadline = EXCLUDED.marks_entry_deadline;
             """, (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream_bool, head_teacher_name.strip() or None, marks_entry_deadline_value))
-            
+
+            # Carries every scheme of work the school already has forward
+            # into the new active year automatically, rather than
+            # requiring a manual re-import of the exact same content each
+            # year — see roll_forward_scheme_copies's own docstring for
+            # the full reasoning (including why it deliberately does NOT
+            # carry forward the print-payment unlock).
+            roll_forward_scheme_copies(cur, school_id, old_year, active_year)
+
             # Sync the modern Tailwind color layout across the institution node
             cur.execute("UPDATE schools SET theme_color = %s WHERE id = %s;", (theme_color, school_id))
             conn.commit()
@@ -7506,6 +7514,15 @@ def promote_school_classes(school_id: int, request: Request):
                 # closes that gap structurally rather than relying on
                 # anyone clicking things in a particular order.
                 cur.execute("UPDATE school_settings SET active_term = %s, active_year = %s WHERE school_id = %s;", (next_term, next_year, school_id))
+
+                # Same automatic scheme-of-work rollover as a manual
+                # Settings save triggers — see roll_forward_scheme_copies's
+                # docstring. Safe to call from both places (confirmed
+                # idempotent): whichever one runs first for a given
+                # school does the actual work, the other is a no-op.
+                if old_year != next_year:
+                    roll_forward_scheme_copies(cur, school_id, old_year, next_year)
+
                 conn.commit()
 
             # --- Snapshot every student about to be affected, BEFORE any

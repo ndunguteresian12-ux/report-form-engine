@@ -215,6 +215,60 @@ def auto_copy_published_masters_to_all_schools():
             conn.commit()
 
 
+def roll_forward_scheme_copies(cur, school_id: int, old_year, new_year):
+    """When a school's active year changes, creates a fresh scheme_copies
+    row (with its own genuinely new copy_id, and its own copied-over
+    lesson rows) for every scheme_copy the school had in the old year —
+    so a scheme that's already in use just carries forward automatically
+    rather than the school needing to manually re-import the exact same
+    content every single year. The old year's copy is left completely
+    untouched as a historical record of what was actually taught that
+    year, including any edits a teacher had made to it.
+
+    Deliberately gives the new year's copy a NEW copy_id rather than
+    just changing the old row's year in place — confirmed directly:
+    the print paywall (mpesa_routes.has_scheme_print_unlock) is keyed on
+    copy_id, and a teacher who already paid to print the old year's
+    version should NOT get the new year for free just because it rolled
+    forward automatically; a new year is meant to require unlocking
+    again the same as any other scheme.
+
+    Safe to call more than once for the same old_year -> new_year
+    transition (confirmed against real data): the NOT EXISTS check means
+    a scheme that's already been rolled forward is simply skipped rather
+    than duplicated, so this can be triggered from more than one place
+    (a settings save, or the dedicated year-end promotion flow) without
+    coordinating which one "owns" the rollover.
+
+    Returns silently (does nothing) if old_year and new_year are the
+    same, or either is missing — callers don't need their own guard for
+    "did the year actually change" before calling this."""
+    if not old_year or not new_year or old_year == new_year:
+        return
+    cur.execute("""
+        WITH new_copies AS (
+            INSERT INTO scheme_copies (school_id, master_id, subject_name, grade_name, education_level, stream, term, year, teacher_user_id, teacher_name_override, tsc_number_override, imported_by_user_id)
+            SELECT school_id, master_id, subject_name, grade_name, education_level, stream, term, %(new_year)s, teacher_user_id, teacher_name_override, tsc_number_override, imported_by_user_id
+            FROM scheme_copies old_copy
+            WHERE old_copy.school_id = %(school_id)s AND old_copy.year = %(old_year)s
+              AND NOT EXISTS (
+                  SELECT 1 FROM scheme_copies existing
+                  WHERE existing.school_id = old_copy.school_id AND existing.year = %(new_year)s
+                    AND existing.subject_name = old_copy.subject_name AND existing.grade_name = old_copy.grade_name
+                    AND existing.education_level = old_copy.education_level AND existing.stream = old_copy.stream AND existing.term = old_copy.term
+              )
+            RETURNING id, subject_name, grade_name, education_level, stream, term
+        )
+        INSERT INTO scheme_copy_rows (copy_id, sort_order, week_number, lesson_number, strand, sub_strand, learning_outcomes, learning_experiences, key_inquiry_questions, learning_resources, assessment_methods, reflection)
+        SELECT nc.id, r.sort_order, r.week_number, r.lesson_number, r.strand, r.sub_strand, r.learning_outcomes, r.learning_experiences, r.key_inquiry_questions, r.learning_resources, r.assessment_methods, r.reflection
+        FROM new_copies nc
+        JOIN scheme_copies old_copy ON old_copy.school_id = %(school_id)s AND old_copy.year = %(old_year)s
+          AND old_copy.subject_name = nc.subject_name AND old_copy.grade_name = nc.grade_name
+          AND old_copy.education_level = nc.education_level AND old_copy.stream = nc.stream AND old_copy.term = nc.term
+        JOIN scheme_copy_rows r ON r.copy_id = old_copy.id;
+    """, {"school_id": school_id, "old_year": old_year, "new_year": new_year})
+
+
 SCHEME_ROW_FIELDS = [
     "week_number", "lesson_number", "strand", "sub_strand",
     "learning_outcomes", "learning_experiences", "key_inquiry_questions",
@@ -290,6 +344,44 @@ def _fix_letter_spacing(text):
     if not text:
         return text
     return _LETTER_SPACING_PATTERN.sub(lambda m: m.group(0).replace(" ", ""), text)
+
+
+_EXCESSIVE_WHITESPACE_PATTERN = re.compile(r'\s+')
+# Two safe cases only, each confirmed against real edge cases before
+# shipping: (1) 2+ letters before the punctuation mark — the end of an
+# actual word, never a single-letter abbreviation component like the "e"
+# in "e.g." or an initial like "J."; (2) one or more digits before a
+# period — a numbered list marker like "1." or "12.", always safe since
+# list numbers are never part of an abbreviation. A narrower pattern
+# (either case alone) either left numbered-list items unfixed or broke
+# "e.g." itself by inserting a space mid-abbreviation — both confirmed
+# with real test cases, not just reasoned about.
+_MISSING_SPACE_AFTER_PUNCTUATION_PATTERN = re.compile(r'(?<=[a-zA-Z]{2}[.,;:])(?=[A-Za-z])|(?<=\d\.)(?=[A-Za-z])')
+
+
+def _clean_scheme_cell_text(text):
+    """Cleans up common everyday PDF-extraction messiness within a
+    single scheme cell's text — a different, more general problem than
+    _fix_letter_spacing above (which handles one specific, narrow
+    artifact: individually-spaced letters). This handles two things
+    instead:
+    1. Collapses embedded line-wraps and repeated whitespace into single
+       spaces — a cell that wrapped across several lines in the original
+       PDF otherwise displays with literal line breaks and irregular
+       gaps baked in, rather than reading as one flowing sentence.
+    2. Inserts a missing space after sentence punctuation immediately
+       followed by a letter, e.g. "1.Learners identify..." becomes
+       "1. Learners identify..." — a very common PDF-extraction artifact
+       from justified or tightly-kerned text.
+    Deliberately does NOT touch a period followed by a digit (so a
+    genuine decimal like "3.5" is never touched), and deliberately does
+    NOT touch a single letter before a period (so abbreviations like
+    "e.g." and initials like "J.K." are never broken apart)."""
+    if not text:
+        return text
+    text = _EXCESSIVE_WHITESPACE_PATTERN.sub(' ', text.strip())
+    text = _MISSING_SPACE_AFTER_PUNCTUATION_PATTERN.sub(' ', text)
+    return text.strip()
 
 
 
@@ -419,7 +511,7 @@ def parse_scheme_pdf(filepath: str):
                                 break
                             field = column_field_map[col_idx]
                             if field:
-                                row_dict[field] = _fix_letter_spacing((cell_value or "").strip())
+                                row_dict[field] = _clean_scheme_cell_text(_fix_letter_spacing((cell_value or "").strip()))
                         # A row whose only content is a stray "Page N"
                         # watermark (picked up as if it were real cell
                         # content) isn't a real lesson — safe to drop
@@ -667,7 +759,12 @@ def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
         <div class="max-w-[1600px] mx-auto space-y-4">
             <a href="/superadmin/schemes/list" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Master Schemes</a>
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
-                <h2 class="text-lg font-black text-slate-800">📘 Review — {esc(master['subject_name'])} — {esc(master['grade_name'])} ({esc(master['term'])} {master['year']})</h2>
+                <div class="flex items-center justify-between flex-wrap gap-2">
+                    <h2 class="text-lg font-black text-slate-800">📘 Review — {esc(master['subject_name'])} — {esc(master['grade_name'])} ({esc(master['term'])} {master['year']})</h2>
+                    <form action="/api/v1/superadmin/schemes/clean-text/{master_id}" method="post" onsubmit="return confirm('Re-run text cleanup on every row of this scheme? This tidies up spacing and punctuation artifacts left over from the original PDF extraction — it does not change the actual wording, and any manual edits you\\'ve already made here are preserved and cleaned the same way.');">
+                        <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white px-3.5 py-2 rounded-xl text-xs font-bold transition">✨ Re-clean Text</button>
+                    </form>
+                </div>
                 <p class="text-xs text-slate-400 mt-1">{len(rows)} row(s) detected. This scheme is already live and visible to schools. Parsing is best-effort, not guaranteed accurate — the original PDF is shown alongside so you can quickly fill in anything it missed.</p>
                 {f"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-xs px-4 py-3 rounded-xl mt-3'><b>⚠️ Parser flagged these concerns:</b><ul class='list-disc list-inside mt-1'>{warnings_html}</ul></div>" if warning_list else ""}
             </div>
@@ -708,6 +805,38 @@ def schemes_review_form(master_id: int, request: Request, warnings: str = ""):
     </body>
     </html>
     """
+
+
+@router.post("/api/v1/superadmin/schemes/clean-text/{master_id}")
+def schemes_clean_text(master_id: int, request: Request):
+    """Re-runs _clean_scheme_cell_text (and _fix_letter_spacing) against
+    every row of an already-uploaded master scheme — for schemes
+    uploaded before this cleanup step existed, or as a manual re-run if
+    a super admin notices lingering messiness. Only touches the master;
+    schools that already imported a copy keep their own version
+    unchanged (they can re-import if they want the cleaned text too —
+    see the existing "already imported, re-import to get updates"
+    pattern on the available-schemes page)."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id FROM scheme_masters WHERE id = %s;", (master_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Scheme not found.")
+
+            select_cols = ", ".join(SCHEME_ROW_FIELDS)
+            cur.execute(f"SELECT id, {select_cols} FROM scheme_master_rows WHERE master_id = %s;", (master_id,))
+            rows = cur.fetchall()
+            for row in rows:
+                cleaned = {f: _clean_scheme_cell_text(_fix_letter_spacing(row.get(f) or "")) for f in SCHEME_ROW_FIELDS}
+                set_clause = ", ".join(f"{f} = %s" for f in SCHEME_ROW_FIELDS)
+                cur.execute(f"UPDATE scheme_master_rows SET {set_clause} WHERE id = %s;", (*[cleaned[f] for f in SCHEME_ROW_FIELDS], row['id']))
+            conn.commit()
+
+    return RedirectResponse(url=f"/superadmin/schemes/review/{master_id}", status_code=303)
 
 
 @router.post("/api/v1/superadmin/schemes/publish/{master_id}")
