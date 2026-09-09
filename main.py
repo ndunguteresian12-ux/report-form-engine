@@ -1627,7 +1627,7 @@ def forgot_password_form(sent: str = None):
     if sent == "1":
         notice_html = """
         <div class="bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg mb-4">
-            If that email has an account, a reset code has been sent to it. Enter it on the next screen.
+            If that email has an account, a reset link has been sent to it. Click the link in the email, or enter the code on the next screen.
         </div>
         """
     return f"""
@@ -1641,14 +1641,14 @@ def forgot_password_form(sent: str = None):
     <body class="bg-slate-900 flex items-center justify-center h-screen font-sans">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Forgot Password</h2>
-            <p class="text-xs text-slate-400 mb-6">Enter the email on your account. We'll email you a reset code.</p>
+            <p class="text-xs text-slate-400 mb-6">Enter the email on your account. We'll email you a reset link.</p>
             {notice_html}
             <form action="/api/v1/auth/forgot-password" method="post" class="space-y-4">
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">Account Email</label>
                     <input type="email" name="email" class="w-full p-3 border rounded-lg mt-1 focus:ring-2 focus:ring-emerald-600 outline-none" required>
                 </div>
-                <button type="submit" class="w-full bg-emerald-700 text-white p-3.5 rounded-lg font-black tracking-wide hover:bg-emerald-800 transition shadow-lg">Send Reset Code</button>
+                <button type="submit" class="w-full bg-emerald-700 text-white p-3.5 rounded-lg font-black tracking-wide hover:bg-emerald-800 transition shadow-lg">Send Reset Link</button>
             </form>
             <div class="mt-4 text-center">
                 <a href="/login" class="text-xs text-slate-400 hover:text-slate-600 hover:underline">← Back to login</a>
@@ -1687,14 +1687,25 @@ def forgot_password_submit(email: str = Form(...)):
                 """, (user['id'], reset_code, expires_at))
                 conn.commit()
 
+                # A genuine clickable link, not just a code to copy by
+                # hand — pre-fills both the email and the code on the
+                # reset form, so most users can just click through
+                # rather than switching apps to manually retype a
+                # 6-digit number. The plain code is still shown too, as
+                # a fallback for any email client that strips links or
+                # any user who'd rather type it manually.
+                reset_link = f"https://report-form-engine.onrender.com/reset-password?email={urllib.parse.quote(email)}&code={reset_code}"
+
                 send_email(
                     email,
-                    "Your Elimu Hub password reset code",
+                    "Your Elimu Hub password reset link",
                     f"""
                     <p>Hi {esc((user['full_name'] or email).split(' ')[0])},</p>
-                    <p>Your Elimu Hub password reset code is:</p>
+                    <p>Click the button below to reset your Elimu Hub password:</p>
+                    <p><a href="{esc(reset_link)}" style="display:inline-block;background:#047857;color:#ffffff;font-weight:bold;padding:12px 24px;border-radius:8px;text-decoration:none;">Reset My Password</a></p>
+                    <p>Or enter this code manually on the reset page:</p>
                     <p style="font-size:22px;font-weight:bold;background:#f1f5f9;padding:10px 16px;border-radius:8px;display:inline-block;letter-spacing:2px;">{esc(reset_code)}</p>
-                    <p>It expires in 15 minutes.</p>
+                    <p>This link and code expire in 15 minutes.</p>
                     <p>If you didn't request this, you can safely ignore this email.</p>
                     """
                 )
@@ -1711,12 +1722,12 @@ def forgot_password_submit(email: str = Form(...)):
     return RedirectResponse(url=f"/reset-password?email={urllib.parse.quote(email)}&sent=1", status_code=303)
 
 @app.get("/reset-password", response_class=HTMLResponse)
-def reset_password_form(email: str = "", sent: str = None):
+def reset_password_form(email: str = "", code: str = "", sent: str = None):
     notice_html = ""
     if sent == "1":
         notice_html = """
         <div class="bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg mb-4">
-            If that email has an account, a reset code has been sent to it.
+            If that email has an account, a reset link/code has been sent to it.
         </div>
         """
     return f"""
@@ -1730,7 +1741,7 @@ def reset_password_form(email: str = "", sent: str = None):
     <body class="bg-slate-900 flex items-center justify-center h-screen font-sans">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
             <h2 class="text-xl font-black text-slate-800 mb-1">Reset Password</h2>
-            <p class="text-xs text-slate-400 mb-6">Enter the 6-digit code we texted you, along with your new password.</p>
+            <p class="text-xs text-slate-400 mb-6">{"Confirm your new password below." if code else "Enter the 6-digit code from your email, along with your new password."}</p>
             {notice_html}
             <form action="/api/v1/auth/reset-password" method="post" class="space-y-4">
                 <div>
@@ -1739,7 +1750,7 @@ def reset_password_form(email: str = "", sent: str = None):
                 </div>
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">6-Digit Reset Code</label>
-                    <input type="text" name="reset_code" maxlength="6" pattern="[0-9]{{6}}" class="w-full p-3 border rounded-lg mt-1 focus:ring-2 focus:ring-emerald-600 outline-none tracking-widest text-center font-mono text-lg" required>
+                    <input type="text" name="reset_code" value="{esc(code)}" maxlength="6" pattern="[0-9]{{6}}" class="w-full p-3 border rounded-lg mt-1 focus:ring-2 focus:ring-emerald-600 outline-none tracking-widest text-center font-mono text-lg" required>
                 </div>
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">New Password</label>
@@ -2671,6 +2682,15 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             cookie_secure_raw = os.getenv("COOKIE_SECURE")
             cookie_secure_active = (cookie_secure_raw or "false").lower() == "true"
 
+            # Same reasoning as the last_active_at and COOKIE_SECURE
+            # checks above — shows exactly what THIS running process sees
+            # for email configuration, plus the actual error from the
+            # last real send attempt (if any), rather than continuing to
+            # guess why users report not receiving a reset email.
+            email_configured_now = _email_configured
+            last_email_error_now = _last_email_error
+
+
             # Shows the ACTUAL data in last_active_at, unfiltered by any
             # time window — the only way to directly answer "is this
             # column ever getting populated at all?" rather than
@@ -2711,6 +2731,12 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             <p class="text-xs font-bold {'text-emerald-800' if cookie_secure_active else 'text-amber-800'}">
                 {'✅ COOKIE_SECURE is active — session cookies require HTTPS' if cookie_secure_active else f"⚠️ COOKIE_SECURE is NOT active (this process reads it as {cookie_secure_raw!r}) — session cookies do not require HTTPS. If your live site is only ever accessed over https://, set COOKIE_SECURE=true in Render's environment variables to close this gap."}
             </p>
+        </div>
+        <div class="p-3 rounded-xl {'bg-emerald-50 border border-emerald-200' if email_configured_now else 'bg-rose-50 border border-rose-200'}">
+            <p class="text-xs font-bold {'text-emerald-800' if email_configured_now else 'text-rose-800'}">
+                {'✅ Email is configured (SMTP_USERNAME and SMTP_PASSWORD are both set) — real emails should be going out.' if email_configured_now else "❌ Email is NOT configured — SMTP_USERNAME and/or SMTP_PASSWORD are missing from this environment. Every \"reset password\" email is being silently SIMULATED (only logged server-side) rather than actually sent. Set both in Render's environment variables to fix this."}
+            </p>
+            {f"<p class='text-xs font-bold text-rose-800 mt-2'>Last real send attempt failed with: {esc(last_email_error_now)}</p>" if last_email_error_now else ""}
         </div>
     </div>
     """
