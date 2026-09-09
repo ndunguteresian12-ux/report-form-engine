@@ -2651,7 +2651,7 @@ def logout():
 
 
 @app.get("/superadmin/db-diagnostic", response_class=HTMLResponse)
-def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
+def superadmin_db_diagnostic(request: Request, table: str = "student_scores", test_email_result: str = None):
     """Shows exactly what the CURRENTLY RUNNING app's own database
     connection sees for a given table's columns — not what any Neon
     console session might show, which could be looking at a completely
@@ -2757,6 +2757,11 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             </p>
             {f"<p class='text-xs font-bold text-slate-700 mt-2'>SMTP_USERNAME this process is actually authenticating as: <span class='font-mono'>{esc(SMTP_USERNAME)}</span> — compare this character-for-character against the account whose Sent folder you checked.</p>" if email_configured_now else ""}
             {f"<p class='text-xs font-bold text-rose-800 mt-2'>Last real send attempt failed with: {esc(last_email_error_now)}</p>" if last_email_error_now else ""}
+            {f"<div class='mt-3 p-2.5 rounded-lg {'bg-emerald-100 text-emerald-800' if test_email_result.startswith('SUCCESS') else 'bg-rose-100 text-rose-800'} text-xs font-bold'>{esc(test_email_result)}</div>" if test_email_result else ""}
+            <form action="/superadmin/db-diagnostic/send-test-email" method="post" class="mt-3 flex gap-2">
+                <input type="email" name="test_email" placeholder="you@example.com" class="flex-1 border p-2 rounded-lg text-xs" required>
+                <button type="submit" class="bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold px-4 py-2 rounded-lg">Send Test Email Now</button>
+            </form>
         </div>
     </div>
     """
@@ -2905,6 +2910,34 @@ def fix_users_last_active_column(request: Request):
             conn.commit()
 
     return RedirectResponse(url="/superadmin/db-diagnostic?table=users", status_code=303)
+
+
+@app.post("/superadmin/db-diagnostic/send-test-email")
+async def send_test_email_diagnostic(request: Request):
+    """Calls send_email() directly and immediately, showing the exact
+    real result right on this page — rather than going through the
+    forgot-password flow (which always shows the same generic "sent"
+    message regardless of what actually happened, by design, so it
+    can't leak which emails have accounts) or relying on
+    _last_email_error possibly reflecting an older, different attempt.
+    This is the most direct way to answer "does a real send actually
+    work right now, with these exact credentials" with certainty."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    form = await request.form()
+    test_email = (form.get("test_email") or "").strip()
+    if not test_email:
+        return RedirectResponse(url="/superadmin/db-diagnostic?table=users&test_email_result=Please+enter+an+email+address.", status_code=303)
+
+    success = send_email(
+        test_email,
+        "Elimu Hub — test email",
+        f"<p>This is a direct test email, sent at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC, to confirm your SMTP configuration is genuinely working.</p>"
+    )
+    result_message = f"SUCCESS — send_email() reported success sending to {test_email}. Check that inbox now." if success else f"FAILED — {_last_email_error or 'no specific error was captured'}"
+    return RedirectResponse(url=f"/superadmin/db-diagnostic?table=users&test_email_result={urllib.parse.quote(result_message)}", status_code=303)
 
 
 @app.get("/superadmin/dashboard", response_class=HTMLResponse)
