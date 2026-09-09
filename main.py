@@ -2755,6 +2755,7 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             <p class="text-xs font-bold {'text-emerald-800' if email_configured_now else 'text-rose-800'}">
                 {'✅ Email is configured (SMTP_USERNAME and SMTP_PASSWORD are both set) — real emails should be going out.' if email_configured_now else "❌ Email is NOT configured — SMTP_USERNAME and/or SMTP_PASSWORD are missing from this environment. Every \"reset password\" email is being silently SIMULATED (only logged server-side) rather than actually sent. Set both in Render's environment variables to fix this."}
             </p>
+            {f"<p class='text-xs font-bold text-slate-700 mt-2'>SMTP_USERNAME this process is actually authenticating as: <span class='font-mono'>{esc(SMTP_USERNAME)}</span> — compare this character-for-character against the account whose Sent folder you checked.</p>" if email_configured_now else ""}
             {f"<p class='text-xs font-bold text-rose-800 mt-2'>Last real send attempt failed with: {esc(last_email_error_now)}</p>" if last_email_error_now else ""}
         </div>
     </div>
