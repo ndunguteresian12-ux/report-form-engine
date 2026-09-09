@@ -2664,6 +2664,13 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             """)
             has_staff_category_column = cur.fetchone() is not None
 
+            # What THIS running process actually sees for COOKIE_SECURE —
+            # not what you might expect to be set, or what a stale docs
+            # page says, but the literal value read by this exact
+            # deployment right now.
+            cookie_secure_raw = os.getenv("COOKIE_SECURE")
+            cookie_secure_active = (cookie_secure_raw or "false").lower() == "true"
+
             # Shows the ACTUAL data in last_active_at, unfiltered by any
             # time window — the only way to directly answer "is this
             # column ever getting populated at all?" rather than
@@ -2700,6 +2707,11 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores"):
             <p class="text-xs font-bold text-slate-700 mb-2">🕒 Top 5 users by last_active_at (unfiltered, includes NULLs) — direct proof of whether this is being written at all:</p>
             <table class="w-full text-[11px]"><tbody>{"".join(f"<tr class='border-b border-slate-200'><td class='py-1 pr-3 font-bold'>{esc(u['full_name'] or u['email'])}</td><td class='py-1 pr-3 text-slate-400'>{esc(u['role'])}</td><td class='py-1'>{u['last_active_at'].strftime('%d %b %Y, %H:%M:%S') if u['last_active_at'] else 'never'}</td></tr>" for u in last_active_sample)}</tbody></table>
         </div>''' if last_active_sample else ""}
+        <div class="p-3 rounded-xl {'bg-emerald-50 border border-emerald-200' if cookie_secure_active else 'bg-amber-50 border border-amber-200'}">
+            <p class="text-xs font-bold {'text-emerald-800' if cookie_secure_active else 'text-amber-800'}">
+                {'✅ COOKIE_SECURE is active — session cookies require HTTPS' if cookie_secure_active else f"⚠️ COOKIE_SECURE is NOT active (this process reads it as {cookie_secure_raw!r}) — session cookies do not require HTTPS. If your live site is only ever accessed over https://, set COOKIE_SECURE=true in Render's environment variables to close this gap."}
+            </p>
+        </div>
     </div>
     """
 
