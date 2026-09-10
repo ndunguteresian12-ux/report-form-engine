@@ -2549,6 +2549,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <a href="/finance/dashboard/{school_id}" class="bg-amber-400 hover:bg-amber-300 text-indigo-950 px-3 py-2 rounded-xl transition font-bold">💰 Finance</a>
                 <a href="/admin/class-teachers/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🧑‍🏫 Class Teachers</a>
                 <a href="/schemes/manage/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📘 Schemes of Work</a>
+                <a href="/staff/profile/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">👤 My Profile</a>
                 <a href="/logout" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
@@ -4033,6 +4034,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
                 <a href="/finance/staff/collect/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-3 py-2 rounded-xl transition">💰 Collect Fees</a>
                 <a href="/schemes/my-schemes/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">📘 My Schemes of Work</a>
                 <a href="/staff/wallet/{school_id}" class="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-2 rounded-xl transition">💳 My Wallet</a>
+                <a href="/staff/profile/{school_id}" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">👤 My Profile</a>
                 <a href="/logout" class="bg-white hover:bg-slate-100 text-slate-500 border border-slate-200 px-3 py-2 rounded-xl transition">Log Out</a>
             </div>
         </header>
@@ -4064,6 +4066,151 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
     </body>
     </html>
     """)
+
+
+@app.get("/staff/profile/{school_id}", response_class=HTMLResponse)
+def staff_profile_form(school_id: int, request: Request, error: str = None, saved: str = None):
+    """A staff member's own profile — separate from the admin-facing
+    "Edit Staff" page, since this always operates on the LOGGED-IN
+    user's own account (via get_current_session_user), never on a
+    user_id passed in from outside, so there's no way for a staff
+    account to view or edit anyone else's details through this route.
+    Built specifically so a teacher who registered with a placeholder
+    or unreachable email (common during initial setup) can switch it to
+    a real one themselves — this matters more now that email is the
+    actual password-reset channel, not just a login identifier."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    viewer = get_current_session_user(request)
+    if not viewer:
+        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, email, full_name, tsc_number, phone_number FROM users WHERE id = %s;", (viewer['id'],))
+            me = cur.fetchone()
+            if not me:
+                raise HTTPException(status_code=404, detail="Account not found.")
+
+    back_url = f"/staff/dashboard/{school_id}?user_id={viewer['id']}" if viewer['role'] == 'staff' else f"/admin/dashboard/{school_id}"
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | My Profile</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
+        <div class="bg-white p-8 rounded-2xl border shadow-xs w-full max-w-md">
+            <h2 class="text-lg font-black text-slate-800">👤 My Profile</h2>
+            <p class="text-xs text-slate-400 mb-4">Update your own details here.</p>
+            {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-3 py-2.5 rounded-lg mb-4'>{esc(error)}</div>" if error else ""}
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-3 py-2.5 rounded-lg mb-4'>✅ Profile updated successfully.</div>" if saved else ""}
+            <form action="/api/v1/staff/profile/update/{school_id}" method="post" class="space-y-3">
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Full Name</label>
+                    <input type="text" name="full_name" value="{esc(me['full_name'] or '')}" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">TSC Number</label>
+                    <input type="text" name="tsc_number" value="{esc(me['tsc_number'] or '')}" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Phone Number</label>
+                    <input type="tel" name="phone_number" value="{esc(me['phone_number'] or '')}" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Email (login)</label>
+                    <input type="email" name="email" value="{esc(me['email'])}" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                    <p class="text-[10px] text-slate-400 mt-1">If you registered with a placeholder or work email you no longer use, change it here to one you actually check — this is also where password reset links get sent.</p>
+                </div>
+                <hr class="my-2">
+                <div>
+                    <label class="text-xs font-bold text-slate-600">New Password (optional)</label>
+                    <input type="text" name="new_password" placeholder="Leave blank to keep your current password" class="w-full border p-2.5 rounded-lg mt-1 text-sm">
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Current Password</label>
+                    <input type="password" name="current_password" placeholder="Required only if changing your email or password above" class="w-full border p-2.5 rounded-lg mt-1 text-sm">
+                </div>
+                <div class="flex gap-3 pt-2">
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 px-5 rounded-lg text-sm transition">Save Changes</button>
+                    <a href="{back_url}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-lg text-sm transition">Cancel</a>
+                </div>
+            </form>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/api/v1/staff/profile/update/{school_id}")
+async def staff_profile_update(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    viewer = get_current_session_user(request)
+    if not viewer:
+        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
+
+    form = await request.form()
+    full_name = (form.get("full_name") or "").strip()
+    tsc_number = (form.get("tsc_number") or "").strip()
+    phone_number = (form.get("phone_number") or "").strip()
+    email = (form.get("email") or "").strip().lower()
+    new_password = (form.get("new_password") or "").strip()
+    current_password = (form.get("current_password") or "").strip()
+
+    if not full_name or not tsc_number or not phone_number or not email:
+        return RedirectResponse(url=f"/staff/profile/{school_id}?error=All+profile+fields+are+required.", status_code=303)
+    if new_password and len(new_password) < 8:
+        return RedirectResponse(url=f"/staff/profile/{school_id}?error=New+password+must+be+at+least+8+characters+long.", status_code=303)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, email, password_hash FROM users WHERE id = %s;", (viewer['id'],))
+            me = cur.fetchone()
+            if not me:
+                raise HTTPException(status_code=404, detail="Account not found.")
+
+            email_changing = email != me['email']
+            password_changing = bool(new_password)
+
+            # Confirming with the CURRENT password before allowing either
+            # of these two specifically (not the other, non-sensitive
+            # fields) — both control access to this account, so changing
+            # either deserves the same proof-of-identity a real password
+            # change normally requires, rather than trusting that anyone
+            # with an already-open, possibly-unattended session is
+            # necessarily the account's own owner.
+            if email_changing or password_changing:
+                if not current_password:
+                    return RedirectResponse(url=f"/staff/profile/{school_id}?error=Enter+your+current+password+to+change+your+email+or+password.", status_code=303)
+                if not verify_password(current_password, me['password_hash']):
+                    return RedirectResponse(url=f"/staff/profile/{school_id}?error=Current+password+is+incorrect.", status_code=303)
+
+            try:
+                if password_changing:
+                    hashed_password = get_password_hash(new_password[:72])
+                    cur.execute(
+                        "UPDATE users SET full_name = %s, tsc_number = %s, phone_number = %s, email = %s, password_hash = %s WHERE id = %s;",
+                        (full_name, tsc_number, phone_number, email, hashed_password, viewer['id'])
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE users SET full_name = %s, tsc_number = %s, phone_number = %s, email = %s WHERE id = %s;",
+                        (full_name, tsc_number, phone_number, email, viewer['id'])
+                    )
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                return RedirectResponse(url=f"/staff/profile/{school_id}?error=That+email+is+already+registered+to+a+different+account.", status_code=303)
+
+            log_audit_action(cur, request, school_id, "profile_updated", f"{full_name} updated their own profile" + (" (email changed)" if email_changing else "") + (" (password changed)" if password_changing else ""))
+            conn.commit()
+
+    return RedirectResponse(url=f"/staff/profile/{school_id}?saved=1", status_code=303)
 
 
 @app.get("/admin/students/roster/{school_id}", response_class=HTMLResponse)
