@@ -4378,6 +4378,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
     for s in students:
         s_scores = score_map.get(s['id'], {})
         total_marks = 0.0
+        total_points = 0
         subjects_entered = 0
         subject_cells = {}
         for sub in subjects:
@@ -4388,6 +4389,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                 metrics = evaluate_performance_metrics(score)
                 subject_cells[sub['id']] = (score, metrics['pld'])
                 total_marks += score
+                total_points += metrics['points']
                 subjects_entered += 1
         # Divided by the full subject count for this level (total_subjects),
         # not just the subjects THIS student happens to have marks entered
@@ -4397,6 +4399,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         # which would make two students with the same total_marks but a
         # different number of entered subjects show different averages.
         avg_marks = (total_marks / total_subjects) if total_subjects else 0.0
+        avg_points = (total_points / total_subjects) if total_subjects else 0.0
         overall_metrics = evaluate_performance_metrics(avg_marks)
         overall_level = overall_metrics['desc']
         overall_pld = overall_metrics['pld']
@@ -4406,6 +4409,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             'subjects_entered': subjects_entered,
             'total_marks': total_marks,
             'avg_marks': avg_marks,
+            'total_points': total_points,
+            'avg_points': avg_points,
             'overall_level': overall_level,
             'overall_pld': overall_pld,
         })
@@ -4494,6 +4499,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                 <td style='text-align:center;'>{row['subjects_entered']}</td>
                 <td style='text-align:center;font-weight:bold;'>{row['total_marks']:.0f}</td>
                 <td style='text-align:center;'>{row['avg_marks']:.1f}</td>
+                <td style='text-align:center;font-weight:bold;'>{row['total_points']}</td>
+                <td style='text-align:center;'>{row['avg_points']:.2f}</td>
                 <td style='text-align:center;font-weight:bold;'>{row['overall_pld']}</td>
                 <td style='text-align:center;font-weight:bold;'>{row['overall_level']}</td>
             </tr>
@@ -4542,11 +4549,12 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                     <th style="text-align:center;">Prv Str Pos</th><th style="text-align:center;">Prv Ovr Pos</th>
                     {subject_header_cells}
                     <th style="text-align:center;">Sub. Entry</th><th style="text-align:center;">Total Marks</th>
-                    <th style="text-align:center;">Avg Marks</th><th style="text-align:center;">Code</th>
+                    <th style="text-align:center;">Avg Marks</th><th style="text-align:center;">Total Points</th>
+                    <th style="text-align:center;">Avg Points</th><th style="text-align:center;">Code</th>
                     <th style="text-align:center;">Level</th>
                 </tr>
             </thead>
-            <tbody>{rows_html or f"<tr><td colspan='{13 + total_subjects}' style='padding:20px;text-align:center;color:#94a3b8;'>No students found for this grade.</td></tr>"}</tbody>
+            <tbody>{rows_html or f"<tr><td colspan='{15 + total_subjects}' style='padding:20px;text-align:center;color:#94a3b8;'>No students found for this grade.</td></tr>"}</tbody>
         </table>
 
         <div style="margin-top:24px; font-weight:bold; font-size:13px;">CLASS AVERAGE MARKS: {class_average_marks:.1f}</div>
@@ -4647,19 +4655,23 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
     computed = []
     for s in students:
         s_scores = score_map.get(s['id'], {})
-        total_marks, subjects_entered = 0.0, 0
+        total_marks, total_points, subjects_entered = 0.0, 0, 0
         for sub in subjects:
             score = s_scores.get(sub['id'])
             if score is not None:
                 total_marks += score
+                total_points += evaluate_performance_metrics(score)['points']
                 subjects_entered += 1
         # Divided by the full subject count for this level, matching the
         # merit list's own methodology — see its comment for the reasoning.
         avg_marks = (total_marks / len(subjects)) if subjects else 0.0
+        avg_points = (total_points / len(subjects)) if subjects else 0.0
         overall_metrics = evaluate_performance_metrics(avg_marks)
         computed.append({
             'student': s, 'total_marks': total_marks,
             'avg_marks': avg_marks,
+            'total_points': total_points,
+            'avg_points': avg_points,
             'overall_level': overall_metrics['desc'],
             'overall_pld': overall_metrics['pld'],
         })
@@ -4682,13 +4694,15 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
             {"<td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>" + esc(r['student']['stream']) + "</td>" if whole_grade else ""}
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['total_marks']:.0f}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{r['avg_marks']:.1f}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['total_points']}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{r['avg_points']:.2f}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['overall_pld']}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{r['overall_level']}</td>
         </tr>
     """ for i, r in enumerate(top10, start=1))
 
     stream_header = "<th style='text-align:center;'>Stream</th>" if whole_grade else ""
-    colspan_count = 8 if whole_grade else 7
+    colspan_count = 10 if whole_grade else 9
 
     from mpesa_routes import render_admin_print_toolbar_and_content
     document_content_html = f"""
@@ -4705,6 +4719,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
                 <tr>
                     <th style="text-align:center;">Pos.</th><th>Adm No.</th><th>Full Name</th>{stream_header}
                     <th style="text-align:center;">Total Marks</th><th style="text-align:center;">Avg Marks</th>
+                    <th style="text-align:center;">Total Points</th><th style="text-align:center;">Avg Points</th>
                     <th style="text-align:center;">Code</th><th style="text-align:center;">Level</th>
                 </tr>
             </thead>
@@ -4903,20 +4918,22 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
 
     def _summarize(rows):
         """Given a list of raw scores, returns entry count, per-level
-        counts, avg marks, and the overall level/code derived directly
-        from avg marks — consistent with the merit list's own
+        counts, avg marks, avg points, and the overall level/code derived
+        directly from avg marks — consistent with the merit list's own
         methodology, so the same average mark always maps to the same
         descriptor everywhere in the system."""
         counts = {lvl: 0 for lvl in PLD_ORDER}
-        total_marks = 0.0
+        total_marks, total_points = 0.0, 0
         for score in rows:
             metrics = evaluate_performance_metrics(score)
             counts[metrics['pld']] = counts.get(metrics['pld'], 0) + 1
             total_marks += score
+            total_points += metrics['points']
         n = len(rows)
         avg_marks = (total_marks / n) if n else 0.0
+        avg_points = (total_points / n) if n else 0.0
         overall_metrics = evaluate_performance_metrics(avg_marks)
-        return {'entry': n, 'counts': counts, 'avg_marks': avg_marks, 'pld': overall_metrics['pld'], 'level': overall_metrics['desc']}
+        return {'entry': n, 'counts': counts, 'avg_marks': avg_marks, 'avg_points': avg_points, 'pld': overall_metrics['pld'], 'level': overall_metrics['desc']}
 
     logo_src = school.get('logo_url')
     logo_html = ""
@@ -4942,6 +4959,7 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
                 <td style="text-align:center;">{summary['entry']}</td>
                 {level_cells}
                 <td style="text-align:center;">{summary['avg_marks']:.1f}</td>
+                <td style="text-align:center;">{summary['avg_points']:.2f}</td>
                 <td style="text-align:center;font-weight:bold;">{summary['pld']}</td>
                 <td style="text-align:center;font-weight:bold;">{summary['level']}</td>
             </tr>
@@ -4954,6 +4972,7 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
             <td style="text-align:center;">{overall_summary['entry']}</td>
             {overall_level_cells}
             <td style="text-align:center;">{overall_summary['avg_marks']:.1f}</td>
+            <td style="text-align:center;">{overall_summary['avg_points']:.2f}</td>
             <td style="text-align:center;">{overall_summary['pld']}</td>
             <td style="text-align:center;">{overall_summary['level']}</td>
         </tr>
@@ -4964,7 +4983,7 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
         <div style="margin-top:22px;">
             <h3 style="font-size:13px;background:#eef2ff;padding:8px 12px;margin:0;border-radius:6px 6px 0 0;">Performance Level Summary — {esc(sub['name'])}</h3>
             <table style="margin-top:0;">
-                <thead><tr><th>Stream</th><th style="text-align:center;">Entry</th>{level_header_cells}<th style="text-align:center;">Avg Marks</th><th style="text-align:center;">Code</th><th style="text-align:center;">Level</th></tr></thead>
+                <thead><tr><th>Stream</th><th style="text-align:center;">Entry</th>{level_header_cells}<th style="text-align:center;">Avg Marks</th><th style="text-align:center;">Avg Points</th><th style="text-align:center;">Code</th><th style="text-align:center;">Level</th></tr></thead>
                 <tbody>{stream_rows_html}{overall_row}</tbody>
             </table>
         </div>
@@ -4989,12 +5008,13 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
         <div style="margin-top:26px;">
             <h3 style="font-size:13px;background:#e0e7ff;padding:8px 12px;margin:0;border-radius:6px 6px 0 0;">Class-Wide Overall Summary (All Subjects Combined)</h3>
             <table style="margin-top:0;">
-                <thead><tr><th style="text-align:center;">Entry</th>{level_header_cells}<th style="text-align:center;">Avg Marks</th><th style="text-align:center;">Code</th><th style="text-align:center;">Level</th></tr></thead>
+                <thead><tr><th style="text-align:center;">Entry</th>{level_header_cells}<th style="text-align:center;">Avg Marks</th><th style="text-align:center;">Avg Points</th><th style="text-align:center;">Code</th><th style="text-align:center;">Level</th></tr></thead>
                 <tbody>
                     <tr style="font-weight:bold;">
                         <td style="text-align:center;">{class_wide_summary['entry']}</td>
                         {class_wide_level_cells}
                         <td style="text-align:center;">{class_wide_summary['avg_marks']:.1f}</td>
+                        <td style="text-align:center;">{class_wide_summary['avg_points']:.2f}</td>
                         <td style="text-align:center;">{class_wide_summary['pld']}</td>
                         <td style="text-align:center;">{class_wide_summary['level']}</td>
                     </tr>
