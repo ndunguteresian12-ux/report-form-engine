@@ -5768,16 +5768,20 @@ def educators_bulk_entry_grid(
                 rows = cur.fetchall()
                 for r in rows:
                     paper_map[r['student_id']] = r
-                # Reuse whatever "out of" was last configured for this
-                # subject/cycle — scan every row rather than trusting just
-                # the first one, since a student scored on only one paper
-                # has the other paper's max stored as NULL on their row.
-                first_p1_max = next((r['paper1_max'] for r in rows if r['paper1_max'] is not None), None)
-                first_p2_max = next((r['paper2_max'] for r in rows if r['paper2_max'] is not None), None)
-                if first_p1_max is not None:
-                    paper1_max = float(first_p1_max)
-                if first_p2_max is not None:
-                    paper2_max = float(first_p2_max)
+                # Reuse whichever "out of" is most common among this
+                # subject/cycle's existing rows — not just the first one
+                # found, for the same reason as the single-subject "out
+                # of" fix above: a few students scored under an earlier
+                # (possibly different) max shouldn't make an arbitrary,
+                # possibly-stale value win over what most of the class
+                # actually used.
+                from collections import Counter
+                p1_max_counter = Counter(r['paper1_max'] for r in rows if r['paper1_max'] is not None)
+                p2_max_counter = Counter(r['paper2_max'] for r in rows if r['paper2_max'] is not None)
+                if p1_max_counter:
+                    paper1_max = float(p1_max_counter.most_common(1)[0][0])
+                if p2_max_counter:
+                    paper2_max = float(p2_max_counter.most_common(1)[0][0])
             elif selected_area_id:
                 cur.execute("""
                     SELECT student_id, raw_score, entered_marks, entered_out_of FROM student_scores 
@@ -5791,13 +5795,20 @@ def educators_bulk_entry_grid(
                     }
 
             # "Out of" is one shared value for the whole grid, entered once
-            # — same UX as Paper 1/Paper 2's "out of" above. Reuse whatever
-            # was last used for this subject/cycle if every existing entry
-            # agrees on it; default to 100 (a plain percentage) otherwise,
-            # which is exactly today's existing behavior for a school that
-            # never touches this new field at all.
-            out_of_values = {v['entered_out_of'] for v in score_map.values() if v.get('entered_out_of') is not None}
-            shared_out_of = out_of_values.pop() if len(out_of_values) == 1 else 100.0
+            # — same UX as Paper 1/Paper 2's "out of" above. Uses whichever
+            # entered_out_of value is most common among this subject/
+            # cycle's existing entries, not "only if every single entry
+            # agrees" (the previous logic) — that stricter rule silently
+            # reset to the default 100 the moment even one student's row
+            # had a different value, e.g. a few students entered earlier
+            # under the old default before the teacher started using a
+            # real "out of" value for the rest of the class. A real,
+            # confirmed bug: a teacher's deliberately-set "out of 80"
+            # would vanish from the form on the next page load, with
+            # nothing wrong actually having happened.
+            from collections import Counter
+            out_of_counter = Counter(v['entered_out_of'] for v in score_map.values() if v.get('entered_out_of') is not None)
+            shared_out_of = out_of_counter.most_common(1)[0][0] if out_of_counter else 100.0
 
     subject_options = "".join([f"<option value='{sub['id']}' {'selected' if sub['id'] == selected_area_id else ''}>{sub['name']}</option>" for sub in subjects])
 
