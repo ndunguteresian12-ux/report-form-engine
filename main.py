@@ -6307,7 +6307,11 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                                 </svg>
                             </div>
 
-                            <div style="border:1px solid {theme['hex']}; background:#f4faf6; padding:16px; border-radius:8px; display:flex; flex-direction:column; justify-content:center; gap:12px; height:110px; box-sizing:border-box;">
+                            <div style="border:1px solid {theme['hex']}; background:#f4faf6; padding:16px; border-radius:8px; display:flex; flex-direction:column; justify-content:center; gap:10px; height:140px; box-sizing:border-box;">
+                                <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:13px;">
+                                    <span>Total Marks:</span>
+                                    <span style="color:{theme['hex']}; font-weight:800;">{total_evaluated_weight:.0f} / {len(subjects) * 100}</span>
+                                </div>
                                 <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:13px;">
                                     <span>Cumulative Scale Points:</span>
                                     <span style="color:{theme['hex']}; font-weight:800;">{accumulated_scale_points} Pts</span>
