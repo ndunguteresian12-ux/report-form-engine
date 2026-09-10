@@ -10,9 +10,6 @@ import functools
 import bcrypt
 import psycopg2
 import requests as http_requests
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile
@@ -122,39 +119,52 @@ _last_storage_error = None
 # (imported above) — moved there so notifications_routes.py can send SMS
 # without a circular import with main.py.
 
-# --- Email provider configuration (SMTP — Gmail / Google Workspace) ---
-# Set these on Render to enable real email delivery. Gmail requires an App
-# Password here, NOT the account's normal login password — that only
-# works once 2-Step Verification is turned on for the Google account
-# (myaccount.google.com/apppasswords). The regular password will not
-# work for SMTP; Google blocks it. Until these are set, emails are only
-# logged server-side (a clearly-labeled simulation) so the feature can be
-# tested end-to-end without a live account, matching the SMS pattern above.
-SMTP_HOST = (os.getenv("SMTP_HOST") or "smtp.gmail.com").strip()
-SMTP_PORT = int((os.getenv("SMTP_PORT") or "587").strip())
-SMTP_USERNAME = (os.getenv("SMTP_USERNAME") or "").strip() or None
-SMTP_PASSWORD = (os.getenv("SMTP_PASSWORD") or "").strip() or None
+# --- Email provider configuration (Resend — HTTP API, not SMTP) ---
+# Was originally built on raw SMTP (Gmail/Google Workspace) — switched to
+# Resend's HTTP API after a real, confirmed production failure: Render
+# blocks outbound traffic to SMTP ports (25/465/587) on free-tier web
+# services (their own changelog confirms this, effective Sept 26 2025),
+# so no SMTP configuration — regardless of how correctly the credentials
+# were set up — could ever work from a free-tier deployment. Confirmed
+# directly against this exact deployment: a real send attempt failed
+# with OSError: [Errno 101] Network is unreachable, the exact signature
+# of an outbound connection being blocked at the network level before it
+# ever reaches Gmail. Resend sends over plain HTTPS (port 443) instead,
+# the same port all normal web traffic already uses, so it isn't subject
+# to this restriction at all.
+#
+# Set RESEND_API_KEY on Render to enable real email delivery — sign up
+# free at resend.com (free tier: 3,000 emails/month, 100/day, more than
+# enough for password-reset volume). RESEND_FROM_EMAIL defaults to
+# Resend's own onboarding@resend.dev sender, which works immediately
+# with no setup but is more likely to be flagged as spam by some
+# receivers — verify a real domain in Resend's dashboard and set this to
+# an address on it once you have one, for better deliverability. Until
+# RESEND_API_KEY is set, emails are only logged server-side (a clearly-
+# labeled simulation) so the feature can be tested end-to-end without a
+# live account, matching the SMS pattern above.
+RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip() or None
+RESEND_FROM_EMAIL = (os.getenv("RESEND_FROM_EMAIL") or "onboarding@resend.dev").strip()
 SMTP_FROM_NAME = (os.getenv("SMTP_FROM_NAME") or "Elimu Hub").strip()
-_email_configured = bool(SMTP_USERNAME and SMTP_PASSWORD)
+_email_configured = bool(RESEND_API_KEY)
 
 if _email_configured:
-    logger.info(f"SMTP configured ({SMTP_HOST}) — emails will be sent for real.")
+    logger.info("Resend configured — emails will be sent for real, over HTTPS (not SMTP).")
 else:
     logger.warning(
-        "SMTP NOT configured (SMTP_USERNAME / SMTP_PASSWORD missing). "
-        "Emails will only be logged server-side (simulated) until configured."
+        "RESEND_API_KEY not set. Emails will only be logged server-side (simulated) until configured."
     )
 
 _last_email_error = None
 
 def send_email(to_email: str, subject: str, body_html: str) -> bool:
-    """Sends an email via SMTP (Gmail/Google Workspace by default) if
-    configured; otherwise logs the message as a simulated send. Returns
-    True if a real send succeeded or a simulated send was logged, False
-    only on a genuine sending failure. Mirrors send_sms's exact
-    configured-check / simulate / real-send / error-tracking pattern,
-    for the same reason: lets the whole flow be built and tested before
-    real credentials exist, and self-diagnoses cleanly once they do."""
+    """Sends an email via Resend's HTTP API if configured; otherwise logs
+    the message as a simulated send. Returns True if a real send
+    succeeded or a simulated send was logged, False only on a genuine
+    sending failure. Mirrors send_sms's exact configured-check /
+    simulate / real-send / error-tracking pattern, for the same reason:
+    lets the whole flow be built and tested before real credentials
+    exist, and self-diagnoses cleanly once they do."""
     global _last_email_error
 
     if not _email_configured:
@@ -162,37 +172,24 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
         return True
 
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_USERNAME}>"
-        msg["To"] = to_email
-        msg.attach(MIMEText(body_html, "html"))
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            # sendmail()'s return value was previously ignored entirely.
-            # It only RAISES if every recipient is refused — with a
-            # single recipient (always the case here), that means "no
-            # exception" was being treated as full proof of acceptance.
-            # Logging the return value explicitly (an empty dict means
-            # genuinely accepted; a non-empty one names exactly which
-            # recipient was refused and why, even though no exception
-            # was raised) gives real visibility into a case that
-            # otherwise looks identical to a successful send from this
-            # function's own perspective — useful for a "reported success
-            # but the recipient says it never arrived" report, where the
-            # actual cause turned out to be entirely downstream of this
-            # function (the receiving server's own filtering), not
-            # something this code could detect on its own either way.
-            refused = server.sendmail(SMTP_USERNAME, [to_email], msg.as_string())
-            if refused:
-                _last_email_error = f"Recipient refused by their mail server: {refused}"
-                logger.warning(f"Email to {to_email} was submitted but refused by the recipient's server: {refused}")
-                return False
+        response = http_requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from": f"{SMTP_FROM_NAME} <{RESEND_FROM_EMAIL}>",
+                "to": [to_email],
+                "subject": subject,
+                "html": body_html,
+            },
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            _last_email_error = f"HTTP {response.status_code}: {response.text[:300]}"
+            logger.error(f"Email send failed: {_last_email_error}")
+            return False
 
         _last_email_error = None
-        logger.info(f"Email successfully submitted to {SMTP_HOST} for delivery to {to_email} (subject: {subject!r}).")
+        logger.info(f"Email successfully submitted to Resend for delivery to {to_email} (subject: {subject!r}).")
         return True
     except Exception as email_err:
         _last_email_error = f"{type(email_err).__name__}: {email_err}"
@@ -2753,9 +2750,9 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores", te
         </div>
         <div class="p-3 rounded-xl {'bg-emerald-50 border border-emerald-200' if email_configured_now else 'bg-rose-50 border border-rose-200'}">
             <p class="text-xs font-bold {'text-emerald-800' if email_configured_now else 'text-rose-800'}">
-                {'✅ Email is configured (SMTP_USERNAME and SMTP_PASSWORD are both set) — real emails should be going out.' if email_configured_now else "❌ Email is NOT configured — SMTP_USERNAME and/or SMTP_PASSWORD are missing from this environment. Every \"reset password\" email is being silently SIMULATED (only logged server-side) rather than actually sent. Set both in Render's environment variables to fix this."}
+                {'✅ Email is configured (RESEND_API_KEY is set) — real emails should be going out over HTTPS via Resend.' if email_configured_now else "❌ Email is NOT configured — RESEND_API_KEY is missing from this environment. Every email is being silently SIMULATED (only logged server-side) rather than actually sent. Set it in Render's environment variables to fix this — sign up free at resend.com."}
             </p>
-            {f"<p class='text-xs font-bold text-slate-700 mt-2'>SMTP_USERNAME this process is actually authenticating as: <span class='font-mono'>{esc(SMTP_USERNAME)}</span> — compare this character-for-character against the account whose Sent folder you checked.</p>" if email_configured_now else ""}
+            {f"<p class='text-xs font-bold text-slate-700 mt-2'>Sending from: <span class='font-mono'>{esc(RESEND_FROM_EMAIL)}</span></p>" if email_configured_now else ""}
             {f"<p class='text-xs font-bold text-rose-800 mt-2'>Last real send attempt failed with: {esc(last_email_error_now)}</p>" if last_email_error_now else ""}
             {f"<div class='mt-3 p-2.5 rounded-lg {'bg-emerald-100 text-emerald-800' if test_email_result.startswith('SUCCESS') else 'bg-rose-100 text-rose-800'} text-xs font-bold'>{esc(test_email_result)}</div>" if test_email_result else ""}
             <form action="/superadmin/db-diagnostic/send-test-email" method="post" class="mt-3 flex gap-2">
@@ -3604,7 +3601,7 @@ def superadmin_reset_admin_password_form(school_id: int, request: Request, done:
         result_html = f"""
         <div class="bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-lg mb-4">
             <p class="font-bold">Couldn't send the email to {esc(admin['email'])}.</p>
-            <p class="text-xs mt-1">The password was NOT changed — their current one still works. Check your SMTP setup (SMTP_USERNAME / SMTP_PASSWORD on Render) and try again.</p>
+            <p class="text-xs mt-1">The password was NOT changed — their current one still works. Check your RESEND_API_KEY on Render and try again.</p>
         </div>
         """
 
