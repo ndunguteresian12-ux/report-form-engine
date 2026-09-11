@@ -2938,6 +2938,93 @@ async def send_test_email_diagnostic(request: Request):
     return RedirectResponse(url=f"/superadmin/db-diagnostic?table=users&test_email_result={urllib.parse.quote(result_message)}", status_code=303)
 
 
+@app.get("/superadmin/diagnostic/teacher-assignments/{school_id}", response_class=HTMLResponse)
+def diagnose_teacher_assignments(school_id: int, request: Request, grade_name: str = "", education_level: str = "", stream: str = ""):
+    """Built specifically to investigate a real, reported bug: teachers
+    assigned in Teaching Assignments reportedly disappearing "after a
+    short while" with no admin action. Rather than continue guessing at
+    the cause from code alone, this shows the actual, raw truth directly:
+    every timetable plan that exists for a given school+level (which one
+    is active, when each was created), and for each plan, exactly how
+    many teacher_subject_assignments rows exist for this specific class
+    and how many of them still have a real staff_user_id versus NULL.
+    If assignments are still there but tied to a DIFFERENT plan than the
+    one currently active, they'd correctly show as "0 with a teacher" on
+    whichever page an admin is viewing — not because the data vanished,
+    but because a different plan quietly became active. If the count is
+    genuinely 0 across every plan, the data really was cleared, and the
+    real bug is elsewhere (the save path itself, not plan-switching)."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            plans_html = "<p class='text-xs text-slate-400 italic'>Enter a grade name and education level below to inspect.</p>"
+            if education_level:
+                cur.execute("""
+                    SELECT id, name, is_active, created_at, updated_at FROM timetable_plans
+                    WHERE school_id = %s AND education_level = %s ORDER BY created_at ASC;
+                """, (school_id, education_level))
+                plans = cur.fetchall()
+
+                rows = []
+                for p in plans:
+                    if grade_name and stream:
+                        cur.execute("""
+                            SELECT COUNT(*) AS total, COUNT(staff_user_id) AS with_teacher
+                            FROM teacher_subject_assignments
+                            WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND plan_id = %s;
+                        """, (school_id, grade_name, education_level, stream, p['id']))
+                        counts = cur.fetchone()
+                    else:
+                        counts = {'total': '—', 'with_teacher': '—'}
+                    rows.append(f"""
+                        <tr class="border-b">
+                            <td class="p-2 font-mono text-xs">{p['id']}</td>
+                            <td class="p-2 text-sm font-bold">{esc(p['name'])}</td>
+                            <td class="p-2 text-xs">{'<span class="text-emerald-700 font-bold">ACTIVE</span>' if p['is_active'] else '<span class="text-slate-400">draft</span>'}</td>
+                            <td class="p-2 text-xs">{p['created_at'].strftime('%d %b %Y %H:%M') if p['created_at'] else '—'}</td>
+                            <td class="p-2 text-xs">{p['updated_at'].strftime('%d %b %Y %H:%M') if p['updated_at'] else '—'}</td>
+                            <td class="p-2 text-center font-bold">{counts['total']}</td>
+                            <td class="p-2 text-center font-bold {'text-emerald-700' if counts['with_teacher'] not in (0, '—') else 'text-rose-600'}">{counts['with_teacher']}</td>
+                        </tr>
+                    """)
+                plans_html = f"""
+                <table class="w-full text-left border-collapse">
+                    <thead><tr class="border-b-2 text-[11px] uppercase text-slate-400">
+                        <th class="p-2">Plan ID</th><th class="p-2">Name</th><th class="p-2">Status</th>
+                        <th class="p-2">Created</th><th class="p-2">Last Updated</th>
+                        <th class="p-2 text-center">Assignment Rows (this class)</th><th class="p-2 text-center">...With a Teacher Set</th>
+                    </tr></thead>
+                    <tbody>{"".join(rows) or "<tr><td colspan='7' class='p-4 text-center text-slate-400 italic'>No plans found for this level.</td></tr>"}</tbody>
+                </table>
+                """ if plans else "<p class='text-xs text-rose-600 font-bold'>No timetable_plans exist at all for this school+level — resolve_plan_id would create one on the next page load.</p>"
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Diagnose Teacher Assignments</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-4xl mx-auto space-y-4">
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-lg font-black text-slate-800">🔍 Diagnose: Disappearing Teacher Assignments</h2>
+                <form method="get" class="flex gap-2 mt-3 flex-wrap">
+                    <input type="text" name="grade_name" value="{esc(grade_name)}" placeholder="Grade name, e.g. Grade 8" class="border p-2 rounded-lg text-sm flex-1 min-w-[160px]">
+                    <input type="text" name="education_level" value="{esc(education_level)}" placeholder="Education level, e.g. Junior School" class="border p-2 rounded-lg text-sm flex-1 min-w-[160px]">
+                    <input type="text" name="stream" value="{esc(stream)}" placeholder="Stream, e.g. A or SINGLE STREAM" class="border p-2 rounded-lg text-sm flex-1 min-w-[160px]">
+                    <button type="submit" class="bg-slate-800 hover:bg-slate-900 text-white font-bold px-4 py-2 rounded-lg text-sm">Inspect</button>
+                </form>
+            </div>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                {plans_html}
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
 @app.get("/superadmin/dashboard", response_class=HTMLResponse)
 def superadmin_dashboard(request: Request, backup_started: str = None, backup_error: str = None):
     auth_error = require_superadmin_session(request)
