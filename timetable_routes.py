@@ -1699,6 +1699,18 @@ def add_timetable_period(
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            # Validates plan_id actually still exists and belongs to this
+            # school+level before using it — a plain int = Form(...) trusts
+            # whatever a stale page (open in a browser tab since before an
+            # admin deleted that plan, or an old bookmark/link) happens to
+            # submit. Confirmed as a real, live crash: a browser held onto
+            # plan_id=46 in a hidden form field from before that plan was
+            # deleted, and submitting the form afterward hit a genuine
+            # ForeignKeyViolation, not a graceful fallback. resolve_plan_id
+            # falls back to whichever plan is currently active if the
+            # submitted one is missing or invalid, instead of crashing.
+            plan_id = resolve_plan_id(cur, school_id, education_level, plan_id)
+
             cur.execute(
                 "SELECT COALESCE(MAX(period_order), 0) + 1 AS next_order FROM timetable_periods WHERE school_id = %s AND education_level = %s AND plan_id = %s;",
                 (school_id, education_level, plan_id)
