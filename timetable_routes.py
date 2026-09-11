@@ -3596,8 +3596,8 @@ def timetable_grade_view(school_id: int, request: Request, grade_name: str, educ
 
             cur.execute("""
                 SELECT issues_json FROM timetable_generation_issues
-                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
-            """, (school_id, grade_name, education_level, stream))
+                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND plan_id = %s;
+            """, (school_id, grade_name, education_level, stream, resolve_plan_id(cur, school_id, education_level)))
             issues_row = cur.fetchone()
             # issues_json is either the new {"shortfalls": [...], "relaxed": [...]}
             # shape, or an old bare list from before "relaxed" existed —
@@ -4224,6 +4224,14 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             days = get_school_days(cur, school_id)
             conn.commit()
+
+            # Resolves to whichever plan is currently active for this
+            # school+level (or the school's only plan, for the common
+            # case of a school that's never created a second one) — used
+            # below when recording generation issues, so results from one
+            # plan don't collide with, or silently overwrite, another
+            # plan's own issues for the same class.
+            plan_id = resolve_plan_id(cur, school_id, education_level)
 
             teaching_periods = [p for p in get_periods_for_level(cur, school_id, education_level) if p['is_teaching_period']]
 
@@ -5145,13 +5153,13 @@ def generate_draft_timetable(school_id: int, request: Request, grade_name: str =
             # and the old bare-list shape from before this existed.
             if shortfalls or relaxed_placements:
                 cur.execute("""
-                    INSERT INTO timetable_generation_issues (school_id, grade_name, education_level, stream, issues_json, created_at)
-                    VALUES (%s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (school_id, grade_name, education_level, stream)
+                    INSERT INTO timetable_generation_issues (school_id, grade_name, education_level, stream, plan_id, issues_json, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (school_id, grade_name, education_level, stream, plan_id)
                     DO UPDATE SET issues_json = EXCLUDED.issues_json, created_at = NOW();
-                """, (school_id, grade_name, education_level, stream, json.dumps({"shortfalls": shortfalls, "relaxed": relaxed_placements})))
+                """, (school_id, grade_name, education_level, stream, plan_id, json.dumps({"shortfalls": shortfalls, "relaxed": relaxed_placements})))
             else:
-                cur.execute("DELETE FROM timetable_generation_issues WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;", (school_id, grade_name, education_level, stream))
+                cur.execute("DELETE FROM timetable_generation_issues WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND plan_id = %s;", (school_id, grade_name, education_level, stream, plan_id))
 
             conn.commit()
 
