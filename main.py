@@ -2508,6 +2508,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <a href="/finance/dashboard/{school_id}" class="bg-amber-400 hover:bg-amber-300 text-indigo-950 px-3 py-2 rounded-xl transition font-bold">💰 Finance</a>
                 <a href="/admin/class-teachers/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🧑‍🏫 Class Teachers</a>
                 <a href="/admin/class-rosters/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📋 Class Rosters</a>
+                <a href="/admin/graduated-students/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🎓 Graduated Students</a>
                 <a href="/schemes/manage/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📘 Schemes of Work</a>
                 <a href="/staff/profile/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">👤 My Profile</a>
                 <a href="/logout" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">Log Out</a>
@@ -4298,6 +4299,100 @@ async def staff_profile_update(school_id: int, request: Request):
             conn.commit()
 
     return RedirectResponse(url=f"/staff/profile/{school_id}?saved=1", status_code=303)
+
+
+@app.get("/admin/graduated-students/{school_id}", response_class=HTMLResponse)
+def graduated_students_archive(school_id: int, request: Request, year: str = None):
+    """Where graduated students actually go — there was previously no
+    way to see them at all after "Advance All Classes" set their status
+    to GRADUATED and cleared their class_id, even though their records
+    were never deleted. Joins back through class_promotion_history to
+    show each student's last class and the actual date they graduated,
+    grouped by graduation year (how schools naturally think about
+    alumni — "the class of 2025") rather than as one flat list."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (s.id)
+                    s.id, s.admission_number, s.first_name, s.middle_name, s.last_name,
+                    c.grade_name AS last_grade, c.education_level AS last_level,
+                    h.performed_at AS graduated_at, h.new_active_year AS graduation_year
+                FROM students s
+                LEFT JOIN class_promotion_history_students hs ON hs.student_id = s.id AND hs.new_status = 'GRADUATED'
+                LEFT JOIN class_promotion_history h ON h.id = hs.history_id
+                LEFT JOIN classes c ON c.id = hs.old_class_id
+                WHERE s.school_id = %s AND s.status = 'GRADUATED'
+                ORDER BY s.id, h.performed_at DESC NULLS LAST;
+            """, (school_id,))
+            all_graduates = cur.fetchall()
+
+    def _full_name(st):
+        parts = [st['first_name'], st.get('middle_name'), st['last_name']]
+        return " ".join(esc(p) for p in parts if p)
+
+    groups = {}
+    for g in all_graduates:
+        yr = g['graduation_year'] or (g['graduated_at'].year if g['graduated_at'] else "Unknown Year")
+        groups.setdefault(yr, []).append(g)
+
+    year_keys = sorted([k for k in groups if isinstance(k, int)], reverse=True) + [k for k in groups if not isinstance(k, int)]
+    selected_year = year if year else (str(year_keys[0]) if year_keys else None)
+
+    year_tabs_html = "".join(f"""
+        <a href="/admin/graduated-students/{school_id}?year={urllib.parse.quote(str(yr))}"
+           class="px-4 py-2 rounded-xl text-sm font-bold transition {'bg-indigo-700 text-white' if str(yr) == selected_year else 'bg-white border border-slate-200 text-slate-600 hover:border-indigo-300'}">
+            {esc(str(yr))} <span class="text-xs opacity-70">({len(groups[yr])})</span>
+        </a>
+    """ for yr in year_keys)
+
+    selected_group = []
+    try:
+        selected_group = groups[int(selected_year)]
+    except (ValueError, TypeError, KeyError):
+        selected_group = groups.get(selected_year, [])
+
+    rows_html = "".join(f"""
+        <tr class="border-b border-slate-100 hover:bg-slate-50">
+            <td class="p-3 text-xs font-mono text-slate-500">{esc(st['admission_number'])}</td>
+            <td class="p-3 text-sm font-bold text-slate-800">{_full_name(st)}</td>
+            <td class="p-3 text-xs text-slate-500">{esc(st['last_grade']) if st.get('last_grade') else '—'}</td>
+            <td class="p-3 text-xs text-slate-500">{st['graduated_at'].strftime('%d %b %Y') if st.get('graduated_at') else '—'}</td>
+        </tr>
+    """ for st in selected_group)
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Graduated Students</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-5xl mx-auto">
+            <div class="flex items-center justify-between mb-6">
+                <h1 class="text-xl font-black text-slate-800">🎓 Graduated Students Archive</h1>
+                <a href="/admin/dashboard/{school_id}" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back to Dashboard</a>
+            </div>
+            <div class="flex flex-wrap gap-2 mb-4">
+                {year_tabs_html or "<p class='text-slate-400 text-sm italic'>No graduated students yet — they'll appear here after \"Advance All Classes\" promotes a final-grade student out of the school.</p>"}
+            </div>
+            {"" if not selected_group else f'''
+            <div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left">
+                        <thead><tr class="bg-slate-50 text-[11px] uppercase text-slate-400 border-b">
+                            <th class="p-3">Adm No.</th><th class="p-3">Full Name</th><th class="p-3">Last Class</th><th class="p-3">Graduated On</th>
+                        </tr></thead>
+                        <tbody>{rows_html}</tbody>
+                    </table>
+                </div>
+            </div>
+            '''}
+        </div>
+    </body>
+    </html>
+    """)
 
 
 @app.get("/admin/class-rosters/{school_id}", response_class=HTMLResponse)
