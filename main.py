@@ -2380,47 +2380,6 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
     </div>
     """
 
-    # Sidebar: collapsible, printable per-class roster panels
-    roster_sections = []
-    for (grade_name, disp_stream, education_level, raw_stream) in class_group_order:
-        group_students = grouped_students[(grade_name, disp_stream, education_level, raw_stream)]
-        is_stream_blank = not raw_stream or raw_stream.strip() == "" or raw_stream.upper() == "SINGLE STREAM"
-        stream_param = "SINGLE STREAM" if is_stream_blank else raw_stream
-
-        encoded_grade = urllib.parse.quote(grade_name)
-        encoded_stream = urllib.parse.quote(stream_param)
-        encoded_level = urllib.parse.quote(education_level)
-
-        title_label = grade_name if is_stream_blank else f"{grade_name} — {esc(disp_stream)}"
-
-        rows_html = "".join(f"""
-            <li class='flex justify-between items-center gap-2 py-1.5 border-b border-slate-50 last:border-0'>
-                <span class='text-slate-700 truncate'>{esc(st['first_name'])} {esc(st['middle_name']) + ' ' if st.get('middle_name') else ''}{esc(st['last_name'])}
-                    <span class='text-slate-400 font-mono text-[10px] block'>#{esc(st['admission_number'])}</span>
-                </span>
-                <span class='flex items-center gap-2 shrink-0'>
-                    <a href='/admin/student/edit/{school_id}/{st['id']}' class='text-slate-500 hover:text-slate-800 text-[10px] font-bold'>Edit</a>
-                    <a href='/admin/scores/manage/{school_id}?student_id={st['id']}' class='text-blue-600 hover:text-blue-800 text-[10px] font-bold'>Scores →</a>
-                </span>
-            </li>
-        """ for st in group_students)
-
-        roster_sections.append(f"""
-        <details class='border border-slate-100 rounded-xl overflow-hidden'>
-            <summary class='cursor-pointer list-none flex items-center justify-between px-3 py-2.5 bg-slate-50 hover:bg-slate-100 transition'>
-                <span class='text-xs font-bold text-slate-700'>{title_label}</span>
-                <span class='flex items-center gap-2'>
-                    <span class='text-[10px] bg-white border border-slate-200 px-1.5 py-0.5 rounded-full font-bold text-slate-500'>{len(group_students)}</span>
-                    <a href='/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}' target='_blank' onclick='event.stopPropagation()' class='text-[10px] text-emerald-700 font-bold hover:underline'>🖨 Print</a>
-                </span>
-            </summary>
-            <ul class='px-3 py-2 text-xs max-h-56 overflow-y-auto'>
-                {rows_html or "<li class='text-slate-400 italic py-2'>No students</li>"}
-            </ul>
-        </details>
-        """)
-    roster_sidebar_html = "".join(roster_sections)
-
     # Staff panel: list with activate/deactivate/delete controls
     staff_rows = []
     for m in staff_members:
@@ -2548,6 +2507,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <a href="/admin/school/profile/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🏫 School Profile</a>
                 <a href="/finance/dashboard/{school_id}" class="bg-amber-400 hover:bg-amber-300 text-indigo-950 px-3 py-2 rounded-xl transition font-bold">💰 Finance</a>
                 <a href="/admin/class-teachers/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🧑‍🏫 Class Teachers</a>
+                <a href="/admin/class-rosters/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📋 Class Rosters</a>
                 <a href="/schemes/manage/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📘 Schemes of Work</a>
                 <a href="/staff/profile/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">👤 My Profile</a>
                 <a href="/logout" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">Log Out</a>
@@ -2591,12 +2551,12 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
 
                 <!-- Class Rosters -->
                 <div class="pt-5 border-t border-white/10">
-                    <h2 class="text-[11px] font-bold uppercase tracking-wider text-teal-300 flex items-center gap-1.5 mb-2.5">
-                        <span class="w-2 h-2 rounded-full bg-teal-400"></span> Class Rosters
-                    </h2>
-                    <div class="bg-white rounded-xl p-2.5 space-y-2 max-h-72 overflow-y-auto pr-1">
-                        {roster_sidebar_html or "<p class='text-slate-400 text-xs italic px-1 py-3'>No classes with students yet.</p>"}
-                    </div>
+                    <a href="/admin/class-rosters/{school_id}" class="flex items-center justify-between bg-white hover:bg-slate-50 rounded-xl px-4 py-3 transition">
+                        <span class="flex items-center gap-1.5 text-xs font-bold text-slate-700">
+                            <span class="w-2 h-2 rounded-full bg-teal-400"></span> Class Rosters
+                        </span>
+                        <span class="text-[10px] font-bold text-indigo-600">View & Edit →</span>
+                    </a>
                 </div>
 
                 <!-- Subscription Status -->
@@ -4298,6 +4258,124 @@ async def staff_profile_update(school_id: int, request: Request):
             conn.commit()
 
     return RedirectResponse(url=f"/staff/profile/{school_id}?saved=1", status_code=303)
+
+
+@app.get("/admin/class-rosters/{school_id}", response_class=HTMLResponse)
+def class_rosters_page(school_id: int, request: Request, grade_name: str = None, stream: str = None, education_level: str = None):
+    """A proper, dedicated, full-page class roster — replacing the
+    cramped sidebar panel (a small collapsible list, max-height 56 with
+    a scrollbar, tiny text) that made browsing or editing more than a
+    couple of students genuinely awkward. Every class is listed with its
+    student count; picking one shows the full roster in a spacious
+    table with an easy Edit link per student, reusing the existing
+    per-student edit page rather than building a new one."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT c.grade_name, c.education_level, s.stream, COUNT(*) AS student_count
+                FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                GROUP BY c.grade_name, c.education_level, s.stream
+                ORDER BY c.education_level, c.grade_name, s.stream;
+            """, (school_id,))
+            class_groups = cur.fetchall()
+
+            selected_students = []
+            if grade_name and education_level:
+                stream_filter = stream or "SINGLE STREAM"
+                cur.execute("""
+                    SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name,
+                           s.stream, s.status, s.mother_phone, s.father_phone, s.knec_lan
+                    FROM students s
+                    JOIN classes c ON s.class_id = c.id
+                    WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
+                      AND (s.status IS NULL OR s.status != 'GRADUATED')
+                      AND (%s = 'SINGLE STREAM' OR s.stream = %s)
+                    ORDER BY s.admission_number ASC;
+                """, (school_id, grade_name, education_level, stream_filter, stream_filter))
+                selected_students = cur.fetchall()
+
+    def _class_key(g, e, s):
+        is_blank = not s or s.strip() == "" or s.upper() == "SINGLE STREAM"
+        return (g, e, "SINGLE STREAM" if is_blank else s)
+
+    is_selected = lambda g, e, s: grade_name == g and education_level == e and (stream or "SINGLE STREAM") == _class_key(g, e, s)[2]
+
+    class_list_html = "".join(f"""
+        <a href="/admin/class-rosters/{school_id}?grade_name={urllib.parse.quote(cg['grade_name'])}&education_level={urllib.parse.quote(cg['education_level'])}&stream={urllib.parse.quote(_class_key(cg['grade_name'], cg['education_level'], cg['stream'])[2])}"
+           class="flex items-center justify-between px-4 py-3 rounded-xl border transition {'bg-indigo-700 border-indigo-700 text-white' if is_selected(cg['grade_name'], cg['education_level'], cg['stream']) else 'bg-white border-slate-200 hover:border-indigo-300 text-slate-700'}">
+            <span class="text-sm font-bold">{esc(cg['grade_name'])}{' — ' + esc(cg['stream']) if cg['stream'] and cg['stream'].upper() != 'SINGLE STREAM' else ''}</span>
+            <span class="text-xs font-bold {'text-indigo-200' if is_selected(cg['grade_name'], cg['education_level'], cg['stream']) else 'text-slate-400'}">{cg['student_count']}</span>
+        </a>
+    """ for cg in class_groups)
+
+    def _full_name(st):
+        parts = [st['first_name'], st.get('middle_name'), st['last_name']]
+        return " ".join(esc(p) for p in parts if p)
+
+    student_rows_html = "".join(f"""
+        <tr class="border-b border-slate-100 hover:bg-slate-50">
+            <td class="p-3 text-xs font-mono text-slate-500">{esc(st['admission_number'])}</td>
+            <td class="p-3 text-sm font-bold text-slate-800">{_full_name(st)}</td>
+            <td class="p-3 text-xs text-slate-500">{esc(st.get('mother_phone') or st.get('father_phone') or '—')}</td>
+            <td class="p-3 text-xs text-slate-500">{esc(st.get('knec_lan') or '—')}</td>
+            <td class="p-3 text-xs"><span class="px-2 py-0.5 rounded-full font-bold {'bg-emerald-50 text-emerald-700' if (st.get('status') or 'ACTIVE') == 'ACTIVE' else 'bg-amber-50 text-amber-700'}">{esc(st.get('status') or 'ACTIVE')}</span></td>
+            <td class="p-3 text-right">
+                <a href="/admin/student/edit/{school_id}/{st['id']}" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold px-3 py-1.5 rounded-lg">✏️ Edit</a>
+                <a href="/admin/scores/manage/{school_id}?student_id={st['id']}" class="bg-slate-50 hover:bg-slate-100 text-slate-600 text-xs font-bold px-3 py-1.5 rounded-lg ml-1">Scores</a>
+            </td>
+        </tr>
+    """ for st in selected_students)
+
+    encoded_grade = urllib.parse.quote(grade_name or "")
+    encoded_level = urllib.parse.quote(education_level or "")
+    encoded_stream = urllib.parse.quote(stream or "SINGLE STREAM")
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Class Rosters</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-6xl mx-auto">
+            <div class="flex items-center justify-between mb-6">
+                <h1 class="text-xl font-black text-slate-800">📋 Class Rosters</h1>
+                <a href="/admin/dashboard/{school_id}" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back to Dashboard</a>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-6">
+                <div class="md:col-span-1 space-y-2">
+                    <p class="text-xs font-bold text-slate-400 uppercase tracking-wider px-1">Classes</p>
+                    {class_list_html or "<p class='text-slate-400 text-xs italic px-1'>No classes with students yet.</p>"}
+                </div>
+                <div class="md:col-span-3">
+                    {"" if not (grade_name and education_level) else f'''
+                    <div class="bg-white rounded-2xl border shadow-xs overflow-hidden">
+                        <div class="flex items-center justify-between p-4 border-b bg-slate-50">
+                            <h2 class="text-sm font-black text-slate-800">{esc(grade_name)}{" — " + esc(stream) if stream and stream.upper() != "SINGLE STREAM" else ""} ({len(selected_students)} students)</h2>
+                            <a href="/admin/students/roster/{school_id}?grade_name={encoded_grade}&stream={encoded_stream}&education_level={encoded_level}" target="_blank" class="text-xs font-bold text-emerald-700 hover:underline">🖨 Print This Roster</a>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left">
+                                <thead><tr class="bg-slate-50 text-[11px] uppercase text-slate-400 border-b">
+                                    <th class="p-3">Adm No.</th><th class="p-3">Full Name</th><th class="p-3">Parent Phone</th>
+                                    <th class="p-3">KNEC LAN</th><th class="p-3">Status</th><th class="p-3 text-right">Actions</th>
+                                </tr></thead>
+                                <tbody>{student_rows_html or "<tr><td colspan='6' class='p-6 text-center text-slate-400 italic'>No students in this class yet.</td></tr>"}</tbody>
+                            </table>
+                        </div>
+                    </div>
+                    '''}
+                    {"<div class='bg-white rounded-2xl border shadow-xs p-10 text-center text-slate-400 text-sm'>← Pick a class to view its roster.</div>" if not (grade_name and education_level) else ""}
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
 
 
 @app.get("/admin/students/roster/{school_id}", response_class=HTMLResponse)
