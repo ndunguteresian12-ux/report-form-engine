@@ -346,6 +346,47 @@ def bootstrap_timetable_schema():
                 CREATE INDEX IF NOT EXISTS idx_timetable_slots_lookup ON timetable_slots (school_id, grade_name, education_level, stream);
                 CREATE INDEX IF NOT EXISTS idx_timetable_slots_teacher ON timetable_slots (school_id, staff_user_id, day_of_week, period_id);
 
+                -- Senior School electives: students from DIFFERENT subject
+                -- combinations genuinely mix for the same elective (e.g.
+                -- every Grade 11 student taking Physics meets together,
+                -- regardless of which combination/stream they belong to)
+                -- — confirmed directly against how real client schools
+                -- actually run this, not assumed. An "elective block" is a
+                -- named, shared set of (day, period) slots that are THE
+                -- SAME across every combination in a grade; during a
+                -- block, each elective subject runs simultaneously with
+                -- its own teacher, and each combination's students attend
+                -- whichever elective their own combination includes.
+                CREATE TABLE IF NOT EXISTS elective_blocks (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    grade_name VARCHAR(100) NOT NULL,
+                    name VARCHAR(100) NOT NULL,
+                    UNIQUE(school_id, grade_name, name)
+                );
+                -- The actual (day, period) occurrences of a block each
+                -- week — a block can meet more than once (e.g. Physics
+                -- electives might run twice weekly), and every subject in
+                -- the block shares these exact same slots.
+                CREATE TABLE IF NOT EXISTS elective_block_periods (
+                    id SERIAL PRIMARY KEY,
+                    block_id INTEGER REFERENCES elective_blocks(id) ON DELETE CASCADE,
+                    day_of_week VARCHAR(20) NOT NULL,
+                    period_id INTEGER REFERENCES timetable_periods(id) ON DELETE CASCADE,
+                    UNIQUE(block_id, day_of_week, period_id)
+                );
+                -- Which elective subjects run during a given block, and
+                -- who teaches each one. A student's own combination
+                -- (combination_subjects) determines which of these
+                -- subjects they personally attend during this block.
+                CREATE TABLE IF NOT EXISTS elective_block_subjects (
+                    id SERIAL PRIMARY KEY,
+                    block_id INTEGER REFERENCES elective_blocks(id) ON DELETE CASCADE,
+                    learning_area_id INTEGER REFERENCES learning_areas(id) ON DELETE CASCADE,
+                    staff_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    UNIQUE(block_id, learning_area_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS teacher_availability (
                     id SERIAL PRIMARY KEY,
                     school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
@@ -514,6 +555,18 @@ def bootstrap_timetable_schema():
             except Exception as e:
                 conn.rollback()
                 print(f"[timetable multi-plan migration] Could not add is_preplaced to timetable_slots: {e}")
+
+            # Marks a slot as belonging to a Senior School elective block —
+            # multiple slots sharing the same elective_block_id (one per
+            # participating combination/stream) are the SAME physical
+            # lesson, not a genuine teacher double-booking; see
+            # _find_timetable_collisions, which must treat them that way.
+            try:
+                cur.execute("ALTER TABLE timetable_slots ADD COLUMN IF NOT EXISTS elective_block_id INTEGER REFERENCES elective_blocks(id) ON DELETE SET NULL;")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[timetable elective blocks migration] Could not add elective_block_id to timetable_slots: {e}")
 
             # Widen every unique constraint that predates plan_id — without
             # this, a second plan trying to insert e.g. a teaching
@@ -2225,11 +2278,24 @@ def _find_timetable_collisions(cur, school_id: int, education_level: str = None)
     """Returns a list of collision groups — each group is a list of slot
     rows for the same teacher, same day/period, across 2+ different
     classes. Pure read, no side effects. Shared by the collision-check
-    display page and the whole-level Test & Generate flow."""
+    display page and the whole-level Test & Generate flow.
+
+    Deliberately excludes one specific case that looks identical to a
+    double-booking but isn't: a Senior School elective block generates
+    one timetable_slots row PER PARTICIPATING COMBINATION (so each
+    combination's own grid correctly shows its students' elective) —
+    meaning the same teacher, teaching the same actual elective subject,
+    legitimately appears at the same day/period across several different
+    (grade_name, stream) rows. Confirmed real (students mix across
+    combinations for electives), not a bug. Still flags a genuine
+    problem if it somehow occurs: the same teacher assigned to two
+    DIFFERENT subjects that overlap, even inside the same block — that's
+    a real conflict a teacher can't actually resolve by being in two
+    places at once, block or no block."""
     query = """
         SELECT ts.day_of_week, ts.period_id, tp.label AS period_label, tp.start_time, tp.end_time,
                ts.staff_user_id, u.full_name, u.email,
-               ts.grade_name, ts.stream, ts.education_level,
+               ts.grade_name, ts.stream, ts.education_level, ts.elective_block_id,
                COALESCE(la.name, cs.name, ca.name) AS subject_name
         FROM timetable_slots ts
         JOIN timetable_periods tp ON ts.period_id = tp.id
@@ -2293,7 +2359,13 @@ def _find_timetable_collisions(cur, school_id: int, education_level: str = None)
             if len(overlapping) > 1:
                 distinct_classes = {(s['grade_name'], s['stream']) for s in overlapping}
                 if len(distinct_classes) > 1:
-                    collision_groups.append(overlapping)
+                    block_ids = {s['elective_block_id'] for s in overlapping}
+                    subject_names = {s['subject_name'] for s in overlapping}
+                    is_same_elective_block_lesson = (
+                        len(block_ids) == 1 and None not in block_ids and len(subject_names) == 1
+                    )
+                    if not is_same_elective_block_lesson:
+                        collision_groups.append(overlapping)
                 used.add(i)
 
     return collision_groups
