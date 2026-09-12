@@ -728,6 +728,72 @@ def bootstrap_timetable_schema():
                 conn.rollback()
                 print(f"[timetable multi-plan migration] Backfill failed: {e}")
 
+            # subject_constraints ("Same-Time Subject Rules" — e.g. Maths
+            # and Physics forbidden on the same day) was created with NO
+            # unique constraint at all, ever — confirmed via systematic
+            # audit, not assumed. It was never in the plan_id-widening
+            # list either, so nothing has ever created one. This means
+            # add_subject_constraint's own INSERT ... ON CONFLICT has
+            # likely NEVER succeeded in production: every single save
+            # attempt would hit InvalidColumnReference (no unique
+            # constraint matches), the same failure mode already
+            # confirmed and fixed for timetable_generation_issues.
+            # Placed AFTER the plan_id backfill above (not before) so
+            # plan_id is actually populated by the time the dedup step
+            # runs — deduplicating while plan_id is still NULL for
+            # everything wouldn't group rows correctly, since SQL treats
+            # every NULL as distinct from every other NULL. Deduplicates
+            # first (keeping the newest row per group) since a table that
+            # was NEVER constrained could easily have accumulated
+            # duplicate rows over time that would make ADD CONSTRAINT
+            # itself fail outright.
+            try:
+                cur.execute("""
+                    DELETE FROM subject_constraints a USING subject_constraints b
+                    WHERE a.id < b.id
+                      AND a.school_id = b.school_id AND a.grade_name = b.grade_name AND a.education_level = b.education_level
+                      AND a.stream = b.stream AND a.subject_a_id = b.subject_a_id AND a.subject_b_id = b.subject_b_id
+                      AND a.constraint_type = b.constraint_type AND COALESCE(a.plan_id, -1) = COALESCE(b.plan_id, -1);
+                """)
+                cur.execute("""
+                    ALTER TABLE subject_constraints
+                    ADD CONSTRAINT subject_constraints_unique
+                    UNIQUE (school_id, grade_name, education_level, stream, subject_a_id, subject_b_id, constraint_type, plan_id);
+                """)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[timetable subject_constraints migration] Could not add unique constraint (may already exist): {e}")
+
+            # timetable_slots — the single most important table in the
+            # whole timetabling system — was ALSO created with no unique
+            # constraint at all, confirmed via the same systematic audit.
+            # update_timetable_slot's own INSERT ... ON CONFLICT targets
+            # exactly (school_id, grade_name, education_level, stream,
+            # day_of_week, period_id), meaning manually editing a single
+            # timetable cell has likely never actually worked in
+            # production — every save attempt would hit the identical
+            # InvalidColumnReference failure. Same dedup-then-constrain
+            # approach, for the same reason: an unconstrained table this
+            # central could easily have accumulated real duplicates.
+            try:
+                cur.execute("""
+                    DELETE FROM timetable_slots a USING timetable_slots b
+                    WHERE a.id < b.id
+                      AND a.school_id = b.school_id AND a.grade_name = b.grade_name AND a.education_level = b.education_level
+                      AND a.stream = b.stream AND a.day_of_week = b.day_of_week AND a.period_id = b.period_id
+                      AND COALESCE(a.plan_id, -1) = COALESCE(b.plan_id, -1);
+                """)
+                cur.execute("""
+                    ALTER TABLE timetable_slots
+                    ADD CONSTRAINT timetable_slots_unique
+                    UNIQUE (school_id, grade_name, education_level, stream, day_of_week, period_id, plan_id);
+                """)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print(f"[timetable timetable_slots migration] Could not add unique constraint (may already exist): {e}")
+
 
 def resolve_plan_id(cur, school_id: int, education_level: str, plan_id_param: int = None) -> int:
     """The single source of truth for "which plan are we actually working
@@ -2540,10 +2606,20 @@ def add_custom_subject(school_id: int, request: Request, education_level: str = 
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            # Confirmed as a real bug via systematic audit: the widening
+            # migration (see the bootstrap list a few hundred lines up)
+            # assumes a 3-column constraint on this table that was never
+            # actually created, then widens the column LIST to include
+            # plan_id regardless — meaning the live constraint ends up as
+            # 4 columns while this INSERT was still targeting the old
+            # 3-column shape. Exactly the same failure mode that already
+            # crashed timetable_generation_issues in production
+            # (InvalidColumnReference: no unique constraint matches).
+            plan_id = resolve_plan_id(cur, school_id, education_level)
             cur.execute("""
-                INSERT INTO timetable_custom_subjects (school_id, education_level, name) VALUES (%s, %s, %s)
-                ON CONFLICT (school_id, education_level, name) DO NOTHING;
-            """, (school_id, education_level, name))
+                INSERT INTO timetable_custom_subjects (school_id, education_level, name, plan_id) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (school_id, education_level, name, plan_id) DO NOTHING;
+            """, (school_id, education_level, name, plan_id))
             conn.commit()
 
     return RedirectResponse(url=f"/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(education_level)}", status_code=303)
@@ -3583,11 +3659,12 @@ def add_subject_constraint(
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
+            plan_id = resolve_plan_id(cur, school_id, education_level)
             cur.execute("""
-                INSERT INTO subject_constraints (school_id, grade_name, education_level, stream, subject_a_id, subject_b_id, constraint_type)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (school_id, grade_name, education_level, stream, subject_a_id, subject_b_id, constraint_type) DO NOTHING;
-            """, (school_id, grade_name, education_level, stream, a, b, constraint_type))
+                INSERT INTO subject_constraints (school_id, grade_name, education_level, stream, subject_a_id, subject_b_id, constraint_type, plan_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (school_id, grade_name, education_level, stream, subject_a_id, subject_b_id, constraint_type, plan_id) DO NOTHING;
+            """, (school_id, grade_name, education_level, stream, a, b, constraint_type, plan_id))
             conn.commit()
 
     encoded_grade = urllib.parse.quote(grade_name)
@@ -5303,6 +5380,8 @@ def update_timetable_slot(
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            plan_id = resolve_plan_id(cur, school_id, education_level)
+
             cur.execute("SELECT period_type, is_teaching_period, label FROM timetable_periods WHERE id = %s;", (period_id,))
             period_row = cur.fetchone()
             period_type = (period_row.get('period_type') if period_row else None) or ('teaching' if (period_row and period_row['is_teaching_period']) else 'break')
@@ -5315,8 +5394,8 @@ def update_timetable_slot(
             if not subject_choice:
                 cur.execute("""
                     DELETE FROM timetable_slots
-                    WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND day_of_week = %s AND period_id = %s;
-                """, (school_id, grade_name, education_level, stream, day_of_week, period_id))
+                    WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s AND day_of_week = %s AND period_id = %s AND plan_id = %s;
+                """, (school_id, grade_name, education_level, stream, day_of_week, period_id, plan_id))
                 conn.commit()
                 return RedirectResponse(url=redirect_url, status_code=303)
 
@@ -5477,12 +5556,12 @@ def update_timetable_slot(
                     )
 
             cur.execute("""
-                INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, custom_subject_id, co_curricular_activity_id, staff_user_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (school_id, grade_name, education_level, stream, day_of_week, period_id)
+                INSERT INTO timetable_slots (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, custom_subject_id, co_curricular_activity_id, staff_user_id, plan_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (school_id, grade_name, education_level, stream, day_of_week, period_id, plan_id)
                 DO UPDATE SET learning_area_id = EXCLUDED.learning_area_id, custom_subject_id = EXCLUDED.custom_subject_id,
                               co_curricular_activity_id = EXCLUDED.co_curricular_activity_id, staff_user_id = EXCLUDED.staff_user_id;
-            """, (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, custom_subject_id, co_curricular_activity_id, teacher_id))
+            """, (school_id, grade_name, education_level, stream, day_of_week, period_id, learning_area_id, custom_subject_id, co_curricular_activity_id, teacher_id, plan_id))
             conn.commit()
 
     return RedirectResponse(url=redirect_url, status_code=303)
