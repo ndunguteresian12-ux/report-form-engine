@@ -994,6 +994,23 @@ def bootstrap_database_schema():
                     new_status VARCHAR(30)
                 );
 
+                -- A school's own custom grading bands, replacing the
+                -- standard KNEC bands ONLY for that school. Empty for
+                -- every school today (which is exactly "use the standard
+                -- KNEC bands") — see get_grading_bands and
+                -- evaluate_performance_metrics's own docstrings for how
+                -- this gets picked up.
+                CREATE TABLE IF NOT EXISTS school_grading_bands (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    min_score NUMERIC(6, 2) NOT NULL,
+                    max_score NUMERIC(6, 2) NOT NULL,
+                    code VARCHAR(20) NOT NULL,
+                    descriptor VARCHAR(100) NOT NULL,
+                    points INTEGER NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS learning_areas (
                     id SERIAL PRIMARY KEY,
                     education_level VARCHAR(100) NOT NULL,
@@ -1302,40 +1319,67 @@ def log_audit_action(cur, request: Request, school_id: int, action: str, details
     except Exception as e:
         logger.warning(f"Audit log entry failed (non-fatal, action was not blocked): {e}")
 
-def evaluate_performance_metrics(score: float) -> dict:
+# Standard KNEC grading bands — the default every school starts with,
+# and what remains in effect unless a school explicitly defines its own
+# custom bands via school_grading_bands. Kept as an ordered list of
+# dicts (rather than the old if/elif chain) specifically so the same
+# lookup logic in evaluate_performance_metrics can walk EITHER this
+# default list OR a school's custom one — one evaluation function, two
+# possible band sources, rather than duplicating the lookup logic per
+# grading system.
+STANDARD_KNEC_BANDS = [
+    {"min_score": 0, "max_score": 20, "code": "BE2", "points": 1, "desc": "Below Expectations"},
+    {"min_score": 20, "max_score": 30, "code": "BE1", "points": 2, "desc": "Below Expectations"},
+    {"min_score": 30, "max_score": 40, "code": "AE2", "points": 3, "desc": "Approaching Expectations"},
+    {"min_score": 40, "max_score": 50, "code": "AE1", "points": 4, "desc": "Approaching Expectations"},
+    {"min_score": 50, "max_score": 60, "code": "ME2", "points": 5, "desc": "Meeting Expectations"},
+    {"min_score": 60, "max_score": 76, "code": "ME1", "points": 6, "desc": "Meeting Expectations"},
+    {"min_score": 76, "max_score": 90, "code": "EE2", "points": 7, "desc": "Exceeding Expectations"},
+    {"min_score": 90, "max_score": 100, "code": "EE1", "points": 8, "desc": "Exceeding Expectations"},
+]
+
+
+def evaluate_performance_metrics(score: float, bands: list = None) -> dict:
+    """Evaluates a 0-100 score against a set of grading bands — the
+    standard KNEC bands by default, or a school's own custom bands if
+    passed in (see get_grading_bands below, which resolves which one a
+    given school should actually use). Every existing call site that
+    doesn't pass `bands` gets EXACTLY today's behavior unchanged — this
+    is additive, not a breaking change to any of the many places that
+    already call this function.
+
+    Bounds are exclusive on the upper end (matching each band's
+    max_score to the next band's min_score) except the final band's
+    100, so bands connect with zero gaps — a school defining custom
+    bands must cover 0-100 with no gaps for this same guarantee to hold
+    for them; validation for that lives where bands are saved, not here."""
     try:
         val = float(score)
     except (TypeError, ValueError):
         return {"pld": "N/A", "points": 0, "desc": "No Evaluation"}
 
-    # Exclusive upper bounds (except the final 100) so every tier connects
-    # directly to the next with zero gaps. The previous version used
-    # inclusive bounds on both ends of every tier (e.g. 76<=val<=89 then
-    # 90<=val<=100), which left every boundary — 19/20, 29/30, ..., 89/90 —
-    # with a gap that swallowed any fractional score landing exactly there
-    # (e.g. 89.3), silently misclassifying it as "Out of Range" with 0
-    # points. This became much more likely to actually trigger once scores
-    # started being computed as weighted averages (naturally fractional)
-    # rather than always whole-number exam marks.
-    if 0 <= val < 20:
-        return {"pld": "BE2", "points": 1, "desc": "Below Expectations"}
-    elif 20 <= val < 30:
-        return {"pld": "BE1", "points": 2, "desc": "Below Expectations"}
-    elif 30 <= val < 40:
-        return {"pld": "AE2", "points": 3, "desc": "Approaching Expectations"}
-    elif 40 <= val < 50:
-        return {"pld": "AE1", "points": 4, "desc": "Approaching Expectations"}
-    elif 50 <= val < 60:
-        return {"pld": "ME2", "points": 5, "desc": "Meeting Expectations"}
-    elif 60 <= val < 76:
-        return {"pld": "ME1", "points": 6, "desc": "Meeting Expectations"}
-    elif 76 <= val < 90:
-        return {"pld": "EE2", "points": 7, "desc": "Exceeding Expectations"}
-    elif 90 <= val <= 100:
-        return {"pld": "EE1", "points": 8, "desc": "Exceeding Expectations"}
+    active_bands = bands or STANDARD_KNEC_BANDS
+    last_index = len(active_bands) - 1
+    for i, band in enumerate(active_bands):
+        is_top_band = (i == last_index)
+        if band['min_score'] <= val < band['max_score'] or (is_top_band and val == band['max_score']):
+            return {"pld": band['code'], "points": band['points'], "desc": band['desc']}
     return {"pld": "N/A", "points": 0, "desc": "Out of Range"}
 
-POINTS_TO_PLD = {8: "EE1", 7: "EE2", 6: "ME1", 5: "ME2", 4: "AE1", 3: "AE2", 2: "BE1", 1: "BE2"}
+
+def get_grading_bands(cur, school_id: int):
+    """Returns a school's own custom grading bands (ordered by
+    min_score) if they've defined any, else None — meaning
+    evaluate_performance_metrics should fall back to STANDARD_KNEC_BANDS.
+    A school with zero rows in school_grading_bands is exactly a school
+    that has never customized anything, which is every school today."""
+    cur.execute(
+        "SELECT min_score, max_score, code, points, descriptor AS desc FROM school_grading_bands WHERE school_id = %s ORDER BY min_score ASC;",
+        (school_id,)
+    )
+    rows = cur.fetchall()
+    return rows if rows else None
+
 
 # These Junior School subjects are assessed as two separate papers (each with
 # its own "out of" max), rather than a single combined mark. Matched against
@@ -2509,6 +2553,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
                 <a href="/admin/class-teachers/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🧑‍🏫 Class Teachers</a>
                 <a href="/admin/class-rosters/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📋 Class Rosters</a>
                 <a href="/admin/graduated-students/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">🎓 Graduated Students</a>
+                <a href="/admin/grading-system/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📊 Grading System</a>
                 <a href="/schemes/manage/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">📘 Schemes of Work</a>
                 <a href="/staff/profile/{school_id}" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">👤 My Profile</a>
                 <a href="/logout" class="bg-white/10 hover:bg-white/20 text-white border border-white/20 px-3 py-2 rounded-xl transition">Log Out</a>
@@ -4395,6 +4440,163 @@ def graduated_students_archive(school_id: int, request: Request, year: str = Non
     """)
 
 
+@app.get("/admin/grading-system/{school_id}", response_class=HTMLResponse)
+def grading_system_page(school_id: int, request: Request, saved: str = None, error: str = None):
+    """Lets a school view and optionally replace the standard KNEC
+    grading bands with their own. Shows whichever set is ACTUALLY in
+    effect right now — the school's own custom bands if they've saved
+    any, otherwise the standard KNEC bands exactly as evaluate_
+    performance_metrics would apply them — so what's on this page is
+    never out of sync with what a report card would actually show."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            custom_bands = get_grading_bands(cur, school_id)
+    is_custom = custom_bands is not None
+    active_bands = custom_bands if is_custom else STANDARD_KNEC_BANDS
+
+    rows_html = "".join(f"""
+        <div class="grid grid-cols-4 gap-2 items-center">
+            <input type="text" name="code_{i}" value="{esc(b['code'])}" placeholder="Code (e.g. A, EE1)" class="border p-2 rounded-lg text-sm" required>
+            <input type="text" name="descriptor_{i}" value="{esc(b['desc'])}" placeholder="Descriptor" class="border p-2 rounded-lg text-sm" required>
+            <input type="number" name="points_{i}" value="{b['points']}" placeholder="Points" class="border p-2 rounded-lg text-sm" required>
+            <div class="flex items-center gap-1">
+                <input type="number" step="0.01" name="min_score_{i}" value="{b['min_score']}" placeholder="Min score" class="border p-2 rounded-lg text-sm w-full" required {"readonly" if i == 0 else ""}>
+                <button type="button" onclick="this.closest('.grid').remove()" class="text-rose-500 hover:text-rose-700 font-bold px-2">✕</button>
+            </div>
+        </div>
+    """ for i, b in enumerate(active_bands))
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Grading System</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-3xl mx-auto">
+            <div class="flex items-center justify-between mb-6">
+                <h1 class="text-xl font-black text-slate-800">📊 Grading System</h1>
+                <a href="/admin/dashboard/{school_id}" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back to Dashboard</a>
+            </div>
+            <div class="bg-white rounded-2xl border shadow-xs p-6">
+                <div class="mb-4 p-3 rounded-xl {'bg-indigo-50 border border-indigo-200' if is_custom else 'bg-emerald-50 border border-emerald-200'}">
+                    <p class="text-sm font-bold {'text-indigo-800' if is_custom else 'text-emerald-800'}">
+                        {'📝 Using a CUSTOM grading system' if is_custom else '✅ Using the STANDARD KNEC grading system'}
+                    </p>
+                </div>
+                {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-3 py-2.5 rounded-lg mb-4'>{esc(error)}</div>" if error else ""}
+                {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-3 py-2.5 rounded-lg mb-4'>✅ Grading system saved.</div>" if saved else ""}
+                <p class="text-xs text-slate-400 mb-4">Each band's minimum score chains directly to the next band's minimum — enter only the score each band STARTS at, from lowest to highest. The top band automatically extends to 100. This guarantees no gaps or overlaps between bands.</p>
+                <form action="/api/v1/admin/grading-system/save/{school_id}" method="post" class="space-y-3">
+                    <div id="bands-container" class="space-y-2">
+                        <div class="grid grid-cols-4 gap-2 text-[10px] font-bold uppercase text-slate-400 px-1">
+                            <span>Code</span><span>Descriptor</span><span>Points</span><span>Min Score</span>
+                        </div>
+                        {rows_html}
+                    </div>
+                    <button type="button" onclick="addBandRow()" class="text-xs font-bold text-indigo-700 hover:underline">+ Add another band</button>
+                    <div class="flex gap-3 pt-4 border-t">
+                        <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 px-5 rounded-lg text-sm transition">Save Grading System</button>
+                        {f'<a href="/api/v1/admin/grading-system/reset/{school_id}" onclick="return confirm(\'Reset to the standard KNEC grading system? Your custom bands will be deleted.\');" class="bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold py-2.5 px-5 rounded-lg text-sm transition">Reset to KNEC Standard</a>' if is_custom else ""}
+                    </div>
+                </form>
+            </div>
+        </div>
+        <script>
+            let bandCount = {len(active_bands)};
+            function addBandRow() {{
+                const container = document.getElementById('bands-container');
+                const row = document.createElement('div');
+                row.className = 'grid grid-cols-4 gap-2 items-center';
+                row.innerHTML = `
+                    <input type="text" name="code_${{bandCount}}" placeholder="Code (e.g. A, EE1)" class="border p-2 rounded-lg text-sm" required>
+                    <input type="text" name="descriptor_${{bandCount}}" placeholder="Descriptor" class="border p-2 rounded-lg text-sm" required>
+                    <input type="number" name="points_${{bandCount}}" placeholder="Points" class="border p-2 rounded-lg text-sm" required>
+                    <div class="flex items-center gap-1">
+                        <input type="number" step="0.01" name="min_score_${{bandCount}}" placeholder="Min score" class="border p-2 rounded-lg text-sm w-full" required>
+                        <button type="button" onclick="this.closest('.grid').remove()" class="text-rose-500 hover:text-rose-700 font-bold px-2">✕</button>
+                    </div>
+                `;
+                container.appendChild(row);
+                bandCount++;
+            }}
+        </script>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/api/v1/admin/grading-system/save/{school_id}")
+async def save_grading_system(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form = await request.form()
+
+    # Collect every submitted band by its index suffix (code_0, code_1, ...)
+    indices = sorted({int(k.split('_')[-1]) for k in form.keys() if k.startswith('code_')})
+    parsed_bands = []
+    try:
+        for i in indices:
+            code = (form.get(f"code_{i}") or "").strip()
+            descriptor = (form.get(f"descriptor_{i}") or "").strip()
+            points = int(form.get(f"points_{i}") or 0)
+            min_score = float(form.get(f"min_score_{i}") or 0)
+            if not code or not descriptor:
+                return RedirectResponse(url=f"/admin/grading-system/{school_id}?error=Every+band+needs+a+code+and+a+descriptor.", status_code=303)
+            parsed_bands.append({"code": code, "descriptor": descriptor, "points": points, "min_score": min_score})
+    except (ValueError, TypeError):
+        return RedirectResponse(url=f"/admin/grading-system/{school_id}?error=Points+and+minimum+score+must+be+numbers.", status_code=303)
+
+    if len(parsed_bands) < 2:
+        return RedirectResponse(url=f"/admin/grading-system/{school_id}?error=Define+at+least+2+bands.", status_code=303)
+
+    # Sort by min_score so the "chains to the next band" rule below is
+    # meaningful regardless of the order rows were submitted in.
+    parsed_bands.sort(key=lambda b: b['min_score'])
+
+    if parsed_bands[0]['min_score'] != 0:
+        return RedirectResponse(url=f"/admin/grading-system/{school_id}?error=The+lowest+band+must+start+at+0.", status_code=303)
+
+    # Each band's max_score is the next band's min_score — structurally
+    # guarantees no gaps or overlaps, since the boundary between any two
+    # adjacent bands is defined exactly once, not as two independently
+    # editable numbers that could disagree with each other.
+    for i, band in enumerate(parsed_bands):
+        band['max_score'] = parsed_bands[i + 1]['min_score'] if i + 1 < len(parsed_bands) else 100
+        if band['max_score'] <= band['min_score']:
+            return RedirectResponse(url=f"/admin/grading-system/{school_id}?error=Each+band's+minimum+score+must+be+strictly+higher+than+the+one+before+it.", status_code=303)
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM school_grading_bands WHERE school_id = %s;", (school_id,))
+            for i, band in enumerate(parsed_bands):
+                cur.execute("""
+                    INSERT INTO school_grading_bands (school_id, min_score, max_score, code, descriptor, points, sort_order)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                """, (school_id, band['min_score'], band['max_score'], band['code'], band['descriptor'], band['points'], i))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/grading-system/{school_id}?saved=1", status_code=303)
+
+
+@app.get("/api/v1/admin/grading-system/reset/{school_id}")
+def reset_grading_system(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM school_grading_bands WHERE school_id = %s;", (school_id,))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/grading-system/{school_id}?saved=1", status_code=303)
+
+
 @app.get("/admin/class-rosters/{school_id}", response_class=HTMLResponse)
 def class_rosters_page(school_id: int, request: Request, grade_name: str = None, stream: str = None, education_level: str = None):
     """A proper, dedicated, full-page class roster — replacing the
@@ -4614,6 +4816,11 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
+            # Fetched once, reused for every evaluate_performance_metrics
+            # call below — a school's custom bands (or None, meaning
+            # "use the standard KNEC bands", which is every school today).
+            grading_bands = get_grading_bands(cur, school_id)
+
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
@@ -4686,7 +4893,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             if score is None:
                 subject_cells[sub['id']] = None
             else:
-                metrics = evaluate_performance_metrics(score)
+                metrics = evaluate_performance_metrics(score, bands=grading_bands)
                 subject_cells[sub['id']] = (score, metrics['pld'])
                 total_marks += score
                 total_points += metrics['points']
@@ -4700,7 +4907,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         # different number of entered subjects show different averages.
         avg_marks = (total_marks / total_subjects) if total_subjects else 0.0
         avg_points = (total_points / total_subjects) if total_subjects else 0.0
-        overall_metrics = evaluate_performance_metrics(avg_marks)
+        overall_metrics = evaluate_performance_metrics(avg_marks, bands=grading_bands)
         overall_level = overall_metrics['desc']
         overall_pld = overall_metrics['pld']
         computed.append({
@@ -4746,9 +4953,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         vals = [c['subject_cells'][sub['id']][0] for c in computed if c['subject_cells'][sub['id']] is not None]
         if vals:
             avg_mark = sum(vals) / len(vals)
-            avg_pts = sum(evaluate_performance_metrics(v)['points'] for v in vals) / len(vals)
-            level_key = min(8, max(1, round(avg_pts)))
-            level = POINTS_TO_PLD.get(level_key, "N/A")
+            avg_pts = sum(evaluate_performance_metrics(v, bands=grading_bands)['points'] for v in vals) / len(vals)
+            level = evaluate_performance_metrics(avg_mark, bands=grading_bands)['pld']
         else:
             avg_mark, avg_pts, level = 0.0, 0.0, "N/A"
         subject_footer.append({'name': sub['name'], 'avg_mark': avg_mark, 'avg_pts': avg_pts, 'level': level})
@@ -4916,6 +5122,8 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
+            grading_bands = get_grading_bands(cur, school_id)
+
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
@@ -4960,13 +5168,13 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
             score = s_scores.get(sub['id'])
             if score is not None:
                 total_marks += score
-                total_points += evaluate_performance_metrics(score)['points']
+                total_points += evaluate_performance_metrics(score, bands=grading_bands)['points']
                 subjects_entered += 1
         # Divided by the full subject count for this level, matching the
         # merit list's own methodology — see its comment for the reasoning.
         avg_marks = (total_marks / len(subjects)) if subjects else 0.0
         avg_points = (total_points / len(subjects)) if subjects else 0.0
-        overall_metrics = evaluate_performance_metrics(avg_marks)
+        overall_metrics = evaluate_performance_metrics(avg_marks, bands=grading_bands)
         computed.append({
             'student': s, 'total_marks': total_marks,
             'avg_marks': avg_marks,
@@ -5065,6 +5273,8 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
+            grading_bands = get_grading_bands(cur, school_id)
+
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
@@ -5120,7 +5330,7 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
                 <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;'>{esc(full_student_name(r))}</td>
                 <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;font-family:monospace;text-align:center;'>{esc(r['admission_number'])}</td>
                 <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{float(r['raw_score']):.0f}%</td>
-                <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{evaluate_performance_metrics(float(r['raw_score']))['pld']}</td>
+                <td style='padding:6px 10px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{evaluate_performance_metrics(float(r['raw_score']), bands=grading_bands)['pld']}</td>
             </tr>
             """ for i, r in enumerate(top10, start=1))
         else:
@@ -5197,6 +5407,8 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
+            grading_bands = get_grading_bands(cur, school_id)
+
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
@@ -5225,14 +5437,14 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
         counts = {lvl: 0 for lvl in PLD_ORDER}
         total_marks, total_points = 0.0, 0
         for score in rows:
-            metrics = evaluate_performance_metrics(score)
+            metrics = evaluate_performance_metrics(score, bands=grading_bands)
             counts[metrics['pld']] = counts.get(metrics['pld'], 0) + 1
             total_marks += score
             total_points += metrics['points']
         n = len(rows)
         avg_marks = (total_marks / n) if n else 0.0
         avg_points = (total_points / n) if n else 0.0
-        overall_metrics = evaluate_performance_metrics(avg_marks)
+        overall_metrics = evaluate_performance_metrics(avg_marks, bands=grading_bands)
         return {'entry': n, 'counts': counts, 'avg_marks': avg_marks, 'avg_points': avg_points, 'pld': overall_metrics['pld'], 'level': overall_metrics['desc']}
 
     logo_src = school.get('logo_url')
@@ -5544,6 +5756,8 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
+            grading_bands = get_grading_bands(cur, school_id)
+
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
@@ -5592,7 +5806,7 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
             if cycles:
                 m = sum(cycles.values()) / len(cycles)
                 subject_means.append(m)
-                pld = evaluate_performance_metrics(m)['pld']
+                pld = evaluate_performance_metrics(m, bands=grading_bands)['pld']
                 bucket = pld[:2]
                 if bucket in level_counts:
                     level_counts[bucket] += 1
@@ -5616,7 +5830,7 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
         f"""<tr>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:bold;'>{esc(sub['name'])}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;font-weight:bold;'>{sub['mean']:.1f}%</td>
-            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{evaluate_performance_metrics(sub['mean'])['pld'] if sub['entries'] else '-'}</td>
+            <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{evaluate_performance_metrics(sub['mean'], bands=grading_bands)['pld'] if sub['entries'] else '-'}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{sub['levels']['EE']}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{sub['levels']['ME']}</td>
             <td style='padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;'>{sub['levels']['AE']}</td>
@@ -6268,7 +6482,9 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
             # 1. Look up institutional profiles dynamically
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
             school = cur.fetchone()
-            
+
+            grading_bands = get_grading_bands(cur, school_id)
+
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             
@@ -6499,7 +6715,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                     active_cycles = [v for v in [op, mid, end] if v is not None]
                     if active_cycles:
                         weighted_total = sum(active_cycles) / len(active_cycles)
-                        meta = evaluate_performance_metrics(weighted_total)
+                        meta = evaluate_performance_metrics(weighted_total, bands=grading_bands)
                         pld, pts, descriptor = meta['pld'], f"{meta['points']} Pt", meta['desc']
                         
                         total_evaluated_weight += weighted_total
@@ -6542,7 +6758,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                 # rather than having it quietly computed over fewer
                 # subjects than the level actually has.
                 avg_summary_percentage = total_evaluated_weight / len(subjects) if subjects else 0.0
-                summary_meta = evaluate_performance_metrics(avg_summary_percentage)
+                summary_meta = evaluate_performance_metrics(avg_summary_percentage, bands=grading_bands)
 
                 # Compute baseline averages safely for graph generation
                 op_avg = (opener_sum / op_count) if op_count > 0 else 0.0
