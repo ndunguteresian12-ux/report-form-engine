@@ -8414,3 +8414,129 @@ def promote_school_classes(school_id: int, request: Request):
             
     # Redirect cleanly back to the administrative control panel
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
+
+
+# ============================================================
+# Internal API — for the separate WhatsApp Teacher Assistant service
+# (Claude + Twilio), NOT for browser/session-cookie use. Protected by a
+# single shared service token rather than the normal login session,
+# since the caller is a trusted backend service, not a logged-in user
+# with their own account. Every route here requires exactly the header
+# Authorization: Bearer <ELIMU_HUB_INTERNAL_API_KEY>.
+#
+# Endpoint shapes match exactly what elimu_hub_client.py (the bot's own
+# thin client) already expects — built against that contract, not
+# designed independently, so no changes are needed on the bot's side.
+# ============================================================
+
+ELIMU_HUB_INTERNAL_API_KEY = os.getenv("ELIMU_HUB_INTERNAL_API_KEY", "")
+
+
+def _require_internal_api_key(request: Request):
+    """Constant-time comparison (secrets.compare_digest) rather than
+    == , since a naive string comparison leaks timing information an
+    attacker could use to guess the token one character at a time. If
+    ELIMU_HUB_INTERNAL_API_KEY is unset on this deployment, every call
+    is rejected — a missing/empty configured key must never be
+    interpreted as "no auth required"."""
+    auth_header = request.headers.get("authorization", "")
+    provided = auth_header[7:] if auth_header.lower().startswith("bearer ") else ""
+    if not ELIMU_HUB_INTERNAL_API_KEY or not provided or not secrets.compare_digest(provided, ELIMU_HUB_INTERNAL_API_KEY):
+        raise HTTPException(status_code=401, detail="Missing or invalid internal API key.")
+
+
+def _last_9_digits(phone: str) -> str:
+    """Normalizes a phone number down to just its last 9 significant
+    digits, so numbers stored in any of the formats actually seen in
+    this app (local '07...', '+254...', '254...', with or without
+    spaces/dashes) all compare equal once reduced to this common form.
+    Kenyan mobile numbers are 9 significant digits after the leading
+    0 or country code, so this is a safe, stable comparison key."""
+    digits = "".join(c for c in phone if c.isdigit())
+    return digits[-9:] if len(digits) >= 9 else digits
+
+
+@app.get("/api/internal/teachers/lookup")
+def internal_teacher_lookup(request: Request, phone: str):
+    _require_internal_api_key(request)
+    target = _last_9_digits(phone)
+    if not target:
+        raise HTTPException(status_code=404, detail="No teacher found for this number.")
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # RIGHT(...) compares against the same last-9-digits form on
+            # the stored side too, regardless of which of the formats
+            # above that particular row happens to be saved in.
+            cur.execute("""
+                SELECT school_id FROM users
+                WHERE role IN ('staff', 'admin') AND school_id IS NOT NULL
+                  AND RIGHT(regexp_replace(COALESCE(phone_number, ''), '[^0-9]', '', 'g'), 9) = %s
+                LIMIT 1;
+            """, (target,))
+            row = cur.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="No teacher found for this number.")
+    return {"school_id": str(row['school_id'])}
+
+
+@app.get("/api/internal/schools/{school_id}/marks-deadline")
+def internal_marks_deadline(school_id: int, request: Request, assessment: str = ""):
+    _require_internal_api_key(request)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT active_term, active_cycle, marks_entry_deadline FROM school_settings WHERE school_id = %s;",
+                (school_id,)
+            )
+            settings = cur.fetchone()
+
+    if not settings or not settings['marks_entry_deadline']:
+        # No deadline configured is a real, valid state (a school that
+        # hasn't set one yet) — NOT the same as a lookup failure, so
+        # this still returns 200 rather than 404. is_open stays True
+        # (nothing to have missed) and deadline is explicitly null
+        # rather than a made-up date, matching elimu_hub_client.py's
+        # own contract of returning None/an honest "couldn't fetch"
+        # rather than a guess.
+        return {"deadline": None, "is_open": True, "active_cycle": settings['active_cycle'] if settings else None, "active_term": settings['active_term'] if settings else None}
+
+    deadline = settings['marks_entry_deadline']
+    return {
+        "deadline": deadline.isoformat(),
+        "is_open": datetime.utcnow() < deadline,
+        # The deadline stored is always for whichever cycle is CURRENTLY
+        # active — there's no per-assessment deadline history in this
+        # system. Returned alongside the date so the bot/Claude can
+        # honestly tell a teacher which assessment this actually covers,
+        # rather than silently assuming it matches whatever assessment
+        # name they asked about.
+        "active_cycle": settings['active_cycle'],
+        "active_term": settings['active_term'],
+    }
+
+
+@app.get("/api/internal/schools/{school_id}")
+def internal_school_info(school_id: int, request: Request):
+    _require_internal_api_key(request)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT phone_number FROM users WHERE school_id = %s AND role = 'admin' AND phone_number IS NOT NULL LIMIT 1;", (school_id,))
+            admin_row = cur.fetchone()
+
+            cur.execute("SELECT DISTINCT education_level FROM classes WHERE id IN (SELECT DISTINCT class_id FROM students WHERE school_id = %s AND class_id IS NOT NULL);", (school_id,))
+            grade_levels = [r['education_level'] for r in cur.fetchall()]
+
+    return {
+        "name": school['name'],
+        "admin_phone": admin_row['phone_number'] if admin_row else None,
+        "grade_levels": grade_levels,
+    }
