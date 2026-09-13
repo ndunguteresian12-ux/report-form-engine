@@ -910,6 +910,20 @@ def bootstrap_database_schema():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
 
+                -- Replaces manual superadmin review of new school
+                -- signups: the registrant verifies their own email with a
+                -- code, and the school activates automatically the
+                -- moment that succeeds — confirmed this is meant to fully
+                -- replace the manual approval step, not add to it.
+                CREATE TABLE IF NOT EXISTS school_email_verifications (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+                    verification_code VARCHAR(10) NOT NULL,
+                    expires_at TIMESTAMP NOT NULL,
+                    used BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+
                 CREATE TABLE IF NOT EXISTS login_attempts (
                     id SERIAL PRIMARY KEY,
                     identifier VARCHAR(255) NOT NULL,
@@ -1781,6 +1795,124 @@ def forgot_password_submit(email: str = Form(...)):
     # this avoids revealing which emails have accounts on the system.
     return RedirectResponse(url=f"/reset-password?email={urllib.parse.quote(email)}&sent=1", status_code=303)
 
+
+@app.get("/verify-school-email", response_class=HTMLResponse)
+def verify_school_email_form(email: str = "", sent: str = None, error: str = None):
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
+        <title>Elimu Hub | Verify Your Email</title>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    </head>
+    <body class="bg-slate-900 flex items-center justify-center h-screen font-sans">
+        <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
+            <h2 class="text-xl font-black text-slate-800 mb-1">Verify Your Email</h2>
+            <p class="text-xs text-slate-400 mb-6">{"We couldn't send the code — you can request a new one below." if sent == "0" else "Enter the 6-digit code we emailed you to activate your school."}</p>
+            {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-4 py-3 rounded-lg mb-4'>{esc(error)}</div>" if error else ""}
+            <form action="/api/v1/schools/verify-email" method="post" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">Email</label>
+                    <input type="email" name="email" value="{esc(email)}" class="w-full p-3 border rounded-lg mt-1 focus:ring-2 focus:ring-emerald-600 outline-none" required>
+                </div>
+                <div>
+                    <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">6-Digit Code</label>
+                    <input type="text" name="code" maxlength="6" pattern="[0-9]{{6}}" class="w-full p-3 border rounded-lg mt-1 focus:ring-2 focus:ring-emerald-600 outline-none tracking-widest text-center font-mono text-lg" required>
+                </div>
+                <button type="submit" class="w-full bg-emerald-700 text-white p-3.5 rounded-lg font-black tracking-wide hover:bg-emerald-800 transition shadow-lg">Verify & Activate My School</button>
+            </form>
+            <form action="/api/v1/schools/resend-verification" method="post" class="mt-4 text-center">
+                <input type="hidden" name="email" value="{esc(email)}">
+                <button type="submit" class="text-xs text-slate-400 hover:text-slate-600 hover:underline">Didn't get a code? Resend</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/api/v1/schools/verify-email")
+def verify_school_email(email: str = Form(...), code: str = Form(...)):
+    email = email.strip().lower()
+    code = code.strip()
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, school_id FROM users WHERE email = %s AND role = 'admin';", (email,))
+            user = cur.fetchone()
+            if not user:
+                return RedirectResponse(url=f"/verify-school-email?email={urllib.parse.quote(email)}&error=Account+not+found.", status_code=303)
+
+            cur.execute("""
+                SELECT id, expires_at FROM school_email_verifications
+                WHERE school_id = %s AND verification_code = %s AND used = FALSE
+                ORDER BY created_at DESC LIMIT 1;
+            """, (user['school_id'], code))
+            verification = cur.fetchone()
+
+            if not verification:
+                return RedirectResponse(url=f"/verify-school-email?email={urllib.parse.quote(email)}&error=Invalid+code.+Check+the+code+and+try+again.", status_code=303)
+            if verification['expires_at'] < datetime.utcnow():
+                return RedirectResponse(url=f"/verify-school-email?email={urllib.parse.quote(email)}&error=This+code+has+expired.+Request+a+new+one+below.", status_code=303)
+
+            cur.execute("UPDATE school_email_verifications SET used = TRUE WHERE id = %s;", (verification['id'],))
+            # Only ever moves a school OUT of 'pending' here — never
+            # touches a school an admin has since deliberately set to
+            # 'deactivated', which stays exactly as they left it.
+            cur.execute("UPDATE schools SET status = 'active' WHERE id = %s AND status = 'pending';", (user['school_id'],))
+            conn.commit()
+
+    return HTMLResponse("""
+    <script>
+        alert('Email verified! Your school is now active — you can log in.');
+        window.location.href='/login';
+    </script>
+    """)
+
+
+@app.post("/api/v1/schools/resend-verification")
+def resend_school_verification(email: str = Form(...)):
+    email = email.strip().lower()
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT u.school_id, u.full_name, s.name AS school_name, s.status
+                FROM users u JOIN schools s ON u.school_id = s.id
+                WHERE u.email = %s AND u.role = 'admin';
+            """, (email,))
+            row = cur.fetchone()
+
+            # Same "always the same outward response" principle as
+            # forgot-password — but here we DO know the account exists
+            # (they just registered it), so this just quietly no-ops for
+            # an already-active school rather than sending a pointless
+            # code, instead of pretending to send one either way.
+            if not row or row['status'] != 'pending':
+                return RedirectResponse(url=f"/verify-school-email?email={urllib.parse.quote(email)}&sent=1", status_code=303)
+
+            verification_code = f"{random.randint(0, 999999):06d}"
+            expires_at = datetime.utcnow() + timedelta(hours=24)
+            cur.execute("""
+                INSERT INTO school_email_verifications (school_id, verification_code, expires_at)
+                VALUES (%s, %s, %s);
+            """, (row['school_id'], verification_code, expires_at))
+            conn.commit()
+
+    email_sent = send_email(
+        email,
+        "Your new Elimu Hub verification code",
+        f"""
+        <p>Hi {esc(row['full_name'].split(' ')[0] if row.get('full_name') else '')},</p>
+        <p>Here's a new verification code for <b>{esc(row['school_name'])}</b>:</p>
+        <p style="font-size:22px;font-weight:bold;background:#f1f5f9;padding:10px 16px;border-radius:8px;display:inline-block;letter-spacing:2px;">{esc(verification_code)}</p>
+        <p>This code expires in 24 hours.</p>
+        """
+    )
+    return RedirectResponse(url=f"/verify-school-email?email={urllib.parse.quote(email)}&sent={'1' if email_sent else '0'}", status_code=303)
+
+
 @app.get("/reset-password", response_class=HTMLResponse)
 def reset_password_form(email: str = "", code: str = "", sent: str = None):
     notice_html = ""
@@ -2119,14 +2251,33 @@ async def register_new_tenant_pipeline(
                 VALUES (%s, %s, 'admin', %s, TRUE, %s, %s);
             """, (admin_email, hashed_password, new_school_id, admin_phone_number, admin_full_name))
 
+            # Replaces manual superadmin review: the school stays
+            # 'pending' (same as before — login is already correctly
+            # blocked for a pending school) until the registrant proves
+            # they control the email they signed up with. No further
+            # step from the platform admin once that succeeds.
+            verification_code = f"{random.randint(0, 999999):06d}"
+            expires_at = datetime.utcnow() + timedelta(hours=24)
+            cur.execute("""
+                INSERT INTO school_email_verifications (school_id, verification_code, expires_at)
+                VALUES (%s, %s, %s);
+            """, (new_school_id, verification_code, expires_at))
+
             conn.commit()
 
-    return HTMLResponse("""
-    <script>
-        alert('Institutional Registration Complete! Dynamic Tenant Configuration Created Successfully.');
-        window.location.href='/login';
-    </script>
-    """)
+    email_sent = send_email(
+        admin_email,
+        "Verify your Elimu Hub school registration",
+        f"""
+        <p>Hi {esc(admin_full_name.split(' ')[0] if admin_full_name else '')},</p>
+        <p>Thanks for registering <b>{esc(school_name)}</b> on Elimu Hub. Enter this code to verify your email and activate your school:</p>
+        <p style="font-size:22px;font-weight:bold;background:#f1f5f9;padding:10px 16px;border-radius:8px;display:inline-block;letter-spacing:2px;">{esc(verification_code)}</p>
+        <p>This code expires in 24 hours. If you didn't request this, you can ignore this email.</p>
+        """
+    )
+
+    encoded_admin_email = urllib.parse.quote(admin_email)
+    return RedirectResponse(url=f"/verify-school-email?email={encoded_admin_email}&sent={'1' if email_sent else '0'}", status_code=303)
 
 
 @app.get("/admin/school/update-logo/{school_id}", response_class=HTMLResponse)
