@@ -115,7 +115,7 @@ def bootstrap_senior_school_schema():
 
 
 @router.get("/timetable/combinations/{school_id}", response_class=HTMLResponse)
-def subject_combinations_view(school_id: int, request: Request, grade_name: str = "Grade 10"):
+def subject_combinations_view(school_id: int, request: Request, grade_name: str = "Grade 10", stream: str = ""):
     """Lets a school define its own Subject Combinations for Senior
     School — each with a name (used as that combination's `stream`
     value) and a specific set of ELECTIVE subjects, since real schools
@@ -156,6 +156,22 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
             """, (school_id, grade_name))
             rows = cur.fetchall()
 
+            # The actual, real stream values students in this grade are
+            # registered with — shown as suggestions so a combination
+            # name can be picked to match exactly, rather than free-typed
+            # and risking a mismatch (confirmed as a real, reported bug:
+            # a combination saved under a slightly different name than a
+            # student's actual stream shows as having "no subjects
+            # defined" on the Assign Teachers page, even though subjects
+            # WERE defined — just under a name that doesn't match).
+            cur.execute("""
+                SELECT DISTINCT s.stream FROM students s
+                JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = 'Senior School'
+                  AND s.stream IS NOT NULL AND s.stream != '' ORDER BY s.stream ASC;
+            """, (school_id, grade_name))
+            real_student_streams = [r['stream'] for r in cur.fetchall()]
+
     combinations = {}
     for r in rows:
         combinations.setdefault(r['stream'], []).append(r)
@@ -174,13 +190,21 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
         )
         existing_html += f"""
         <div class="bg-white p-4 rounded-2xl border shadow-xs mb-3">
-            <div class="flex justify-between items-start">
+            <div class="flex justify-between items-start gap-2">
                 <h3 class="text-sm font-black text-slate-800">{esc(combo_name)}</h3>
-                <form action="/api/v1/timetable/combinations/delete/{school_id}" method="post" onsubmit="return confirm('Delete the combination \\'{esc(combo_name)}\\' for {esc(grade_name)}? This does NOT affect students already assigned this stream — reassign them first if needed.');">
-                    <input type="hidden" name="grade_name" value="{esc(grade_name)}">
-                    <input type="hidden" name="stream" value="{esc(combo_name)}">
-                    <button type="submit" class="text-[11px] font-bold text-rose-600 hover:underline">Delete</button>
-                </form>
+                <div class="flex gap-2 shrink-0">
+                    <form action="/api/v1/timetable/combinations/rename/{school_id}" method="post" class="flex gap-1 items-center" onsubmit="return this.new_stream.value.trim() !== '';">
+                        <input type="hidden" name="grade_name" value="{esc(grade_name)}">
+                        <input type="hidden" name="old_stream" value="{esc(combo_name)}">
+                        <input type="text" name="new_stream" placeholder="Rename to exactly match student stream" class="text-[11px] border rounded-lg px-2 py-1 w-48">
+                        <button type="submit" class="text-[11px] font-bold text-indigo-700 hover:underline whitespace-nowrap">Rename</button>
+                    </form>
+                    <form action="/api/v1/timetable/combinations/delete/{school_id}" method="post" onsubmit="return confirm('Delete the combination \\'{esc(combo_name)}\\' for {esc(grade_name)}? This does NOT affect students already assigned this stream — reassign them first if needed.');">
+                        <input type="hidden" name="grade_name" value="{esc(grade_name)}">
+                        <input type="hidden" name="stream" value="{esc(combo_name)}">
+                        <button type="submit" class="text-[11px] font-bold text-rose-600 hover:underline">Delete</button>
+                    </form>
+                </div>
             </div>
             <div class="mt-2">{subject_chips}</div>
         </div>
@@ -224,11 +248,16 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
 
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h3 class="text-sm font-black text-slate-800 mb-3">+ Add a new combination</h3>
+                {f"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-xs px-3 py-2 rounded-lg mb-3'>Setting up subjects for <b>{esc(stream)}</b> — the name below is pre-filled to match exactly. Don't change it unless you mean to create a different combination.</div>" if stream else ""}
                 <form action="/api/v1/timetable/combinations/{school_id}" method="post" class="space-y-3">
                     <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                     <div>
                         <label class="text-xs font-bold text-slate-600">Combination Name</label>
-                        <input type="text" name="stream" placeholder="e.g. STEM - Medicine Track" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                        <input type="text" name="stream" value="{esc(stream)}" placeholder="e.g. STEM - Medicine Track" list="real-streams" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                        <datalist id="real-streams">
+                            {"".join(f'<option value="{esc(s)}">' for s in real_student_streams)}
+                        </datalist>
+                        {f"<p class='text-[10px] text-slate-400 mt-1'>Streams your students are actually registered with: {', '.join(esc(s) for s in real_student_streams)}</p>" if real_student_streams and not stream else ""}
                     </div>
                     <div>
                         <label class="text-xs font-bold text-slate-600">Compulsory (every combination automatically includes these)</label>
@@ -329,3 +358,56 @@ async def delete_subject_combination(school_id: int, request: Request):
             conn.commit()
 
     return RedirectResponse(url=f"/timetable/combinations/{school_id}?grade_name={urllib.parse.quote(grade_name)}", status_code=303)
+
+
+@router.post("/api/v1/timetable/combinations/rename/{school_id}")
+async def rename_subject_combination(school_id: int, request: Request):
+    """Fixes exactly the real, confirmed issue: the combination's name
+    is free-typed on this page (no pre-fill, no link to real student
+    stream values), so it's easy to end up with subjects saved under a
+    name that doesn't exactly match the actual `stream` value students
+    are registered with (e.g. typed "East" or "STEM - East" when
+    students are actually on stream "EAST") — the Assign Teachers page
+    then correctly reports "no subjects defined", since as far as the
+    database is concerned, they genuinely aren't defined for that exact
+    stream string. Renaming updates every combination_subjects row for
+    the old name to the new one — no need to redo elective selection
+    from scratch."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form = await request.form()
+    grade_name = form.get("grade_name", "").strip()
+    old_stream = form.get("old_stream", "").strip()
+    new_stream = form.get("new_stream", "").strip()
+
+    if not grade_name or not old_stream or not new_stream:
+        raise HTTPException(status_code=400, detail="Grade, current name, and new name are all required.")
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT school_type FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school or school['school_type'] != 'senior_school':
+                raise HTTPException(status_code=403, detail="Subject Combinations are only available for Senior School institutions.")
+
+            # If a combination already exists under new_stream, merge into
+            # it rather than crash on the unique constraint — the newer
+            # (old_stream) row for a given subject wins, since renaming
+            # is a deliberate "this is now the correct name" action.
+            cur.execute("""
+                DELETE FROM combination_subjects
+                WHERE school_id = %s AND grade_name = %s AND stream = %s
+                  AND learning_area_id IN (
+                      SELECT learning_area_id FROM combination_subjects WHERE school_id = %s AND grade_name = %s AND stream = %s
+                  );
+            """, (school_id, grade_name, new_stream, school_id, grade_name, old_stream))
+            cur.execute("""
+                UPDATE combination_subjects SET stream = %s
+                WHERE school_id = %s AND grade_name = %s AND stream = %s;
+            """, (new_stream, school_id, grade_name, old_stream))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/combinations/{school_id}?grade_name={urllib.parse.quote(grade_name)}", status_code=303)
+
