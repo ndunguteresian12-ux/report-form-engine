@@ -28,7 +28,9 @@ Senior School are a separate, later phase entirely.
 """
 
 import urllib.parse
-from fastapi import APIRouter, Request, HTTPException
+import csv
+import io
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from psycopg2.extras import RealDictCursor
 
@@ -238,7 +240,10 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">🎓 Subject Combinations</h2>
                 <p class="text-xs text-slate-400 mb-3">{esc(school['name'])} — pick the electives your school offers; the compulsory core is added automatically. Each combination becomes a schedulable stream, e.g. "{esc(grade_name)}" + "STEM - Medicine Track".</p>
-                <div class="flex gap-2">{grade_tabs}</div>
+                <div class="flex gap-2 items-center">
+                    <div class="flex gap-2">{grade_tabs}</div>
+                    <a href="/timetable/combinations/import/{school_id}" class="ml-auto text-xs font-bold text-indigo-700 hover:underline whitespace-nowrap">📤 Bulk Import from CSV</a>
+                </div>
             </div>
 
             <div>
@@ -410,4 +415,144 @@ async def rename_subject_combination(school_id: int, request: Request):
             conn.commit()
 
     return RedirectResponse(url=f"/timetable/combinations/{school_id}?grade_name={urllib.parse.quote(grade_name)}", status_code=303)
+
+
+@router.get("/timetable/combinations/import/{school_id}", response_class=HTMLResponse)
+def combinations_import_form(school_id: int, request: Request, error: str = None, imported: str = None):
+    """Bulk-define combinations from a CSV instead of one at a time
+    through the form — same underlying save as the manual form (goes
+    through combination_subjects, per-school, using this school's real
+    learning_areas), just accepting many rows at once. Deliberately
+    all-or-nothing: every row is validated BEFORE anything is saved, so
+    a typo three rows down can't leave the database half-imported."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Bulk Import Combinations</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="flex items-center justify-between">
+                <h1 class="text-lg font-black text-slate-800">📤 Bulk Import Subject Combinations</h1>
+                <a href="/timetable/combinations/{school_id}" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back</a>
+            </div>
+            {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-4 py-3 rounded-lg whitespace-pre-wrap'>{esc(error)}</div>" if error else ""}
+            {f"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg'>✅ Imported {esc(imported)} combination(s).</div>" if imported else ""}
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-sm font-black text-slate-800 mb-2">CSV Format</h2>
+                <p class="text-xs text-slate-500 mb-3">One row per combination. Compulsory subjects (English, Kiswahili, Community Service Learning, Physical Education) are added automatically — don't include them.</p>
+                <div class="bg-slate-50 border rounded-lg p-3 overflow-x-auto">
+                    <table class="text-[11px] font-mono whitespace-nowrap">
+                        <tr class="font-bold text-slate-600"><td class="pr-4">grade_name</td><td class="pr-4">stream</td><td class="pr-4">math_variant</td><td class="pr-4">elective1</td><td class="pr-4">elective2</td><td>elective3</td></tr>
+                        <tr class="text-slate-500"><td class="pr-4">Grade 10</td><td class="pr-4">STEM - Pure Sciences</td><td class="pr-4">Mathematics (Core)</td><td class="pr-4">Chemistry</td><td class="pr-4">Biology</td><td></td></tr>
+                    </table>
+                </div>
+                <p class="text-xs text-slate-500 mt-3"><b>math_variant</b> must be exactly one of: {", ".join(esc(v) for v in MATHEMATICS_VARIANTS)}.</p>
+                <p class="text-xs text-slate-500 mt-1">Elective columns (elective1, elective2, ...) can be as many as you need — leave any unused ones blank. Each subject name must exactly match one already in your Senior School subject list.</p>
+            </div>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <form action="/api/v1/timetable/combinations/import/{school_id}" method="post" enctype="multipart/form-data" class="space-y-3">
+                    <input type="file" name="csv_file" accept=".csv" required class="w-full border p-2.5 rounded-lg text-sm">
+                    <button type="submit" class="w-full bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 rounded-lg text-sm transition">Validate & Import</button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@router.post("/api/v1/timetable/combinations/import/{school_id}")
+async def combinations_import_save(school_id: int, request: Request, csv_file: UploadFile = File(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    raw_bytes = await csv_file.read()
+    try:
+        text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return RedirectResponse(url=f"/timetable/combinations/import/{school_id}?error={urllib.parse.quote('Could not read this file as text — make sure it is saved as a CSV.')}", status_code=303)
+
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames or "grade_name" not in reader.fieldnames or "stream" not in reader.fieldnames or "math_variant" not in reader.fieldnames:
+        return RedirectResponse(url=f"/timetable/combinations/import/{school_id}?error={urllib.parse.quote('CSV is missing required columns: grade_name, stream, math_variant.')}", status_code=303)
+
+    elective_cols = [c for c in reader.fieldnames if c.startswith("elective")]
+    rows = list(reader)
+    if not rows:
+        return RedirectResponse(url=f"/timetable/combinations/import/{school_id}?error={urllib.parse.quote('The CSV has no data rows.')}", status_code=303)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT school_type FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school or school['school_type'] != 'senior_school':
+                raise HTTPException(status_code=403, detail="Subject Combinations are only available for Senior School institutions.")
+
+            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = 'Senior School';")
+            subject_name_to_id = {r['name']: r['id'] for r in cur.fetchall()}
+            cur.execute("SELECT id FROM learning_areas WHERE education_level = 'Senior School' AND name = ANY(%s);", (AUTO_COMPULSORY_SUBJECTS,))
+            compulsory_ids = [r['id'] for r in cur.fetchall()]
+
+            # Validate every row FIRST, collecting every problem found, so
+            # one bad row's error doesn't hide the next one — an admin
+            # fixing a 40-row CSV one error at a time would be painful.
+            errors = []
+            parsed_rows = []
+            for i, row in enumerate(rows, start=2):  # row 1 is the header
+                grade_name = (row.get("grade_name") or "").strip()
+                stream = (row.get("stream") or "").strip()
+                math_variant = (row.get("math_variant") or "").strip()
+                electives = [(row.get(c) or "").strip() for c in elective_cols]
+                electives = [e for e in electives if e]
+
+                if not grade_name or not stream:
+                    errors.append(f"Row {i}: grade_name and stream are both required.")
+                    continue
+                if math_variant not in MATHEMATICS_VARIANTS:
+                    errors.append(f"Row {i} ({stream}): math_variant '{math_variant}' must be exactly one of: {', '.join(MATHEMATICS_VARIANTS)}.")
+                    continue
+                math_variant_id = subject_name_to_id.get(math_variant)
+
+                elective_ids = []
+                row_has_unknown_subject = False
+                for e in electives:
+                    if e not in subject_name_to_id:
+                        errors.append(f"Row {i} ({stream}): subject '{e}' doesn't match any existing Senior School subject.")
+                        row_has_unknown_subject = True
+                    else:
+                        elective_ids.append(subject_name_to_id[e])
+                if row_has_unknown_subject:
+                    continue
+
+                parsed_rows.append((grade_name, stream, math_variant_id, elective_ids))
+
+            if errors:
+                error_text = f"Found {len(errors)} problem(s) — nothing was imported. Fix these and try again:\n\n" + "\n".join(errors[:30])
+                if len(errors) > 30:
+                    error_text += f"\n... and {len(errors) - 30} more."
+                return RedirectResponse(url=f"/timetable/combinations/import/{school_id}?error={urllib.parse.quote(error_text)}", status_code=303)
+
+            for grade_name, stream, math_variant_id, elective_ids in parsed_rows:
+                for lid in compulsory_ids + ([math_variant_id] if math_variant_id else []):
+                    cur.execute("""
+                        INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
+                        VALUES (%s, %s, %s, %s, TRUE)
+                        ON CONFLICT (school_id, grade_name, stream, learning_area_id)
+                        DO UPDATE SET is_compulsory = TRUE;
+                    """, (school_id, grade_name, stream, lid))
+                for eid in elective_ids:
+                    cur.execute("""
+                        INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
+                        VALUES (%s, %s, %s, %s, FALSE)
+                        ON CONFLICT (school_id, grade_name, stream, learning_area_id)
+                        DO UPDATE SET is_compulsory = FALSE;
+                    """, (school_id, grade_name, stream, eid))
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/combinations/import/{school_id}?imported={len(parsed_rows)}", status_code=303)
 
