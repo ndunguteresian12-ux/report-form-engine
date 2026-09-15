@@ -1409,20 +1409,22 @@ async def duplicate_timetable_plan(school_id: int, plan_id: int, request: Reques
 
 
 @router.get("/timetable/subjects-config/{school_id}", response_class=HTMLResponse)
-def subjects_config_view(school_id: int, request: Request, education_level: str = "Upper Primary"):
+def subjects_config_view(school_id: int, request: Request, education_level: str = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            education_levels = get_education_levels_for_school(cur, school_id)
+            if not education_level or education_level not in education_levels:
+                education_level = education_levels[0] if education_levels else "Lower Primary"
+
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
 
             cur.execute("SELECT learning_area_id, short_code, color_hex FROM timetable_subject_config WHERE school_id = %s;", (school_id,))
             existing = {r['learning_area_id']: r for r in cur.fetchall()}
-
-            education_levels = get_education_levels_for_school(cur, school_id)
 
     level_tabs = "".join(
         f"""<a href="/timetable/subjects-config/{school_id}?education_level={urllib.parse.quote(lvl)}"
@@ -1607,7 +1609,7 @@ def validate_timetable_setup(cur, school_id: int, grade_name: str, education_lev
 # ============================================================
 
 @router.get("/timetable/periods/{school_id}", response_class=HTMLResponse)
-def timetable_periods_view(school_id: int, request: Request, education_level: str = "Lower Primary", plan_id: int = None):
+def timetable_periods_view(school_id: int, request: Request, education_level: str = None, plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -1619,6 +1621,17 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
+            education_levels = get_education_levels_for_school(cur, school_id)
+            # No level requested (e.g. the plain "Periods & Days" link from
+            # the dashboard, which has no single level of its own) — default
+            # to the first level THIS school actually offers, rather than a
+            # hardcoded "Lower Primary" that a standalone Senior School (or
+            # any school without that level) doesn't have at all. Confirmed
+            # as the real cause of periods/plans looking like they belonged
+            # to the wrong level entirely for such a school.
+            if not education_level or education_level not in education_levels:
+                education_level = education_levels[0] if education_levels else "Lower Primary"
+
             resolved_plan_id = resolve_plan_id(cur, school_id, education_level, plan_id)
             cur.execute("SELECT name, active_days FROM timetable_plans WHERE id = %s;", (resolved_plan_id,))
             plan_row = cur.fetchone()
@@ -1626,8 +1639,6 @@ def timetable_periods_view(school_id: int, request: Request, education_level: st
             current_days = set((plan_row['active_days'] or "").split(",")) if plan_row else set()
 
             periods = get_periods_for_level(cur, school_id, education_level, resolved_plan_id)
-
-            education_levels = get_education_levels_for_school(cur, school_id)
 
     all_seven_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     day_checkboxes = "".join(
@@ -2526,7 +2537,7 @@ def timetable_collision_check(school_id: int, request: Request, education_level:
 # ============================================================
 
 @router.get("/timetable/custom-subjects/{school_id}", response_class=HTMLResponse)
-def custom_subjects_view(school_id: int, request: Request, education_level: str = "Lower Primary"):
+def custom_subjects_view(school_id: int, request: Request, education_level: str = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2538,13 +2549,15 @@ def custom_subjects_view(school_id: int, request: Request, education_level: str 
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
+            education_levels = get_education_levels_for_school(cur, school_id)
+            if not education_level or education_level not in education_levels:
+                education_level = education_levels[0] if education_levels else "Lower Primary"
+
             cur.execute(
                 "SELECT * FROM timetable_custom_subjects WHERE school_id = %s AND education_level = %s ORDER BY name ASC;",
                 (school_id, education_level)
             )
             custom_subjects = cur.fetchall()
-
-            education_levels = get_education_levels_for_school(cur, school_id)
 
     level_tabs = "".join(
         f"""<a href="/timetable/custom-subjects/{school_id}?education_level={urllib.parse.quote(lvl)}"
@@ -2919,7 +2932,7 @@ def remove_co_curricular_participant(school_id: int, activity_id: int, student_i
 # ============================================================
 
 @router.get("/timetable/availability/{school_id}/{teacher_id}", response_class=HTMLResponse)
-def teacher_availability_grid(school_id: int, teacher_id: int, request: Request, education_level: str = "Lower Primary", plan_id: int = None):
+def teacher_availability_grid(school_id: int, teacher_id: int, request: Request, education_level: str = None, plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -2930,6 +2943,10 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request,
             teacher = cur.fetchone()
             if not teacher:
                 raise HTTPException(status_code=404, detail="Teacher not found.")
+
+            education_levels = get_education_levels_for_school(cur, school_id)
+            if not education_level or education_level not in education_levels:
+                education_level = education_levels[0] if education_levels else "Lower Primary"
 
             resolved_plan_id = resolve_plan_id(cur, school_id, education_level, plan_id)
             plan_options_html = get_plan_options_html(cur, school_id, education_level, resolved_plan_id)
@@ -2944,8 +2961,6 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request,
                 WHERE school_id = %s AND staff_user_id = %s AND plan_id = %s;
             """, (school_id, teacher_id, resolved_plan_id))
             current = {(r['day_of_week'], r['period_id']): r['status'] for r in cur.fetchall()}
-
-            education_levels = get_education_levels_for_school(cur, school_id)
 
     status_options = [("available", "✅ Available"), ("conditional", "❔ Conditional"), ("not_available", "❌ Not Available")]
 
@@ -3004,7 +3019,7 @@ def teacher_availability_grid(school_id: int, teacher_id: int, request: Request,
 
 
 @router.post("/api/v1/timetable/availability/update/{school_id}/{teacher_id}")
-async def save_teacher_availability(school_id: int, teacher_id: int, request: Request, education_level: str = "Lower Primary", plan_id: int = None):
+async def save_teacher_availability(school_id: int, teacher_id: int, request: Request, education_level: str = None, plan_id: int = None):
     auth_error = require_school_session(request, school_id)
     if auth_error:
         return auth_error
@@ -3016,6 +3031,10 @@ async def save_teacher_availability(school_id: int, teacher_id: int, request: Re
             cur.execute("SELECT id FROM users WHERE id = %s AND school_id = %s AND role = 'staff';", (teacher_id, school_id))
             if not cur.fetchone():
                 raise HTTPException(status_code=404, detail="Teacher not found.")
+
+            if not education_level:
+                education_levels = get_education_levels_for_school(cur, school_id)
+                education_level = education_levels[0] if education_levels else "Lower Primary"
 
             resolved_plan_id = resolve_plan_id(cur, school_id, education_level, plan_id)
 
@@ -5800,7 +5819,7 @@ def timetable_view_switcher(school_id: int, request: Request):
 
 
 @router.get("/timetable/view/subjects/{school_id}", response_class=HTMLResponse)
-def timetable_subject_perspective(school_id: int, request: Request, education_level: str = "Upper Primary", learning_area_id: int = None):
+def timetable_subject_perspective(school_id: int, request: Request, education_level: str = None, learning_area_id: int = None):
     """A genuinely new view: pick one subject and see, across every class
     in a level, exactly which day/period it's taught in — useful for
     spotting a subject that's badly clustered on one day, or confirming a
@@ -5816,8 +5835,13 @@ def timetable_subject_perspective(school_id: int, request: Request, education_le
             if not school:
                 raise HTTPException(status_code=404, detail="School not found.")
 
+            education_levels = get_education_levels_for_school(cur, school_id)
+            if not education_level or education_level not in education_levels:
+                education_level = education_levels[0] if education_levels else "Lower Primary"
+
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
+
 
             if learning_area_id is None and subjects:
                 learning_area_id = subjects[0]['id']
@@ -5837,8 +5861,6 @@ def timetable_subject_perspective(school_id: int, request: Request, education_le
                     grid[(row['day_of_week'], row['period_id'])] = grid.get((row['day_of_week'], row['period_id']), []) + [
                         f"{_section_label(row['grade_name'], row['stream'])}" + (f" ({row['teacher_name']})" if row['teacher_name'] else "")
                     ]
-
-            education_levels = get_education_levels_for_school(cur, school_id)
 
     level_tabs = "".join(
         f"""<a href="/timetable/view/subjects/{school_id}?education_level={urllib.parse.quote(lvl)}"
