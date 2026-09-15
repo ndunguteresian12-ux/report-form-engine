@@ -291,6 +291,7 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Subject Combinations</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
         <div class="max-w-3xl mx-auto space-y-4">
+            <a href="/timetable/dashboard/{school_id}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Timetable Workspace</a>
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-lg font-black text-slate-800">🎓 Subject Combinations</h2>
                 <p class="text-xs text-slate-400 mb-3">{esc(school['name'])} — pick the electives your school offers; the compulsory core is added automatically. Each combination becomes a schedulable stream, e.g. "{esc(grade_name)}" + "STEM - Medicine Track".</p>

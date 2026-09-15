@@ -1534,8 +1534,8 @@ def login_portal():
         {PWA_HEAD_SNIPPET}
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     </head>
-    <body class="bg-slate-900 flex items-center justify-center h-screen font-sans">
-        <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
+    <body class="bg-slate-900 bg-cover bg-center flex items-center justify-center h-screen font-sans" style="background-image: linear-gradient(rgba(15,23,42,0.80), rgba(15,23,42,0.88)), url('data:image/jpeg;base64,{REGISTRATION_BG_IMAGE_B64}');">
+        <div class="bg-white/90 backdrop-blur-sm p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
             <img src="{ELIMU_HUB_ICON_DATA_URI}" alt="Elimu Hub" class="w-14 h-14 mx-auto mb-3 rounded-2xl shadow-sm" />
             <h2 class="text-2xl font-black text-center text-slate-800 mb-2">Elimu Hub</h2>
             <p class="text-xs text-center text-slate-400 mb-6">Enterprise Institutional Gateway Node</p>
@@ -2063,7 +2063,7 @@ def public_registration_portal():
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Create School Tenant Account</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="flex items-center justify-center min-h-screen font-sans p-6 bg-slate-900 bg-cover bg-center" style="background-image: linear-gradient(rgba(15,23,42,0.80), rgba(15,23,42,0.88)), url('data:image/jpeg;base64,{REGISTRATION_BG_IMAGE_B64}');">
-        <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-xl border-t-8 border-emerald-700">
+        <div class="bg-white/90 backdrop-blur-sm p-8 rounded-2xl shadow-2xl w-full max-w-xl border-t-8 border-emerald-700">
             <h2 class="text-2xl font-black text-slate-800">Register Institutional Tenant</h2>
             <p class="text-xs text-slate-400 mb-6">Setup your completely isolated enterprise report engine node instance.</p>
             
@@ -6097,6 +6097,16 @@ def add_student_view(school_id: int, request: Request):
             cur.execute("SELECT id, grade_name, education_level FROM classes WHERE education_level = ANY(%s) ORDER BY id ASC;", (allowed_levels,))
             all_classes = cur.fetchall()
 
+            # Real, actual combination names already defined for this
+            # school — shown as suggestions so a Senior School student's
+            # stream can be picked to match exactly, rather than
+            # free-typed and risking a mismatch against Subject
+            # Combinations (the same real bug already fixed there).
+            senior_combination_names = []
+            if "Senior School" in allowed_levels:
+                cur.execute("SELECT DISTINCT stream FROM combination_subjects WHERE school_id = %s ORDER BY stream ASC;", (school_id,))
+                senior_combination_names = [r['stream'] for r in cur.fetchall()]
+
             # A class (homeroom) teacher can register students into their
             # own class(es) — e.g. ECDE learners registered by their PP1/
             # PP2 teacher — but only those classes, not the whole school.
@@ -6126,7 +6136,9 @@ def add_student_view(school_id: int, request: Request):
     stream_field_html = (
         "<div class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500'>ℹ️ This school is in <b>Single Stream Mode</b> — no stream assignment is needed.</div>"
         if is_single_stream else
-        "<div><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" name=\"stream\" placeholder=\"e.g. N\" class=\"w-full border p-2.5 rounded mt-1 text-base\" required></div>"
+        "<div><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" name=\"stream\" placeholder=\"e.g. N — or a Senior School combination name\" list=\"combo-suggestions\" class=\"w-full border p-2.5 rounded mt-1 text-base\" required>"
+        + (f"<datalist id='combo-suggestions'>{''.join(f'<option value=\"{esc(s)}\">' for s in senior_combination_names)}</datalist><p class='text-[10px] text-slate-400 mt-1'>For Senior School: type it exactly as defined on the Subject Combinations page — start typing to see suggestions.</p>" if senior_combination_names else "")
+        + "</div>"
     )
 
     class_options_html = "".join(
@@ -7652,17 +7664,6 @@ def backend_add_student(
             raise HTTPException(status_code=403, detail="You aren't the class teacher for that grade. Ask your admin to assign you as its class teacher first.")
 
     # Clean up the string input value
-    raw_stream = stream.strip().upper() if stream else ""
-    
-    # If it's left blank, assign the standard "SINGLE STREAM" token flag
-    if not raw_stream or raw_stream == "":
-        processed_stream = "SINGLE STREAM"
-    else:
-        # If they wrote '2N' instead of just 'N', strip off the number part gracefully
-        processed_stream = raw_stream.replace("GRADE", "").replace(str(class_id), "").strip()
-        if not processed_stream:
-            processed_stream = "SINGLE STREAM"
-
     admission_number = admission_number.strip().upper()
     first_name = first_name.strip()
     middle_name = middle_name.strip() or None
@@ -7680,6 +7681,24 @@ def backend_add_student(
             if not class_row:
                 raise HTTPException(status_code=400, detail="The selected grade/class does not exist.")
             education_level = class_row[0]
+
+            # Senior School's "stream" is a subject combination name — see
+            # backend_edit_student's own comment on this exact same fix
+            # for the full reasoning. Preserved exactly as typed here;
+            # every other level keeps the existing letter-stream cleanup.
+            if education_level == "Senior School":
+                processed_stream = stream.strip() if stream else "SINGLE STREAM"
+                if not processed_stream:
+                    processed_stream = "SINGLE STREAM"
+            else:
+                raw_stream = stream.strip().upper() if stream else ""
+                if not raw_stream:
+                    processed_stream = "SINGLE STREAM"
+                else:
+                    # If they wrote '2N' instead of just 'N', strip off the number part gracefully
+                    processed_stream = raw_stream.replace("GRADE", "").replace(str(class_id), "").strip()
+                    if not processed_stream:
+                        processed_stream = "SINGLE STREAM"
 
             try:
                 cur.execute("""
@@ -7847,6 +7866,11 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
             settings_row = cur.fetchone()
             is_single_stream = bool(settings_row['is_single_stream']) if settings_row else False
 
+            senior_combination_names = []
+            if "Senior School" in allowed_levels:
+                cur.execute("SELECT DISTINCT stream FROM combination_subjects WHERE school_id = %s ORDER BY stream ASC;", (school_id,))
+                senior_combination_names = [r['stream'] for r in cur.fetchall()]
+
     grade_options = "".join(
         f"<option value='{c['id']}' {'selected' if c['id'] == student['class_id'] else ''}>{esc(c['grade_name'])}</option>"
         for c in classes
@@ -7856,7 +7880,9 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
     stream_field_html = (
         "<div class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500'>ℹ️ This school is in <b>Single Stream Mode</b> — no stream assignment is needed.</div>"
         if is_single_stream else
-        f"<div><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" name=\"stream\" value=\"{esc(display_stream)}\" placeholder=\"e.g. N\" class=\"w-full border p-2.5 rounded mt-1 text-base\"></div>"
+        f"<div><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" name=\"stream\" value=\"{esc(display_stream)}\" placeholder=\"e.g. N — or a Senior School combination name\" list=\"combo-suggestions\" class=\"w-full border p-2.5 rounded mt-1 text-base\">"
+        + (f"<datalist id='combo-suggestions'>{''.join(f'<option value=\"{esc(s)}\">' for s in senior_combination_names)}</datalist><p class='text-[10px] text-slate-400 mt-1'>For Senior School: type it exactly as defined on the Subject Combinations page — start typing to see suggestions.</p>" if senior_combination_names else "")
+        + "</div>"
     )
 
     return f"""
@@ -7913,14 +7939,6 @@ def backend_edit_student(
     if auth_error:
         return auth_error
 
-    raw_stream = stream.strip().upper() if stream else ""
-    if not raw_stream:
-        processed_stream = "SINGLE STREAM"
-    else:
-        processed_stream = raw_stream.replace("GRADE", "").replace(str(class_id), "").strip()
-        if not processed_stream:
-            processed_stream = "SINGLE STREAM"
-
     admission_number = admission_number.strip().upper()
     first_name = first_name.strip()
     middle_name = middle_name.strip() or None
@@ -7939,6 +7957,30 @@ def backend_edit_student(
             if not class_row:
                 raise HTTPException(status_code=400, detail="The selected grade/class does not exist.")
             education_level = class_row[0]
+
+            # Senior School's "stream" is a subject combination name (e.g.
+            # "STEM - Medicine Track"), not a letter like "N" — the
+            # uppercase + GRADE/class_id stripping below is built
+            # specifically for the letter-stream pattern used by every
+            # other level, and would silently mangle a combination name
+            # into a DIFFERENT string than the one actually defined on
+            # the Subject Combinations page (confirmed as a real,
+            # additional instance of the exact mismatch bug already fixed
+            # there — even a correctly-typed name would break here).
+            # Preserved exactly as typed for Senior School; every other
+            # level keeps its existing behavior unchanged.
+            if education_level == "Senior School":
+                processed_stream = stream.strip() if stream else "SINGLE STREAM"
+                if not processed_stream:
+                    processed_stream = "SINGLE STREAM"
+            else:
+                raw_stream = stream.strip().upper() if stream else ""
+                if not raw_stream:
+                    processed_stream = "SINGLE STREAM"
+                else:
+                    processed_stream = raw_stream.replace("GRADE", "").replace(str(class_id), "").strip()
+                    if not processed_stream:
+                        processed_stream = "SINGLE STREAM"
 
             try:
                 cur.execute("""
