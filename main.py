@@ -1546,7 +1546,7 @@ def login_portal():
         </style>
     </head>
     <body class="bg-slate-900 bg-cover bg-center flex items-center justify-center h-screen font-sans" style="background-image: linear-gradient(rgba(15,23,42,0.80), rgba(15,23,42,0.88)), url('data:image/jpeg;base64,{REGISTRATION_BG_IMAGE_B64}');">
-        <div class="bg-white/90 backdrop-blur-sm p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
+        <div class="bg-white/60 backdrop-blur-sm p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
             <img src="{ELIMU_HUB_ICON_DATA_URI}" alt="Elimu Hub" class="w-14 h-14 mx-auto mb-3 rounded-2xl shadow-sm" />
             <h2 class="text-2xl font-black text-center text-slate-800 mb-2">Elimu Hub</h2>
             <p class="text-xs text-center text-slate-400 mb-6">Enterprise Institutional Gateway Node</p>
@@ -1554,12 +1554,12 @@ def login_portal():
             <form action="/api/v1/auth/login" method="post" class="space-y-4">
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">Access Email</label>
-                    <input type="email" name="email" class="w-full p-3 border rounded-lg mt-1 bg-white/70 focus:ring-2 focus:ring-emerald-600 outline-none" required>
+                    <input type="email" name="email" class="w-full p-3 border-2 border-slate-400 rounded-lg mt-1 bg-transparent focus:ring-2 focus:ring-emerald-600 outline-none" required>
                 </div>
                 <div>
                     <label class="block text-xs font-bold uppercase text-slate-600 tracking-wider">Security Passphrase</label>
                     <div class="relative mt-1">
-                        <input type="password" name="password" id="loginPasswordField" class="w-full p-3 pr-11 border rounded-lg bg-white/70 focus:ring-2 focus:ring-emerald-600 outline-none" required>
+                        <input type="password" name="password" id="loginPasswordField" class="w-full p-3 pr-11 border-2 border-slate-400 rounded-lg bg-transparent focus:ring-2 focus:ring-emerald-600 outline-none" required>
                         <button type="button" onclick="const f=document.getElementById('loginPasswordField'); const isHidden=f.type==='password'; f.type=isHidden?'text':'password'; this.textContent=isHidden?'Hide':'Show';" class="absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-bold text-slate-400 hover:text-slate-600">Show</button>
                     </div>
                 </div>
@@ -2082,21 +2082,21 @@ def public_registration_portal():
         </style>
     </head>
     <body class="flex items-center justify-center min-h-screen font-sans p-6 bg-slate-900 bg-cover bg-center" style="background-image: linear-gradient(rgba(15,23,42,0.80), rgba(15,23,42,0.88)), url('data:image/jpeg;base64,{REGISTRATION_BG_IMAGE_B64}');">
-        <div class="bg-white/90 backdrop-blur-sm p-8 rounded-2xl shadow-2xl w-full max-w-xl border-t-8 border-emerald-700">
+        <div class="bg-white/60 backdrop-blur-sm p-8 rounded-2xl shadow-2xl w-full max-w-xl border-t-8 border-emerald-700">
             <h2 class="text-2xl font-black text-slate-800">Register Institutional Tenant</h2>
             <p class="text-xs text-slate-400 mb-6">Setup your completely isolated enterprise report engine node instance.</p>
             
             <form action="/api/v1/tenant/register" method="post" enctype="multipart/form-data" class="space-y-4 text-xs">
-                <div class="bg-slate-50/70 p-4 rounded-xl border space-y-3">
+                <div class="bg-slate-50/40 p-4 rounded-xl border space-y-3">
                     <h3 class="font-black text-slate-700 uppercase tracking-wide">🏫 School Profile Information</h3>
                     <div>
                         <label class="block font-bold text-slate-600">School Type</label>
                         <div class="grid grid-cols-2 gap-2 mt-1">
-                            <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer bg-white/70 hover:bg-white has-[:checked]:border-emerald-600 has-[:checked]:bg-emerald-50">
+                            <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer bg-white/40 hover:bg-white/70 has-[:checked]:border-emerald-600 has-[:checked]:bg-emerald-50">
                                 <input type="radio" name="school_type" value="comprehensive" checked class="mt-0.5">
                                 <span><b class="block">Comprehensive School</b><span class="text-[10px] text-slate-400">ECDE through Junior School (Grade 9)</span></span>
                             </label>
-                            <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer bg-white/70 hover:bg-white has-[:checked]:border-emerald-600 has-[:checked]:bg-emerald-50">
+                            <label class="flex items-start gap-2 p-3 border rounded-lg cursor-pointer bg-white/40 hover:bg-white/70 has-[:checked]:border-emerald-600 has-[:checked]:bg-emerald-50">
                                 <input type="radio" name="school_type" value="senior_school" class="mt-0.5">
                                 <span><b class="block">Senior School</b><span class="text-[10px] text-slate-400">Grade 10-12 only, a standalone institution</span></span>
                             </label>
@@ -2104,46 +2104,46 @@ def public_registration_portal():
                     </div>
                     <div>
                         <label class="block font-bold text-slate-600">Official School Name</label>
-                        <input type="text" name="school_name" placeholder="e.g. Kilimani Academy" class="w-full p-2.5 border rounded-lg mt-1 bg-white/70" required>
+                        <input type="text" name="school_name" placeholder="e.g. Kilimani Academy" class="w-full p-2.5 border-2 border-slate-400 rounded-lg mt-1 bg-transparent" required>
                     </div>
                     <div class="grid grid-cols-2 gap-3">
                         <div>
                             <label class="block font-bold text-slate-600">Sub-County Jurisdiction</label>
-                            <input type="text" name="sub_county" placeholder="e.g. Dagoretti" class="w-full p-2.5 border rounded-lg mt-1 bg-white/70" required>
+                            <input type="text" name="sub_county" placeholder="e.g. Dagoretti" class="w-full p-2.5 border-2 border-slate-400 rounded-lg mt-1 bg-transparent" required>
                         </div>
                         <div>
                             <label class="block font-bold text-slate-600">Physical Location Address</label>
-                            <input type="text" name="physical_address" placeholder="e.g. Yaya Centre, Nairobi" class="w-full p-2.5 border rounded-lg mt-1 bg-white/70" required>
+                            <input type="text" name="physical_address" placeholder="e.g. Yaya Centre, Nairobi" class="w-full p-2.5 border-2 border-slate-400 rounded-lg mt-1 bg-transparent" required>
                         </div>
                     </div>
                     <div>
                         <label class="block font-bold text-slate-600">Official School Logo Image File</label>
-                        <input type="file" name="logo_file" class="w-full p-2 border rounded-lg mt-1 bg-white/70" accept="image/*">
+                        <input type="file" name="logo_file" class="w-full p-2 border-2 border-slate-400 rounded-lg mt-1 bg-transparent" accept="image/*">
                     </div>
                 </div>
 
-                <div class="bg-slate-50/70 p-4 rounded-xl border space-y-3">
+                <div class="bg-slate-50/40 p-4 rounded-xl border space-y-3">
                     <h3 class="font-black text-slate-700 uppercase tracking-wide">🔒 Super-Admin Account Security Credentials</h3>
                     <div>
                         <label class="block font-bold text-slate-600">Administrator Full Name</label>
-                        <input type="text" name="admin_full_name" placeholder="e.g. Francis Mwangi" class="w-full p-2.5 border rounded-lg mt-1 bg-white/70" required>
+                        <input type="text" name="admin_full_name" placeholder="e.g. Francis Mwangi" class="w-full p-2.5 border-2 border-slate-400 rounded-lg mt-1 bg-transparent" required>
                     </div>
                     <div>
                         <label class="block font-bold text-slate-600">Primary Administrator Username (Email Address)</label>
-                        <input type="email" name="admin_email" placeholder="admin@school.ac.ke" class="w-full p-2.5 border rounded-lg mt-1 bg-white/70" required>
+                        <input type="email" name="admin_email" placeholder="admin@school.ac.ke" class="w-full p-2.5 border-2 border-slate-400 rounded-lg mt-1 bg-transparent" required>
                     </div>
                     <div>
                         <label class="block font-bold text-slate-600">Secure Access Passphrase Password</label>
-                        <input type="password" name="admin_password" class="w-full p-2.5 border rounded-lg mt-1 bg-white/70" required>
+                        <input type="password" name="admin_password" class="w-full p-2.5 border-2 border-slate-400 rounded-lg mt-1 bg-transparent" required>
                     </div>
                     <div>
                         <label class="block font-bold text-slate-600">Administrator Phone Number</label>
-                        <input type="tel" name="admin_phone_number" placeholder="07XXXXXXXX" class="w-full p-2.5 border rounded-lg mt-1 bg-white/70" required>
+                        <input type="tel" name="admin_phone_number" placeholder="07XXXXXXXX" class="w-full p-2.5 border-2 border-slate-400 rounded-lg mt-1 bg-transparent" required>
                         <p class="text-[10px] text-slate-400 mt-1">Used only for password-reset codes via SMS.</p>
                     </div>
                 </div>
 
-                <div class="bg-white/70 p-4 rounded-xl border">
+                <div class="bg-white/40 p-4 rounded-xl border">
                     <label class="flex items-start gap-2.5 cursor-pointer">
                         <input type="checkbox" name="accept_terms" value="1" class="mt-0.5 w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500 cursor-pointer" required>
                         <span class="text-xs text-slate-600">
