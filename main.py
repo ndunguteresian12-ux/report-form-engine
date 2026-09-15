@@ -1533,6 +1533,17 @@ def login_portal():
         <meta name="description" content="Elimu Hub is a school management platform built for Kenyan CBC schools — timetabling, fee management, marks entry, and schemes of work in one place.">
         {PWA_HEAD_SNIPPET}
         <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+        <style>
+            /* Browsers force their own opaque background on autofilled
+               fields (email/password), ignoring any background-color set
+               via CSS classes — this is the only reliable override,
+               using a huge inset shadow to visually replace it. */
+            input:-webkit-autofill, input:-webkit-autofill:hover,
+            input:-webkit-autofill:focus, input:-webkit-autofill:active {{
+                -webkit-box-shadow: 0 0 0 1000px rgba(255,255,255,0.7) inset;
+                box-shadow: 0 0 0 1000px rgba(255,255,255,0.7) inset;
+            }}
+        </style>
     </head>
     <body class="bg-slate-900 bg-cover bg-center flex items-center justify-center h-screen font-sans" style="background-image: linear-gradient(rgba(15,23,42,0.80), rgba(15,23,42,0.88)), url('data:image/jpeg;base64,{REGISTRATION_BG_IMAGE_B64}');">
         <div class="bg-white/90 backdrop-blur-sm p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-700">
@@ -2061,7 +2072,15 @@ def public_registration_portal():
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Create School Tenant Account</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Create School Tenant Account</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+        <style>
+            input:-webkit-autofill, input:-webkit-autofill:hover,
+            input:-webkit-autofill:focus, input:-webkit-autofill:active {{
+                -webkit-box-shadow: 0 0 0 1000px rgba(255,255,255,0.7) inset;
+                box-shadow: 0 0 0 1000px rgba(255,255,255,0.7) inset;
+            }}
+        </style>
+    </head>
     <body class="flex items-center justify-center min-h-screen font-sans p-6 bg-slate-900 bg-cover bg-center" style="background-image: linear-gradient(rgba(15,23,42,0.80), rgba(15,23,42,0.88)), url('data:image/jpeg;base64,{REGISTRATION_BG_IMAGE_B64}');">
         <div class="bg-white/90 backdrop-blur-sm p-8 rounded-2xl shadow-2xl w-full max-w-xl border-t-8 border-emerald-700">
             <h2 class="text-2xl font-black text-slate-800">Register Institutional Tenant</h2>
