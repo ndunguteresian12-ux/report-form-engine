@@ -54,6 +54,53 @@ AUTO_COMPULSORY_SUBJECTS = ["English", "Kiswahili", "Community Service Learning"
 # picked.
 MATHEMATICS_VARIANTS = ["Mathematics (Core)", "Mathematics (Essential)", "Advanced Mathematics"]
 
+# A ready-to-use set of real KCSE-style combinations spanning all 3
+# pathways (STEM, Social Sciences, Arts and Sports Science), offered as
+# an opt-in one-click import so a school doesn't have to define 38
+# combinations from scratch — while still leaving each school free to
+# delete or adjust whichever ones don't match what they can actually
+# offer, same as a manually-created combination. (name, math_variant, [electives])
+STANDARD_KCSE_COMBINATIONS = [
+    ('Biological Sciences & Medicine Combination', 'Mathematics (Core)', ['Chemistry', 'Biology']),
+    ('Physical Sciences & Engineering Combination', 'Mathematics (Core)', ['Chemistry', 'Physics']),
+    ('General Pure Sciences Combination', 'Mathematics (Core)', ['Physics', 'Biology']),
+    ('Advanced Physical Sciences Combination', 'Advanced Mathematics', ['Chemistry', 'Physics']),
+    ('Advanced Biological & Physical Sciences', 'Advanced Mathematics', ['Physics', 'Biology']),
+    ('Agri-Science Combination', 'Mathematics (Core)', ['Biology', 'Agriculture']),
+    ('Applied Chemistry & Agriculture', 'Mathematics (Core)', ['Chemistry', 'Agriculture']),
+    ('Health & Computing Science', 'Mathematics (Core)', ['Biology', 'Computer Studies']),
+    ('Applied Tech & Computing', 'Mathematics (Core)', ['Physics', 'Computer Studies']),
+    ('Applied Life Sciences & Nutrition', 'Mathematics (Core)', ['Biology', 'Home Science']),
+    ('Applied Chemistry & Home Science', 'Mathematics (Core)', ['Chemistry', 'Home Science']),
+    ('Architecture & Design Combination', 'Mathematics (Core)', ['Physics', 'Drawing and Design']),
+    ('Aviation & Aerospace Engineering', 'Mathematics (Core)', ['Physics', 'Aviation Technology']),
+    ('Electrical Engineering Track', 'Mathematics (Core)', ['Physics', 'Electrical Technology']),
+    ('Mechanical Engineering Track', 'Mathematics (Core)', ['Physics', 'Mechanical Technology']),
+    ('Industrial Technology Track', 'Mathematics (Core)', ['Physics', 'Woodwork / Metalwork']),
+    ('Advanced Computing & Systems Engineering', 'Advanced Mathematics', ['Physics', 'Computer Studies']),
+    ('Business & Economics Combination', 'Mathematics (Essential)', ['Business Studies', 'Economics', 'History and Citizenship']),
+    ('Humanities & Commerce Combination', 'Mathematics (Essential)', ['Business Studies', 'Geography', 'History and Citizenship']),
+    ('Religious Studies & Governance', 'Mathematics (Essential)', ['Christian Religious Education', 'History and Citizenship', 'Geography']),
+    ('Commerce & Spatial Studies', 'Mathematics (Core)', ['Business Studies', 'Geography']),
+    ('Applied Economics & Commerce', 'Mathematics (Essential)', ['Economics', 'Geography', 'Business Studies']),
+    ('Ethics, History & Enterprise', 'Mathematics (Essential)', ['History and Citizenship', 'Christian Religious Education', 'Business Studies']),
+    ('Multilingual Languages Track', 'Mathematics (Essential)', ['Literature in English', 'Fasihi ya Kiswahili', 'French']),
+    ('Languages & Cultural Studies', 'Mathematics (Essential)', ['Literature in English', 'Fasihi ya Kiswahili', 'German']),
+    ('Global Languages & Diplomacy', 'Mathematics (Essential)', ['Literature in English', 'Mandarin', 'History and Citizenship']),
+    ('Regional & Global Linguistics', 'Mathematics (Essential)', ['Arabic', 'Fasihi ya Kiswahili', 'Literature in English']),
+    ('Inclusive Communication & Linguistics', 'Mathematics (Essential)', ['Literature in English', 'Fasihi ya Kiswahili', 'Kenyan Sign Language']),
+    ('National & Heritage Languages Track', 'Mathematics (Essential)', ['Literature in English', 'Fasihi ya Kiswahili', 'Indigenous Languages']),
+    ('Fine Arts & Digital Design', 'Mathematics (Essential)', ['Fine Art', 'History and Citizenship', 'Computer Studies']),
+    ('Commercial Art & Enterprise', 'Mathematics (Essential)', ['Fine Art', 'Art and Design', 'Business Studies']),
+    ('Digital Media & Visual Arts', 'Mathematics (Essential)', ['Fine Art', 'Photography & Media Arts', 'Computer Studies']),
+    ('Performing Arts & Media Production', 'Mathematics (Essential)', ['Music', 'Theatre and Film', 'Literature in English']),
+    ('Creative Arts & International Media', 'Mathematics (Essential)', ['Theatre and Film', 'Music', 'French']),
+    ('Music Industry & Audio Technology', 'Mathematics (Essential)', ['Music', 'Business Studies', 'Computer Studies']),
+    ('Sports Science & Health Track', 'Mathematics (Essential)', ['Sports and Recreation Science', 'Biology', 'General Science']),
+    ('Sports Management & Administration', 'Mathematics (Essential)', ['Sports and Recreation Science', 'Business Studies', 'History and Citizenship']),
+    ('Sports Analytics & Technology', 'Mathematics (Essential)', ['Sports and Recreation Science', 'Computer Studies']),
+]
+
 
 def bootstrap_senior_school_schema():
     """Creates/upgrades everything this module owns: the classes
@@ -448,6 +495,14 @@ def combinations_import_form(school_id: int, request: Request, error: str = None
             </div>
             {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-4 py-3 rounded-lg whitespace-pre-wrap'>{esc(error)}</div>" if error else ""}
             {f"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg'>✅ Imported {esc(imported)} combination(s).</div>" if imported else ""}
+            <div class="bg-indigo-50 p-6 rounded-2xl border border-indigo-200 shadow-xs">
+                <h2 class="text-sm font-black text-slate-800 mb-1">📚 Import Standard KCSE Combinations</h2>
+                <p class="text-xs text-slate-500 mb-3">{len(STANDARD_KCSE_COMBINATIONS)} ready-made combinations spanning STEM, Social Sciences, and Arts &amp; Sports Science, added to Grade 10, 11 and 12 at once. You can delete or adjust any that don't match what your school actually offers afterward — same as one you'd created by hand.</p>
+                <form action="/api/v1/timetable/combinations/import-standard/{school_id}" method="post" onsubmit="return confirm('Import {len(STANDARD_KCSE_COMBINATIONS)} standard combinations across Grade 10, 11 and 12? You can delete individual ones afterward if your school doesn\\'t offer them.');">
+                    <button type="submit" class="w-full bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 rounded-lg text-sm transition">Import {len(STANDARD_KCSE_COMBINATIONS)} Standard Combinations</button>
+                </form>
+            </div>
+            <div class="text-center text-[11px] text-slate-400 font-bold uppercase tracking-wider">— or, for your own custom list —</div>
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h2 class="text-sm font-black text-slate-800 mb-2">CSV Format</h2>
                 <p class="text-xs text-slate-500 mb-3">One row per combination. Compulsory subjects (English, Kiswahili, Community Service Learning, Physical Education) are added automatically — don't include them.</p>
@@ -470,6 +525,56 @@ def combinations_import_form(school_id: int, request: Request, error: str = None
     </body>
     </html>
     """)
+
+
+@router.post("/api/v1/timetable/combinations/import-standard/{school_id}")
+def import_standard_combinations(request: Request, school_id: int):
+    """Same underlying write as the CSV importer's save step — the only
+    difference is the data comes from STANDARD_KCSE_COMBINATIONS instead
+    of an uploaded file. Every subject name in that constant was already
+    confirmed against this platform's real Senior School subject pool,
+    so — unlike the CSV path — there's no user-supplied data to validate
+    here; a lookup coming back empty for one of these subjects would
+    mean the subject pool itself changed, not a bad import."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT school_type FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school or school['school_type'] != 'senior_school':
+                raise HTTPException(status_code=403, detail="Subject Combinations are only available for Senior School institutions.")
+
+            cur.execute("SELECT id, name FROM learning_areas WHERE education_level = 'Senior School';")
+            subject_name_to_id = {r['name']: r['id'] for r in cur.fetchall()}
+            cur.execute("SELECT id FROM learning_areas WHERE education_level = 'Senior School' AND name = ANY(%s);", (AUTO_COMPULSORY_SUBJECTS,))
+            compulsory_ids = [r['id'] for r in cur.fetchall()]
+
+            imported_count = 0
+            for stream, math_variant, electives in STANDARD_KCSE_COMBINATIONS:
+                math_variant_id = subject_name_to_id.get(math_variant)
+                elective_ids = [subject_name_to_id[e] for e in electives if e in subject_name_to_id]
+                for grade_name in ["Grade 10", "Grade 11", "Grade 12"]:
+                    for lid in compulsory_ids + ([math_variant_id] if math_variant_id else []):
+                        cur.execute("""
+                            INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
+                            VALUES (%s, %s, %s, %s, TRUE)
+                            ON CONFLICT (school_id, grade_name, stream, learning_area_id)
+                            DO UPDATE SET is_compulsory = TRUE;
+                        """, (school_id, grade_name, stream, lid))
+                    for eid in elective_ids:
+                        cur.execute("""
+                            INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
+                            VALUES (%s, %s, %s, %s, FALSE)
+                            ON CONFLICT (school_id, grade_name, stream, learning_area_id)
+                            DO UPDATE SET is_compulsory = FALSE;
+                        """, (school_id, grade_name, stream, eid))
+                    imported_count += 1
+            conn.commit()
+
+    return RedirectResponse(url=f"/timetable/combinations/import/{school_id}?imported={imported_count}", status_code=303)
 
 
 @router.post("/api/v1/timetable/combinations/import/{school_id}")
