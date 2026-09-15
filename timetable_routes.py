@@ -3702,6 +3702,108 @@ def delete_subject_constraint(
 # Grade/Class Timetable View, Test & Generate (single class + whole level)
 # ============================================================
 
+@router.get("/timetable/diagnostic/{school_id}", response_class=HTMLResponse)
+def timetable_generation_diagnostic(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
+    """Shows, for one exact (grade, level, stream), everything the
+    generator and the grid view each depend on — side by side — so a
+    mismatch between what was assigned and what actually got scheduled
+    is visible directly, rather than guessed at through the generator's
+    logic. Built specifically for diagnosing 'I assigned teachers but
+    nothing shows on the timetable' reports."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT tsa.learning_area_id, tsa.custom_subject_id, tsa.staff_user_id, tsa.lessons_per_week, tsa.plan_id,
+                       COALESCE(la.name, cs.name) AS subject_name, u.full_name AS teacher_name
+                FROM teacher_subject_assignments tsa
+                LEFT JOIN learning_areas la ON tsa.learning_area_id = la.id
+                LEFT JOIN timetable_custom_subjects cs ON tsa.custom_subject_id = cs.id
+                LEFT JOIN users u ON tsa.staff_user_id = u.id
+                WHERE tsa.school_id = %s AND tsa.grade_name = %s AND tsa.education_level = %s AND tsa.stream = %s;
+            """, (school_id, grade_name, education_level, stream))
+            assignments = cur.fetchall()
+
+            cur.execute("""
+                SELECT ts.day_of_week, ts.period_id, ts.plan_id, COALESCE(la.name, cs.name) AS subject_name, u.full_name AS teacher_name
+                FROM timetable_slots ts
+                LEFT JOIN learning_areas la ON ts.learning_area_id = la.id
+                LEFT JOIN timetable_custom_subjects cs ON ts.custom_subject_id = cs.id
+                LEFT JOIN users u ON ts.staff_user_id = u.id
+                WHERE ts.school_id = %s AND ts.grade_name = %s AND ts.education_level = %s AND ts.stream = %s
+                ORDER BY ts.day_of_week, ts.period_id;
+            """, (school_id, grade_name, education_level, stream))
+            slots = cur.fetchall()
+
+            combo_subjects = []
+            if education_level == "Senior School":
+                cur.execute("""
+                    SELECT la.name FROM combination_subjects cs JOIN learning_areas la ON cs.learning_area_id = la.id
+                    WHERE cs.school_id = %s AND cs.grade_name = %s AND cs.stream = %s ORDER BY la.name;
+                """, (school_id, grade_name, stream))
+                combo_subjects = [r['name'] for r in cur.fetchall()]
+
+            cur.execute("""
+                SELECT s.stream, COUNT(*) as cnt FROM students s JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND c.grade_name = %s AND c.education_level = %s
+                  AND (s.status IS NULL OR s.status != 'GRADUATED')
+                GROUP BY s.stream;
+            """, (school_id, grade_name, education_level))
+            real_student_streams = cur.fetchall()
+
+            cur.execute("""
+                SELECT issues_json FROM timetable_generation_issues
+                WHERE school_id = %s AND grade_name = %s AND education_level = %s AND stream = %s;
+            """, (school_id, grade_name, education_level, stream))
+            issues_row = cur.fetchone()
+
+    def _rows(items, cols):
+        if not items:
+            return "<tr><td colspan='10' class='p-3 text-center text-slate-400 italic text-xs'>None found</td></tr>"
+        return "".join("<tr>" + "".join(f"<td class='p-2 border-b text-xs'>{esc(str(item.get(c, '')))}</td>" for c in cols) + "</tr>" for item in items)
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-6">
+        <div class="max-w-4xl mx-auto space-y-4">
+            <h1 class="text-lg font-black">🔍 Timetable Diagnostic — {esc(grade_name)} / {esc(stream)} ({esc(education_level)})</h1>
+
+            <div class="bg-white rounded-xl border p-4">
+                <h2 class="font-bold text-sm mb-2">1. Combination Subjects Defined ({len(combo_subjects)})</h2>
+                <p class="text-xs text-slate-500">{esc(', '.join(combo_subjects)) if combo_subjects else 'None — not Senior School, or no combination defined for this exact stream name.'}</p>
+            </div>
+
+            <div class="bg-white rounded-xl border p-4">
+                <h2 class="font-bold text-sm mb-2">2. Real Students Enrolled, By Their Actual Stream Value ({len(real_student_streams)})</h2>
+                <table class="w-full"><tbody>{_rows(real_student_streams, ['stream', 'cnt'])}</tbody></table>
+                <p class="text-[11px] text-slate-400 mt-2">Compare this exactly against "{esc(stream)}" above — any difference in spelling/case means this section won't appear on views that require an enrolled student.</p>
+            </div>
+
+            <div class="bg-white rounded-xl border p-4">
+                <h2 class="font-bold text-sm mb-2">3. Teacher Assignments Saved ({len(assignments)})</h2>
+                <table class="w-full"><tbody>{_rows(assignments, ['subject_name', 'teacher_name', 'lessons_per_week', 'plan_id'])}</tbody></table>
+            </div>
+
+            <div class="bg-white rounded-xl border p-4">
+                <h2 class="font-bold text-sm mb-2">4. Timetable Slots Actually Placed ({len(slots)})</h2>
+                <table class="w-full"><tbody>{_rows(slots, ['day_of_week', 'period_id', 'subject_name', 'teacher_name', 'plan_id'])}</tbody></table>
+            </div>
+
+            <div class="bg-white rounded-xl border p-4">
+                <h2 class="font-bold text-sm mb-2">5. Last Generation's Shortfalls/Issues</h2>
+                <pre class="text-[10px] bg-slate-50 p-3 rounded-lg overflow-x-auto">{esc(issues_row['issues_json']) if issues_row else 'None logged.'}</pre>
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
 @router.get("/timetable/grade/{school_id}", response_class=HTMLResponse)
 def timetable_grade_view(school_id: int, request: Request, grade_name: str, education_level: str, stream: str, test_issues: str = None, synced: str = None, collisions: str = None):
     auth_error = require_school_session(request, school_id)
