@@ -91,6 +91,13 @@ def bootstrap_senior_school_schema():
                 'Christian Religious Education', 'Islamic Religious Education', 'Hindu Religious Education',
                 'Music', 'Theatre and Film', 'Fine Art', 'Art and Design', 'Sports and Recreation Science',
                 'French', 'German', 'Arabic', 'Mandarin',
+                # Added for a real bulk combinations import — these are
+                # genuine, distinct CBC Senior School subjects (Technical
+                # Studies track and Home Science pathway) that weren't in
+                # the original pool yet.
+                'Aviation Technology', 'Electrical Technology', 'Mechanical Technology',
+                'Woodwork / Metalwork', 'Home Science', 'Economics',
+                'Indigenous Languages', 'Photography & Media Arts',
             ]
             for name in subjects_payload:
                 cur.execute("INSERT INTO learning_areas (education_level, name) VALUES ('Senior School', %s) ON CONFLICT (education_level, name) DO NOTHING;", (name,))
