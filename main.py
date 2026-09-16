@@ -3471,6 +3471,12 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
                 </div>
             </div>
 
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6 mt-6">
+                <h2 class="text-sm font-bold text-slate-800 mb-1">✉️ Email Teachers &amp; Staff</h2>
+                <p class="text-xs text-slate-400 mb-4">Send a direct email to staff at one school, or across the whole platform — inductions, updates, or feature announcements.</p>
+                <a href="/superadmin/email-staff" class="inline-block bg-indigo-800 hover:bg-indigo-900 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">Compose Email →</a>
+            </div>
+
             {support_contact_html()}
             <p class="text-center text-[11px] text-slate-500 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-300">Elimu Hub</span></p>
         </div>
@@ -3736,6 +3742,140 @@ def delete_platform_announcement(announcement_id: int, request: Request):
             cur.execute("DELETE FROM platform_announcements WHERE id = %s;", (announcement_id,))
             conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
+
+
+# A couple of reusable starting points, editable before sending — not a
+# rigid template system, just a fast way to not start from a blank box
+# every time for the two purposes explicitly asked for.
+STAFF_EMAIL_TEMPLATES = {
+    "induction": {
+        "subject": "Welcome to Elimu Hub",
+        "body": (
+            "<p>Hi there,</p>"
+            "<p>Welcome aboard! Your school is now set up on Elimu Hub, and you should have login access already. "
+            "If you haven't logged in yet, use the email your school administrator registered you with, along with the \"Forgot your password?\" link on the login page to set your own password.</p>"
+            "<p>If anything is unclear or you run into an issue getting started, just reply to this email.</p>"
+        ),
+    },
+    "feature": {
+        "subject": "New on Elimu Hub: Schemes of Work",
+        "body": (
+            "<p>Hi there,</p>"
+            "<p>A quick note about a feature worth trying if you haven't yet: <b>Schemes of Work</b>, right in Elimu Hub. "
+            "It lets you plan and track your termly coverage without juggling a separate document.</p>"
+            "<p>Log in and look for \"Schemes of Work\" in your dashboard to give it a try.</p>"
+        ),
+    },
+}
+
+
+@app.get("/superadmin/email-staff", response_class=HTMLResponse)
+def superadmin_email_staff_form(request: Request, template: str = "", sent: str = None, failed: str = None, error: str = None):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name FROM schools WHERE status = 'active' ORDER BY name ASC;")
+            schools = cur.fetchall()
+
+    tmpl = STAFF_EMAIL_TEMPLATES.get(template, {"subject": "", "body": ""})
+    school_options = "".join(f'<option value="{s["id"]}">{esc(s["name"])}</option>' for s in schools)
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Email Staff</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="flex items-center justify-between">
+                <h1 class="text-lg font-black text-slate-800">✉️ Email Teachers &amp; Staff</h1>
+                <a href="/superadmin/dashboard" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back to Dashboard</a>
+            </div>
+            {f"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg'>✅ Sent to {esc(sent)} recipient(s).{f' {esc(failed)} failed to send — check their email addresses.' if failed and failed != '0' else ''}</div>" if sent else ""}
+            {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-4 py-3 rounded-lg'>{esc(error)}</div>" if error else ""}
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">Start from a template (optional)</h2>
+                <div class="flex gap-2 mb-4">
+                    <a href="/superadmin/email-staff" class="text-xs font-bold px-3 py-1.5 rounded-lg border {'bg-indigo-800 text-white border-indigo-800' if not template else 'bg-white text-slate-600 hover:bg-slate-50'}">Blank</a>
+                    <a href="/superadmin/email-staff?template=induction" class="text-xs font-bold px-3 py-1.5 rounded-lg border {'bg-indigo-800 text-white border-indigo-800' if template == 'induction' else 'bg-white text-slate-600 hover:bg-slate-50'}">Induction Welcome</a>
+                    <a href="/superadmin/email-staff?template=feature" class="text-xs font-bold px-3 py-1.5 rounded-lg border {'bg-indigo-800 text-white border-indigo-800' if template == 'feature' else 'bg-white text-slate-600 hover:bg-slate-50'}">Feature Announcement</a>
+                </div>
+
+                <form action="/api/v1/superadmin/email-staff/send" method="post" class="space-y-4">
+                    <div>
+                        <label class="text-xs font-bold text-slate-600 uppercase tracking-wide">Send To</label>
+                        <div class="flex gap-4 mt-2">
+                            <label class="flex items-center gap-2 text-sm cursor-pointer">
+                                <input type="radio" name="scope" value="all" checked onchange="document.getElementById('schoolPicker').classList.add('hidden')">
+                                All staff, every active school
+                            </label>
+                            <label class="flex items-center gap-2 text-sm cursor-pointer">
+                                <input type="radio" name="scope" value="one_school" onchange="document.getElementById('schoolPicker').classList.remove('hidden')">
+                                One specific school
+                            </label>
+                        </div>
+                        <select name="school_id" id="schoolPicker" class="hidden w-full border p-2.5 rounded-lg mt-2 text-sm">
+                            {school_options}
+                        </select>
+                    </div>
+
+                    <div>
+                        <label class="text-xs font-bold text-slate-600 uppercase tracking-wide">Subject</label>
+                        <input type="text" name="subject" value="{esc(tmpl['subject'])}" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                    </div>
+
+                    <div>
+                        <label class="text-xs font-bold text-slate-600 uppercase tracking-wide">Message</label>
+                        <textarea name="body" rows="10" class="w-full border p-2.5 rounded-lg mt-1 text-sm font-mono" required>{esc(tmpl['body'])}</textarea>
+                        <p class="text-[10px] text-slate-400 mt-1">Basic HTML is fine (e.g. &lt;p&gt;, &lt;b&gt;) — this is sent as the email body as-is.</p>
+                    </div>
+
+                    <button type="submit" onclick="return confirm('Send this email now? This cannot be undone once sent.');" class="w-full bg-indigo-800 hover:bg-indigo-900 text-white font-bold py-3 rounded-lg text-sm transition">Send Email</button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/api/v1/superadmin/email-staff/send")
+def superadmin_email_staff_send(request: Request, scope: str = Form(...), school_id: int = Form(None), subject: str = Form(...), body: str = Form(...)):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    subject = subject.strip()
+    if not subject or not body.strip():
+        return RedirectResponse(url="/superadmin/email-staff?error=" + urllib.parse.quote("Subject and message are both required."), status_code=303)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if scope == "one_school":
+                if not school_id:
+                    return RedirectResponse(url="/superadmin/email-staff?error=" + urllib.parse.quote("Pick a school first."), status_code=303)
+                cur.execute("""
+                    SELECT email, full_name FROM users
+                    WHERE school_id = %s AND role IN ('staff', 'admin') AND email IS NOT NULL AND email != '';
+                """, (school_id,))
+            else:
+                cur.execute("""
+                    SELECT u.email, u.full_name FROM users u JOIN schools s ON u.school_id = s.id
+                    WHERE u.role IN ('staff', 'admin') AND s.status = 'active' AND u.email IS NOT NULL AND u.email != '';
+                """)
+            recipients = cur.fetchall()
+
+    sent_count, failed_count = 0, 0
+    for r in recipients:
+        if send_email(r['email'], subject, body):
+            sent_count += 1
+        else:
+            failed_count += 1
+
+    return RedirectResponse(url=f"/superadmin/email-staff?sent={sent_count}&failed={failed_count}", status_code=303)
 
 
 @app.get("/superadmin/school/{school_id}", response_class=HTMLResponse)
