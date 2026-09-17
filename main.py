@@ -1025,6 +1025,23 @@ def bootstrap_database_schema():
                     sort_order INTEGER NOT NULL DEFAULT 0
                 );
 
+                -- Lets a school add its own exam cycle names (e.g. "Targeter",
+                -- "Mock") alongside the standard Opener/Midterm/End Term. The
+                -- Assessment Phase dropdown offers these as extra choices, and
+                -- active_cycle itself is a plain VARCHAR with no DB-level
+                -- constraint, so a custom name flows through marks entry,
+                -- exam codes, and report cards exactly like a standard one —
+                -- it's just not summed into "Combined Term" (Opener+Mid+End),
+                -- since a custom cycle like a mock exam isn't part of that
+                -- regular progression.
+                CREATE TABLE IF NOT EXISTS school_custom_cycles (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+                    cycle_name VARCHAR(30) NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE (school_id, cycle_name)
+                );
+
                 CREATE TABLE IF NOT EXISTS learning_areas (
                     id SERIAL PRIMARY KEY,
                     education_level VARCHAR(100) NOT NULL,
@@ -7485,6 +7502,8 @@ def school_settings_page(school_id: int, request: Request):
                 raise HTTPException(status_code=404, detail="School not found.")
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
+            cur.execute("SELECT id, cycle_name FROM school_custom_cycles WHERE school_id = %s ORDER BY cycle_name ASC;", (school_id,))
+            custom_cycles = cur.fetchall()
 
     st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'opening_date': '', 'closing_date': '', 'is_single_stream': False}
     is_single_stream = st.get('is_single_stream', False)
@@ -7520,6 +7539,7 @@ def school_settings_page(school_id: int, request: Request):
                                 <option value="Opener" {"selected" if st['active_cycle'] == 'Opener' else ""}>Opener Exam</option>
                                 <option value="Midterm" {"selected" if st['active_cycle'] == 'Midterm' else ""}>Midterm Exam</option>
                                 <option value="End Term" {"selected" if st['active_cycle'] == 'End Term' else ""}>End Term Synthesis</option>
+                                {"".join(f'<option value="{esc(c["cycle_name"])}" {"selected" if st["active_cycle"] == c["cycle_name"] else ""}>{esc(c["cycle_name"])}</option>' for c in custom_cycles)}
                             </select>
                         </div>
                     </div>
@@ -7566,6 +7586,24 @@ def school_settings_page(school_id: int, request: Request):
                     </div>
                     <button type="submit" class="w-full bg-slate-800 hover:bg-slate-900 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">Commit Engine Settings</button>
                 </form>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6">
+                <h2 class="text-sm font-black text-slate-800 mb-1">🎯 Custom Assessment Cycles</h2>
+                <p class="text-xs text-slate-400 mb-3">Add your own exam cycles beyond Opener/Midterm/End Term — e.g. "Targeter", "Mock", "Pre-Mock" — and they'll appear as extra Assessment Phase choices above. A custom cycle works exactly like a standard one for marks entry and report cards, but isn't included in the "Combined Term" average, since it's a standalone assessment rather than part of the regular term progression.</p>
+                <form action="/api/v1/settings/custom-cycles/add/{school_id}" method="post" class="flex gap-2 mb-3">
+                    <input type="text" name="cycle_name" placeholder="e.g. Targeter" maxlength="30" class="flex-1 border border-slate-200 p-2 rounded-xl text-xs" required>
+                    <button type="submit" class="bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold px-4 py-2 rounded-xl transition">+ Add</button>
+                </form>
+                <div class="flex flex-wrap gap-2">
+                    {"".join(f'''
+                    <form action="/api/v1/settings/custom-cycles/delete/{school_id}/{c["id"]}" method="post" onsubmit="return confirm('Remove the {esc(c["cycle_name"])} cycle? This does NOT delete any marks already saved under it.');">
+                        <button type="submit" class="flex items-center gap-1.5 bg-slate-50 border border-slate-200 text-slate-700 text-xs font-semibold px-2.5 py-1.5 rounded-lg hover:bg-rose-50 hover:border-rose-200 hover:text-rose-600 transition">
+                            {esc(c["cycle_name"])} <span class="text-slate-400">×</span>
+                        </button>
+                    </form>
+                    ''' for c in custom_cycles) or "<p class='text-slate-400 text-xs italic'>No custom cycles added yet.</p>"}
+                </div>
             </div>
 
             <div class="bg-white rounded-2xl border border-amber-200/80 shadow-xs p-6">
@@ -7714,9 +7752,16 @@ def update_settings_endpoint(
 
     # Constrain free-text-ish fields to known-good values so a crafted POST
     # can't smuggle unexpected data (defense in depth beyond output escaping).
+    # active_cycle's allowed set isn't just the 3 standard names — it also
+    # includes whatever custom cycles (e.g. "Targeter") this specific school
+    # has defined, since those are equally valid choices in the dropdown.
     allowed_terms = {"Term 1", "Term 2", "Term 3"}
-    allowed_cycles = {"Opener", "Midterm", "End Term"}
     allowed_themes = {"emerald", "blue", "indigo", "purple", "slate"}
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT cycle_name FROM school_custom_cycles WHERE school_id = %s;", (school_id,))
+            allowed_cycles = {"Opener", "Midterm", "End Term"} | {r[0] for r in cur.fetchall()}
 
     if active_term not in allowed_terms:
         raise HTTPException(status_code=400, detail="Invalid academic term selected.")
@@ -7790,6 +7835,49 @@ def update_settings_endpoint(
                 conn.commit()
 
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
+
+
+@app.post("/api/v1/settings/custom-cycles/add/{school_id}")
+def add_custom_cycle(school_id: int, request: Request, cycle_name: str = Form(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    cycle_name = cycle_name.strip()
+    if not cycle_name:
+        raise HTTPException(status_code=400, detail="Cycle name can't be empty.")
+    if cycle_name in ("Opener", "Midterm", "End Term"):
+        raise HTTPException(status_code=400, detail="That name is already one of the standard cycles.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO school_custom_cycles (school_id, cycle_name) VALUES (%s, %s) ON CONFLICT (school_id, cycle_name) DO NOTHING;",
+                (school_id, cycle_name)
+            )
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/school-settings/{school_id}", status_code=303)
+
+
+@app.post("/api/v1/settings/custom-cycles/delete/{school_id}/{cycle_id}")
+def delete_custom_cycle(school_id: int, cycle_id: int, request: Request):
+    """Only removes the cycle from the dropdown of future choices — any
+    marks already saved under this cycle name stay exactly as they are
+    and remain fully viewable/reportable, since active_cycle on the
+    scores themselves is just a stored string, not a foreign key to
+    this table."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM school_custom_cycles WHERE id = %s AND school_id = %s;", (cycle_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/school-settings/{school_id}", status_code=303)
+
 
 @app.post("/api/v1/students/add/{school_id}")
 def backend_add_student(
