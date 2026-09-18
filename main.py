@@ -6700,7 +6700,7 @@ def educators_bulk_entry_grid(
     saved: int = None,
     skipped: int = None,
     edit_term: str = None,
-    edit_year: int = None,
+    edit_year: str = None,  # accepted as str, not int — a redirect can legitimately send edit_year= (empty string) when not editing a past cycle, and FastAPI's automatic int coercion rejects an empty string with a 422 before this function body ever runs. Parsed manually below instead.
     edit_cycle: str = None,
 ):
     # This route had NO session check at all before — anyone who knew or
@@ -6752,8 +6752,13 @@ def educators_bulk_entry_grid(
             school_active_term, school_active_year = active_term, active_year
             is_editing_past_cycle = False
             if can_edit_past_cycle and edit_term and edit_year and edit_cycle:
-                active_term, active_year, active_cycle = edit_term, edit_year, edit_cycle
-                is_editing_past_cycle = True
+                try:
+                    edit_year_int = int(edit_year)
+                except ValueError:
+                    edit_year_int = None
+                if edit_year_int:
+                    active_term, active_year, active_cycle = edit_term, edit_year_int, edit_cycle
+                    is_editing_past_cycle = True
             cycle_name = active_cycle
 
             custom_cycle_names = []
