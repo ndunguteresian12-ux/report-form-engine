@@ -6651,6 +6651,9 @@ def educators_bulk_entry_grid(
     cycle_name: str = None,  # ignored — always overridden by school_settings.active_cycle below; kept only so old links with ?cycle_name=... in the URL don't error out
     saved: int = None,
     skipped: int = None,
+    edit_term: str = None,
+    edit_year: int = None,
+    edit_cycle: str = None,
 ):
     # This route had NO session check at all before — anyone who knew or
     # guessed the URL parameters could view or edit any school's student
@@ -6684,11 +6687,37 @@ def educators_bulk_entry_grid(
             # whenever no cycle was specified in the URL at all), which is
             # exactly how marks kept landing in the wrong phase. The
             # cycle is no longer a user-editable input anywhere on this
-            # page; whatever gets submitted is always overridden by this.
-            cycle_name = (settings_row['active_cycle'] if settings_row else None) or 'Opener'
+            # page for staff; whatever gets submitted is always overridden
+            # by this for them.
+            #
+            # An admin, however, can deliberately switch to editing a
+            # PAST cycle/term/year via edit_term/edit_year/edit_cycle —
+            # the one genuine gap this whole lockdown left: once a school
+            # moves on from Opener to Midterm, there was no way at all,
+            # even for an admin, to go back and fix an Opener mark. This
+            # is gated to admin only, via a real dropdown shown only to
+            # them (staff still see the same locked, read-only label),
+            # and the save endpoint independently re-checks role too —
+            # never trusting this override on the strength of a crafted
+            # request alone.
+            active_cycle = (settings_row['active_cycle'] if settings_row else None) or 'Opener'
+            school_active_term, school_active_year = active_term, active_year
+            is_editing_past_cycle = False
+            if not is_restricted_staff and edit_term and edit_year and edit_cycle:
+                active_term, active_year, active_cycle = edit_term, edit_year, edit_cycle
+                is_editing_past_cycle = True
+            cycle_name = active_cycle
+
+            custom_cycle_names = []
+            if not is_restricted_staff:
+                cur.execute("SELECT cycle_name FROM school_custom_cycles WHERE school_id = %s ORDER BY cycle_name ASC;", (school_id,))
+                custom_cycle_names = [r['cycle_name'] for r in cur.fetchall()]
 
             # Deadline only ever restricts staff — an admin can always
             # still enter or correct marks, e.g. for a late enrollment.
+            # Editing a past cycle is an admin-only action to begin with,
+            # so the deadline (which never applies to admins anyway)
+            # never blocks it either.
             deadline = settings_row['marks_entry_deadline'] if settings_row else None
             deadline_passed = bool(is_restricted_staff and deadline and kenya_now() > deadline)
             
@@ -6848,6 +6877,9 @@ def educators_bulk_entry_grid(
                 <input type="hidden" name="grade_name" value="{esc(grade_name)}">
                 <input type="hidden" name="education_level" value="{esc(education_level)}">
                 <input type="hidden" name="stream" value="{esc(stream)}">
+                <input type="hidden" name="edit_term" value="{esc(active_term) if is_editing_past_cycle else ''}">
+                <input type="hidden" name="edit_year" value="{active_year if is_editing_past_cycle else ''}">
+                <input type="hidden" name="edit_cycle" value="{esc(active_cycle) if is_editing_past_cycle else ''}">
                 <div>
                     <label class="font-bold text-slate-500">Target Learning Subject</label>
                     <select name="learning_area_id" onchange="this.form.submit()" class="w-full border p-3 rounded-xl mt-1 font-semibold text-sm">{subject_options}</select>
@@ -6855,13 +6887,47 @@ def educators_bulk_entry_grid(
                 <div>
                     <label class="font-bold text-slate-500">Evaluation Phase</label>
                     <div class="w-full border border-slate-200 bg-slate-50 p-3 rounded-xl mt-1 font-semibold text-sm text-slate-700 flex items-center gap-1.5">
-                        🔒 {esc({'Opener': 'Opener Phase', 'Midterm': 'Midterm Cycle', 'End Term': 'End Term Synthesis'}.get(cycle_name, cycle_name))}
+                        🔒 {esc({'Opener': 'Opener Phase', 'Midterm': 'Midterm Cycle', 'End Term': 'End Term Synthesis'}.get(cycle_name, cycle_name))} <span class="text-[10px] font-normal text-slate-400">({esc(active_term)} {active_year})</span>
                     </div>
-                    <p class="text-[10px] text-slate-400 mt-1">Set school-wide under School Settings — not editable per class, so marks can never land in the wrong phase by accident.</p>
+                    <p class="text-[10px] text-slate-400 mt-1">{"Set school-wide under School Settings — not editable per class, so marks can never land in the wrong phase by accident." if is_restricted_staff else "Locked for everyday entry to prevent marks landing in the wrong phase by accident. Use \"Edit a past phase\" below to deliberately correct an earlier one."}</p>
                 </div>
                 <div class="hidden sm:flex items-end text-slate-400 text-[11px] italic pb-2">Changing subject auto-updates student listing map.</div>
             </form>
+
+            {f'''<details class="mt-3 border-t pt-3" {"open" if is_editing_past_cycle else ""}>
+                <summary class="text-xs font-bold text-indigo-700 cursor-pointer">✏️ Edit a past phase instead (admin only)</summary>
+                <form method="get" action="/staff/bulk-entry/{school_id}" class="grid grid-cols-1 sm:grid-cols-4 gap-2 mt-3 text-xs items-end">
+                    <input type="hidden" name="grade_name" value="{esc(grade_name)}">
+                    <input type="hidden" name="education_level" value="{esc(education_level)}">
+                    <input type="hidden" name="stream" value="{esc(stream)}">
+                    <input type="hidden" name="learning_area_id" value="{selected_area_id or ""}">
+                    <div>
+                        <label class="font-bold text-slate-500 block mb-1">Year</label>
+                        <select name="edit_year" class="w-full border p-2 rounded-lg text-xs">
+                            <option value="{school_active_year - 1}" {"selected" if is_editing_past_cycle and active_year == school_active_year - 1 else ""}>{school_active_year - 1}</option>
+                            <option value="{school_active_year}" {"selected" if (not is_editing_past_cycle) or active_year == school_active_year else ""}>{school_active_year}</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="font-bold text-slate-500 block mb-1">Term</label>
+                        <select name="edit_term" class="w-full border p-2 rounded-lg text-xs">
+                            {"".join(f'<option value="{t}" {"selected" if active_term == t else ""}>{t}</option>' for t in ["Term 1", "Term 2", "Term 3"])}
+                        </select>
+                    </div>
+                    <div>
+                        <label class="font-bold text-slate-500 block mb-1">Phase</label>
+                        <select name="edit_cycle" class="w-full border p-2 rounded-lg text-xs">
+                            {"".join(f'<option value="{esc(c)}" {"selected" if active_cycle == c else ""}>{esc(c)}</option>' for c in (["Opener", "Midterm", "End Term"] + custom_cycle_names))}
+                        </select>
+                    </div>
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold px-3 py-2 rounded-lg text-xs transition">Switch</button>
+                </form>
+            </details>''' if not is_restricted_staff else ''}
         </div>
+
+        {f'''<div class="bg-amber-50 border border-amber-300 text-amber-800 text-sm px-4 py-3 rounded-xl font-bold">
+            ⚠️ You're editing {esc(active_cycle)} marks for {esc(active_term)} {active_year} — not the school's current active phase. Changes here affect that specific historical record only.
+        </div>''' if is_editing_past_cycle else ''}
 
         {f'''<div class="bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-xl">
             🔒 Marks entry for this Assessment Phase closed on {deadline.strftime('%d %b %Y, %H:%M')}. Ask your admin to enter or correct marks, or extend the deadline under School Settings.
@@ -6874,6 +6940,9 @@ def educators_bulk_entry_grid(
             <input type="hidden" name="learning_area_id" value="{selected_area_id}">
             <input type="hidden" name="cycle_name" value="{cycle_name}">
             <input type="hidden" name="is_paper_mode" value="{'1' if is_paper_mode else '0'}">
+            <input type="hidden" name="edit_term" value="{esc(active_term) if is_editing_past_cycle else ''}">
+            <input type="hidden" name="edit_year" value="{active_year if is_editing_past_cycle else ''}">
+            <input type="hidden" name="edit_cycle" value="{esc(active_cycle) if is_editing_past_cycle else ''}">
 
             {f'''<div class="p-3.5 bg-indigo-50 border-b border-indigo-100 flex flex-wrap items-center gap-3 text-xs">
                 <span class="font-bold text-indigo-800">📄 {esc(selected_subject_name)} is assessed as two papers —</span>
@@ -8699,6 +8768,32 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     # just in the UI.
     cycle_name = (settings_row[2] if settings_row else None) or 'Opener'
 
+    # The one deliberate exception: an admin explicitly editing a PAST
+    # cycle (via the admin-only "Edit a past phase" control on the entry
+    # page) needs their save to actually target that past term/year/
+    # cycle, not silently snap back to whatever's currently active. Only
+    # honored for role == 'admin', re-checked here independently of
+    # whatever the entry page showed — never trusted on the strength of
+    # the hidden form fields alone, since a request can always be
+    # crafted by hand.
+    edit_term = form_data.get("edit_term") or ""
+    edit_year_raw = form_data.get("edit_year") or ""
+    edit_cycle = form_data.get("edit_cycle") or ""
+    is_editing_past_cycle = False
+    if viewer and viewer.get('role') == 'admin' and edit_term and edit_year_raw and edit_cycle:
+        try:
+            edit_year = int(edit_year_raw)
+        except ValueError:
+            edit_year = None
+        if edit_term in ("Term 1", "Term 2", "Term 3") and edit_year:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM school_custom_cycles WHERE school_id = %s AND cycle_name = %s;", (school_id, edit_cycle))
+                    is_valid_custom_cycle = bool(cur.fetchone())
+            if edit_cycle in ("Opener", "Midterm", "End Term") or is_valid_custom_cycle:
+                active_term, active_year, cycle_name = edit_term, edit_year, edit_cycle
+                is_editing_past_cycle = True
+
     # Real enforcement of the marks entry deadline — the entry page
     # already disables the submit button, but that's cosmetic; a request
     # can always be crafted by hand (e.g. the page was open before the
@@ -8833,6 +8928,13 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
             "cycle_name": cycle_name,
             "saved": saved_count,
             "skipped": skipped_entries,
+            # Keeps the admin on the same past-cycle view after saving,
+            # instead of silently bouncing them back to the current
+            # active phase — only ever set when the override above
+            # actually applied (viewer confirmed as admin).
+            "edit_term": form_data.get("edit_term", "") if is_editing_past_cycle else "",
+            "edit_year": form_data.get("edit_year", "") if is_editing_past_cycle else "",
+            "edit_cycle": form_data.get("edit_cycle", "") if is_editing_past_cycle else "",
         })
         return RedirectResponse(url=f"/staff/bulk-entry/{school_id}?{redirect_params}", status_code=303)
 
@@ -8916,6 +9018,9 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
         "cycle_name": cycle_name,
         "saved": saved_count,
         "skipped": skipped_entries,
+        "edit_term": form_data.get("edit_term", "") if is_editing_past_cycle else "",
+        "edit_year": form_data.get("edit_year", "") if is_editing_past_cycle else "",
+        "edit_cycle": form_data.get("edit_cycle", "") if is_editing_past_cycle else "",
     })
     return RedirectResponse(url=f"/staff/bulk-entry/{school_id}?{redirect_params}", status_code=303)
 
