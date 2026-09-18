@@ -839,6 +839,13 @@ def bootstrap_database_schema():
                 -- Junior School options either.
                 ALTER TABLE schools ADD COLUMN IF NOT EXISTS school_type VARCHAR(20) NOT NULL DEFAULT 'comprehensive';
 
+                -- Head of Institution's signature image, shown pre-printed
+                -- on every report card above the signature line — saves the
+                -- admin/headteacher from hand-signing each physical copy.
+                -- NULL means "not uploaded yet", in which case the line
+                -- stays blank exactly as it always has.
+                ALTER TABLE schools ADD COLUMN IF NOT EXISTS hoi_signature_url VARCHAR(512);
+
                 CREATE TABLE IF NOT EXISTS school_settings (
                     school_id INTEGER PRIMARY KEY REFERENCES schools(id) ON DELETE CASCADE,
                     active_year INTEGER DEFAULT 2026,
@@ -2420,6 +2427,60 @@ async def update_school_logo_submit(school_id: int, request: Request, logo_file:
 
     storage_flag = "cloud" if logo_resolved_url.startswith("http") else "local"
     return RedirectResponse(url=f"/admin/dashboard/{school_id}?logo_storage={storage_flag}", status_code=303)
+
+
+@app.post("/api/v1/school/hoi-signature/update/{school_id}")
+async def update_hoi_signature_submit(school_id: int, request: Request, signature_file: UploadFile = File(...)):
+    """Same upload pattern as the school logo above — Supabase storage
+    first, falling back to local disk — just a different bucket/column,
+    since a signature is functionally the same kind of asset."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    if not signature_file or not signature_file.filename:
+        raise HTTPException(status_code=400, detail="A signature image file is required.")
+
+    file_extension = os.path.splitext(signature_file.filename)[1].lower()
+    if file_extension not in ALLOWED_LOGO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Use PNG, JPG, GIF, or WEBP.")
+
+    contents = await signature_file.read()
+    if len(contents) > MAX_LOGO_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="Signature file is too large (5MB max).")
+
+    safe_filename = f"hoi_signature_{uuid.uuid4().hex}{file_extension}"
+    signature_resolved_url = None
+
+    if supabase_client:
+        try:
+            supabase_client.storage.from_("logos").upload(
+                path=safe_filename,
+                file=contents,
+                file_options={"content-type": signature_file.content_type}
+            )
+            signature_resolved_url = supabase_client.storage.from_("logos").get_public_url(safe_filename)
+        except Exception as storage_err:
+            global _last_storage_error
+            _last_storage_error = f"{type(storage_err).__name__}: {storage_err}"
+            logger.error(f"Supabase Cloud upload failed for HOI signature, reverting locally: {storage_err}")
+
+    if not signature_resolved_url:
+        local_path = f"{UPLOAD_DIR}/{safe_filename}"
+        try:
+            with open(local_path, "wb") as f:
+                f.write(contents)
+            signature_resolved_url = f"/{local_path}"
+        except OSError as io_err:
+            logger.error(f"Failed to save uploaded HOI signature locally: {io_err}")
+            raise HTTPException(status_code=500, detail="Could not save the uploaded signature. Please try again.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE schools SET hoi_signature_url = %s WHERE id = %s;", (signature_resolved_url, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/school/profile/{school_id}?saved=1", status_code=303)
 
 
 @app.get("/admin/dashboard/{school_id}", response_class=HTMLResponse)
@@ -6861,6 +6922,18 @@ def educators_bulk_entry_grid(
 
 
 @app.get("/api/v1/reports/bulk-print/{school_id}", response_class=HTMLResponse)
+def _get_previous_term_year(active_term: str, active_year: int):
+    """Term 1 -> previous year's Term 3; Term 2 -> this year's Term 1;
+    Term 3 -> this year's Term 2. Used to show each student's position
+    from the term before, alongside their current one, on the report
+    card — the standard way Kenyan report cards show trend."""
+    term_order = ["Term 1", "Term 2", "Term 3"]
+    idx = term_order.index(active_term) if active_term in term_order else 0
+    if idx == 0:
+        return "Term 3", active_year - 1
+    return term_order[idx - 1], active_year
+
+
 def output_batch_class_report_forms(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
     # This report contains full student names, admission numbers, and
     # every subject score/performance level for an entire class — real
@@ -6959,7 +7032,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                 ORDER BY stream_position ASC, admission_number ASC;
             """, (st['active_term'], st['active_year'], school_id, grade_name, stream))
             students = cur.fetchall()
-            
+
             if not students:
                 return f"""
                 <div style="font-family:'Plus Jakarta Sans',Arial,sans-serif; text-align:center; padding:80px 20px; background:#F7F9F8; min-height:100vh;">
@@ -6967,6 +7040,49 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                     <a href="/admin/dashboard/{school_id}" style="background:#1e1b4b; color:white; padding:12px 24px; border-radius:10px; font-weight:bold; text-decoration:none; font-size:13px;">← Back to Dashboard</a>
                 </div>
                 """
+
+            # Same ranking calculation, run again for the previous term, so
+            # each student's report card can show "was 8th, now 5th" style
+            # trend. A student with no scores at all in the previous term
+            # (new admission, or the school just hasn't been using the
+            # system that long) is simply absent from this lookup, and the
+            # report card shows "—" for them rather than a wrong number.
+            prev_term, prev_year = _get_previous_term_year(st['active_term'], st['active_year'])
+            cur.execute("""
+                WITH subject_averages AS (
+                    SELECT
+                        sc.student_id,
+                        sc.learning_area_id,
+                        AVG(sc.raw_score) AS subject_avg
+                    FROM student_scores sc
+                    WHERE sc.cycle_name IN ('Opener', 'Midterm', 'End Term') AND sc.term = %s AND sc.year = %s
+                    GROUP BY sc.student_id, sc.learning_area_id
+                ),
+                student_mean_scores AS (
+                    SELECT
+                        s.id AS student_id,
+                        s.stream,
+                        c.grade_name,
+                        COALESCE(SUM(sa.subject_avg), 0) AS total_marks
+                    FROM students s
+                    JOIN classes c ON s.class_id = c.id
+                    JOIN subject_averages sa ON s.id = sa.student_id
+                    WHERE s.school_id = %s AND c.grade_name = %s
+                      AND (s.status IS NULL OR s.status != 'GRADUATED')
+                    GROUP BY s.id, s.stream, c.grade_name
+                ),
+                cohort_rankings AS (
+                    SELECT
+                        *,
+                        RANK() OVER (PARTITION BY grade_name, stream ORDER BY total_marks DESC) AS stream_position,
+                        COUNT(*) OVER (PARTITION BY grade_name, stream) AS total_in_stream,
+                        RANK() OVER (PARTITION BY grade_name ORDER BY total_marks DESC) AS grade_position,
+                        COUNT(*) OVER (PARTITION BY grade_name) AS total_in_grade
+                    FROM student_mean_scores
+                )
+                SELECT student_id, stream_position, total_in_stream, grade_position, total_in_grade FROM cohort_rankings WHERE stream = %s;
+            """, (prev_term, prev_year, school_id, grade_name, stream))
+            previous_positions = {r['student_id']: r for r in cur.fetchall()}
 
             # Only show a column for an exam cycle if it's actually been keyed
             # in anywhere for this batch — e.g. if only End Term has been
@@ -7200,12 +7316,14 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                                 <div style="font-size: 15px; font-weight: 900; color: #1e3a8a; margin-top: 1px;">
                                     {s['stream_position']} <span style="font-size: 11px; font-weight: normal; color: #475569;">out of {s['total_in_stream']}</span>
                                 </div>
+                                <div style="font-size: 9px; color: #94a3b8; margin-top: 1px;">Previous ({esc(prev_term)}): {f"{previous_positions[s['student_id']]['stream_position']} of {previous_positions[s['student_id']]['total_in_stream']}" if s['student_id'] in previous_positions else '—'}</div>
                             </div>
                             <div style="border: 1px dashed #059669; padding: 4px 8px; border-radius: 6px; background: #f0fdf4; text-align: center;">
                                 <span style="font-size: 10px; text-transform: uppercase; font-weight: bold; color: #059669;">Overall Position In Grade</span>
                                 <div style="font-size: 15px; font-weight: 900; color: #065f46; margin-top: 1px;">
                                     {s['grade_position']} <span style="font-size: 11px; font-weight: normal; color: #475569;">out of {s['total_in_grade']}</span>
                                 </div>
+                                <div style="font-size: 9px; color: #94a3b8; margin-top: 1px;">Previous ({esc(prev_term)}): {f"{previous_positions[s['student_id']]['grade_position']} of {previous_positions[s['student_id']]['total_in_grade']}" if s['student_id'] in previous_positions else '—'}</div>
                             </div>
                         </div>
 
@@ -7282,6 +7400,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
 
                         <div style="display:flex; justify-content:space-between; gap:12px; margin-top:8px; padding-top:6px; border-top: 1.5px solid #cbd5e1;">
                             <div style="flex:1; text-align:center;">
+                                {f'<img src="{esc(school["hoi_signature_url"])}" style="height:32px; max-width:100%; object-fit:contain; margin-bottom:-4px;" alt="Signature">' if school.get('hoi_signature_url') else ''}
                                 <div style="border-bottom:1px solid #334155; height:16px;"></div>
                                 <div style="font-size:9px; color:#334155; margin-top:2px;">
                                     <b>{esc(st.get('head_teacher_name') or '')}</b><br>Head of Institution — Signature
@@ -8063,6 +8182,20 @@ def school_profile_view(school_id: int, request: Request, saved: str = None):
 
                 <button type="submit" class="w-full bg-indigo-800 hover:bg-indigo-900 text-white font-bold py-3 rounded-xl text-sm transition">Save Changes</button>
             </form>
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h3 class="text-xs font-bold uppercase tracking-wider text-emerald-700 mb-1">✍️ Head of Institution Signature</h3>
+                <p class="text-xs text-slate-400 mb-3">Upload a scanned or photographed signature once, and it's automatically printed on every report card — no more hand-signing each physical copy.</p>
+                {f'''<div class="mb-3 p-3 bg-slate-50 border rounded-xl flex items-center gap-3">
+                    <img src="{esc(school['hoi_signature_url'])}" alt="Current signature" class="h-12 bg-white border rounded px-2">
+                    <span class="text-xs text-slate-500">Currently in use — upload a new file below to replace it.</span>
+                </div>''' if school.get('hoi_signature_url') else ""}
+                <form action="/api/v1/school/hoi-signature/update/{school_id}" method="post" enctype="multipart/form-data" class="flex gap-2">
+                    <input type="file" name="signature_file" accept="image/*" class="flex-1 border p-2 rounded-xl text-sm" required>
+                    <button type="submit" class="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-4 py-2 rounded-xl text-sm transition whitespace-nowrap">Upload</button>
+                </form>
+                <p class="text-[10px] text-slate-400 mt-2">Best results: a signature on a plain white background, saved as PNG or JPG.</p>
+            </div>
 
             <a href="/admin/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back to Dashboard</a>
         </div>
