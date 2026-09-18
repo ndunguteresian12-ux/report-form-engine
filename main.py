@@ -7043,7 +7043,6 @@ def educators_bulk_entry_grid(
     """
 
 
-@app.get("/api/v1/reports/bulk-print/{school_id}", response_class=HTMLResponse)
 def _get_previous_term_year(active_term: str, active_year: int):
     """Term 1 -> previous year's Term 3; Term 2 -> this year's Term 1;
     Term 3 -> this year's Term 2. Used to show each student's position
@@ -7056,6 +7055,7 @@ def _get_previous_term_year(active_term: str, active_year: int):
     return term_order[idx - 1], active_year
 
 
+@app.get("/api/v1/reports/bulk-print/{school_id}", response_class=HTMLResponse)
 def output_batch_class_report_forms(school_id: int, request: Request, grade_name: str, education_level: str, stream: str):
     # This report contains full student names, admission numbers, and
     # every subject score/performance level for an entire class — real
