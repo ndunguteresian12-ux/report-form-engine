@@ -12,6 +12,19 @@ import psycopg2
 import requests as http_requests
 from datetime import datetime, timedelta
 
+# Optional — only needed to make an uploaded HOI signature's background
+# transparent. Guarded so a deployment that hasn't added Pillow to its
+# requirements.txt yet doesn't crash on startup; the upload still works
+# in that case, it just skips the transparency step and saves the image
+# as-is (a real degradation, not a silent no-op — flagged at the upload
+# site itself, not just logged here).
+try:
+    from PIL import Image
+    import io as _pil_io
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
 from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -2434,6 +2447,34 @@ async def update_school_logo_submit(school_id: int, request: Request, logo_file:
     return RedirectResponse(url=f"/admin/dashboard/{school_id}?logo_storage={storage_flag}", status_code=303)
 
 
+def make_signature_transparent(image_bytes: bytes) -> bytes:
+    """Converts a signature's near-white background to transparent,
+    keeping the dark ink strokes opaque, with a smooth gradient at the
+    in-between pixels rather than a hard cutoff — an anti-aliased edge
+    pixel gets a partial alpha instead of an abrupt jagged edge. Always
+    returns PNG bytes (the only common format that supports
+    transparency), regardless of the input format."""
+    img = Image.open(_pil_io.BytesIO(image_bytes)).convert("RGBA")
+    pixels = img.load()
+    width, height = img.size
+    WHITE_THRESHOLD = 235  # pixels this bright or brighter become fully transparent
+    DARK_THRESHOLD = 180   # pixels this dark or darker stay fully opaque
+    for y in range(height):
+        for x in range(width):
+            r, g, b, a = pixels[x, y]
+            luminance = (r + g + b) / 3
+            if luminance >= WHITE_THRESHOLD:
+                pixels[x, y] = (r, g, b, 0)
+            elif luminance <= DARK_THRESHOLD:
+                pixels[x, y] = (r, g, b, 255)
+            else:
+                alpha = int(255 * (WHITE_THRESHOLD - luminance) / (WHITE_THRESHOLD - DARK_THRESHOLD))
+                pixels[x, y] = (r, g, b, alpha)
+    out = _pil_io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
 @app.post("/api/v1/school/hoi-signature/update/{school_id}")
 async def update_hoi_signature_submit(school_id: int, request: Request, signature_file: UploadFile = File(...)):
     """Same upload pattern as the school logo above — Supabase storage
@@ -2454,6 +2495,25 @@ async def update_hoi_signature_submit(school_id: int, request: Request, signatur
     if len(contents) > MAX_LOGO_SIZE_BYTES:
         raise HTTPException(status_code=400, detail="Signature file is too large (5MB max).")
 
+    # Background made transparent so the signature sits cleanly on the
+    # report card's line instead of showing a white/off-white box around
+    # it. Always outputs PNG (the only common format with transparency),
+    # regardless of what was uploaded — file_extension/content_type are
+    # updated to match. If Pillow isn't available on this deployment, or
+    # processing fails for any reason (e.g. a corrupted image), falls
+    # back to uploading the original file as-is rather than blocking the
+    # upload entirely — flagged to the admin either way via the redirect.
+    transparency_applied = False
+    upload_content_type = signature_file.content_type
+    if PIL_AVAILABLE:
+        try:
+            contents = make_signature_transparent(contents)
+            file_extension = ".png"
+            upload_content_type = "image/png"
+            transparency_applied = True
+        except Exception as img_err:
+            logger.error(f"Failed to make HOI signature transparent, uploading as-is: {img_err}")
+
     safe_filename = f"hoi_signature_{uuid.uuid4().hex}{file_extension}"
     signature_resolved_url = None
 
@@ -2462,7 +2522,7 @@ async def update_hoi_signature_submit(school_id: int, request: Request, signatur
             supabase_client.storage.from_("logos").upload(
                 path=safe_filename,
                 file=contents,
-                file_options={"content-type": signature_file.content_type}
+                file_options={"content-type": upload_content_type}
             )
             signature_resolved_url = supabase_client.storage.from_("logos").get_public_url(safe_filename)
         except Exception as storage_err:
@@ -2485,7 +2545,21 @@ async def update_hoi_signature_submit(school_id: int, request: Request, signatur
             cur.execute("UPDATE schools SET hoi_signature_url = %s WHERE id = %s;", (signature_resolved_url, school_id))
             conn.commit()
 
-    return RedirectResponse(url=f"/admin/school/profile/{school_id}?saved=1", status_code=303)
+    return RedirectResponse(url=f"/admin/school/profile/{school_id}?saved=1&sig_transparent={'1' if transparency_applied else '0'}", status_code=303)
+
+
+@app.post("/api/v1/school/hoi-signature/delete/{school_id}")
+def delete_hoi_signature(school_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE schools SET hoi_signature_url = NULL WHERE id = %s;", (school_id,))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/school/profile/{school_id}?sig_deleted=1", status_code=303)
 
 
 @app.get("/admin/dashboard/{school_id}", response_class=HTMLResponse)
@@ -8244,7 +8318,7 @@ def backend_add_student(
 
 
 @app.get("/admin/school/profile/{school_id}", response_class=HTMLResponse)
-def school_profile_view(school_id: int, request: Request, saved: str = None):
+def school_profile_view(school_id: int, request: Request, saved: str = None, sig_transparent: str = None, sig_deleted: str = None):
     auth_error = require_admin_session(request, school_id)
     if auth_error:
         return auth_error
@@ -8320,16 +8394,22 @@ def school_profile_view(school_id: int, request: Request, saved: str = None):
 
             <div class="bg-white p-6 rounded-2xl border shadow-xs">
                 <h3 class="text-xs font-bold uppercase tracking-wider text-emerald-700 mb-1">✍️ Head of Institution Signature</h3>
-                <p class="text-xs text-slate-400 mb-3">Upload a scanned or photographed signature once, and it's automatically printed on every report card — no more hand-signing each physical copy.</p>
+                <p class="text-xs text-slate-400 mb-3">Upload a scanned or photographed signature once, and it's automatically printed on every report card — no more hand-signing each physical copy. Background is automatically made transparent so it sits cleanly on the signature line.</p>
+                {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-3 py-2 rounded-lg mb-3'>✅ Signature uploaded and background made transparent.</div>" if sig_transparent == "1" else ""}
+                {"<div class='bg-amber-50 border border-amber-200 text-amber-800 text-xs px-3 py-2 rounded-lg mb-3'>⚠️ Signature uploaded, but the background could not be made transparent automatically — it was saved as-is.</div>" if sig_transparent == "0" else ""}
+                {"<div class='bg-slate-100 border border-slate-200 text-slate-600 text-xs px-3 py-2 rounded-lg mb-3'>Signature removed — the line will print blank until a new one is uploaded.</div>" if sig_deleted == "1" else ""}
                 {f'''<div class="mb-3 p-3 bg-slate-50 border rounded-xl flex items-center gap-3">
-                    <img src="{esc(school['hoi_signature_url'])}" alt="Current signature" class="h-12 bg-white border rounded px-2">
-                    <span class="text-xs text-slate-500">Currently in use — upload a new file below to replace it.</span>
+                    <img src="{esc(school['hoi_signature_url'])}" alt="Current signature" class="h-12 border rounded px-2" style="background-image: repeating-conic-gradient(#e2e8f0 0% 25%, white 0% 50%); background-size: 12px 12px;">
+                    <span class="text-xs text-slate-500 flex-1">Currently in use — upload a new file below to replace it.</span>
+                    <form action="/api/v1/school/hoi-signature/delete/{school_id}" method="post" onsubmit="return confirm('Remove the current signature? The line will print blank until you upload a new one.');">
+                        <button type="submit" class="text-xs font-bold text-rose-600 hover:underline whitespace-nowrap">🗑️ Delete</button>
+                    </form>
                 </div>''' if school.get('hoi_signature_url') else ""}
                 <form action="/api/v1/school/hoi-signature/update/{school_id}" method="post" enctype="multipart/form-data" class="flex gap-2">
                     <input type="file" name="signature_file" accept="image/*" class="flex-1 border p-2 rounded-xl text-sm" required>
                     <button type="submit" class="bg-emerald-700 hover:bg-emerald-800 text-white font-bold px-4 py-2 rounded-xl text-sm transition whitespace-nowrap">Upload</button>
                 </form>
-                <p class="text-[10px] text-slate-400 mt-2">Best results: a signature on a plain white background, saved as PNG or JPG.</p>
+                <p class="text-[10px] text-slate-400 mt-2">Best results: a signature written in dark ink on a plain white background, saved as PNG or JPG.</p>
             </div>
 
             <a href="/admin/dashboard/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-xl text-sm transition inline-block">← Back to Dashboard</a>
