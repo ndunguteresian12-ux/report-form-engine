@@ -3045,7 +3045,7 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores", te
                 <p class="text-xs text-slate-400">Compare the database name above against the Neon project/branch you ran your ALTER TABLE commands on — if they don't match, that's exactly why the fix didn't take effect.</p>
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-student-scores' onsubmit=\"return confirm('Add entered_marks/entered_out_of columns to student_scores on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add entered_marks / entered_out_of to student_scores now</button></form>" if table == "student_scores" and not any(c['column_name'] == 'entered_marks' for c in columns) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-fee-categories' onsubmit=\"return confirm('Add collectible_by_staff column to fee_categories on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add collectible_by_staff to fee_categories now</button></form>" if table == "fee_categories" and not any(c['column_name'] == 'collectible_by_staff' for c in columns) else ""}
-                {"<form method='post' action='/superadmin/db-diagnostic/fix-school-settings' onsubmit=\"return confirm('Add marks_entry_deadline column to school_settings on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add marks_entry_deadline to school_settings now</button></form>" if table == "school_settings" and not any(c['column_name'] == 'marks_entry_deadline' for c in columns) else ""}
+                {"<form method='post' action='/superadmin/db-diagnostic/fix-school-settings' onsubmit=\"return confirm('Add any missing columns to school_settings on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add missing school_settings columns now</button></form>" if table == "school_settings" and not all(any(c['column_name'] == col for c in columns) for col in ('marks_entry_deadline', 'allow_staff_past_cycle_editing')) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-students-portal' onsubmit=\"return confirm('Add mother_phone, father_phone, portal_password_hash columns to students on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add student portal columns now</button></form>" if table == "students" and not any(c['column_name'] == 'mother_phone' for c in columns) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-schools-type' onsubmit=\"return confirm('Add school_type column to schools on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add school_type to schools now</button></form>" if table == "schools" and not any(c['column_name'] == 'school_type' for c in columns) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-users-last-active' onsubmit=\"return confirm('Add last_active_at column to users on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add last_active_at to users now</button></form>" if table == "users" and not any(c['column_name'] == 'last_active_at' for c in columns) else ""}
@@ -3107,8 +3107,9 @@ def fix_fee_categories_columns(request: Request):
 
 @app.post("/superadmin/db-diagnostic/fix-school-settings")
 def fix_school_settings_columns(request: Request):
-    """Same self-service pattern — adds school_settings.marks_entry_deadline
-    directly through the live app's own connection. Safe to run repeatedly."""
+    """Same self-service pattern — adds any school_settings columns that
+    might be missing on an older deployment, directly through the live
+    app's own connection. Safe to run repeatedly (IF NOT EXISTS)."""
     auth_error = require_superadmin_session(request)
     if auth_error:
         return auth_error
@@ -3116,6 +3117,7 @@ def fix_school_settings_columns(request: Request):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS marks_entry_deadline TIMESTAMP;")
+            cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS allow_staff_past_cycle_editing BOOLEAN NOT NULL DEFAULT FALSE;")
             conn.commit()
 
     return RedirectResponse(url="/superadmin/db-diagnostic?table=school_settings", status_code=303)
