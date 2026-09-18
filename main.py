@@ -3047,7 +3047,7 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores", te
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-fee-categories' onsubmit=\"return confirm('Add collectible_by_staff column to fee_categories on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add collectible_by_staff to fee_categories now</button></form>" if table == "fee_categories" and not any(c['column_name'] == 'collectible_by_staff' for c in columns) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-school-settings' onsubmit=\"return confirm('Add any missing columns to school_settings on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add missing school_settings columns now</button></form>" if table == "school_settings" and not all(any(c['column_name'] == col for c in columns) for col in ('marks_entry_deadline', 'allow_staff_past_cycle_editing')) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-students-portal' onsubmit=\"return confirm('Add mother_phone, father_phone, portal_password_hash columns to students on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add student portal columns now</button></form>" if table == "students" and not any(c['column_name'] == 'mother_phone' for c in columns) else ""}
-                {"<form method='post' action='/superadmin/db-diagnostic/fix-schools-type' onsubmit=\"return confirm('Add school_type column to schools on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add school_type to schools now</button></form>" if table == "schools" and not any(c['column_name'] == 'school_type' for c in columns) else ""}
+                {"<form method='post' action='/superadmin/db-diagnostic/fix-schools-type' onsubmit=\"return confirm('Add any missing columns to schools on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add missing schools columns now</button></form>" if table == "schools" and not all(any(c['column_name'] == col for c in columns) for col in ('school_type', 'hoi_signature_url')) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-users-last-active' onsubmit=\"return confirm('Add last_active_at column to users on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Add last_active_at to users now</button></form>" if table == "users" and not any(c['column_name'] == 'last_active_at' for c in columns) else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-class-promotion-history' onsubmit=\"return confirm('Create class_promotion_history and class_promotion_history_students on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Create class_promotion_history tables now</button></form>" if table == "class_promotion_history" and not columns else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-school-grading-bands' onsubmit=\"return confirm('Create school_grading_bands on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Create school_grading_bands table now</button></form>" if table == "school_grading_bands" and not columns else ""}
@@ -3144,8 +3144,9 @@ def fix_students_portal_columns(request: Request):
 
 @app.post("/superadmin/db-diagnostic/fix-schools-type")
 def fix_schools_school_type_column(request: Request):
-    """Same self-service pattern — adds schools.school_type directly
-    through the live app's own connection. Safe to run repeatedly."""
+    """Same self-service pattern — adds any schools-table columns that
+    might be missing on an older deployment, directly through the live
+    app's own connection. Safe to run repeatedly (IF NOT EXISTS)."""
     auth_error = require_superadmin_session(request)
     if auth_error:
         return auth_error
@@ -3153,6 +3154,7 @@ def fix_schools_school_type_column(request: Request):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("ALTER TABLE schools ADD COLUMN IF NOT EXISTS school_type VARCHAR(20) NOT NULL DEFAULT 'comprehensive';")
+            cur.execute("ALTER TABLE schools ADD COLUMN IF NOT EXISTS hoi_signature_url VARCHAR(512);")
             conn.commit()
 
     return RedirectResponse(url="/superadmin/db-diagnostic?table=schools", status_code=303)
