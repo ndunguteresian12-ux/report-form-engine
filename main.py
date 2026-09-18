@@ -866,6 +866,11 @@ def bootstrap_database_schema():
                 -- nothing changes for a school that never touches this.
                 ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS marks_entry_deadline TIMESTAMP;
 
+                -- Off by default: editing a past exam cycle's marks stays
+                -- admin-only until a school's admin deliberately extends
+                -- that ability to their own staff/teachers too.
+                ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS allow_staff_past_cycle_editing BOOLEAN NOT NULL DEFAULT FALSE;
+
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
                     email VARCHAR(255) UNIQUE NOT NULL,
@@ -5323,6 +5328,47 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                     for row in cur.fetchall():
                         score_map.setdefault(row['student_id'], {})[row['learning_area_id']] = float(row['raw_score'])
 
+            # Same idea as the report card's "previous position" — always
+            # the previous TERM's combined score (Opener+Midterm+End Term
+            # summed), regardless of whether this merit list is itself
+            # viewing a single cycle or combined mode, since "how did they
+            # do last term vs this term" is the natural comparison, not
+            # "last cycle vs this cycle within the same term". A student
+            # absent from this lookup (new admission, or no scores at all
+            # that term) simply shows "—" rather than a fabricated rank.
+            previous_positions_stream, previous_positions_grade = {}, {}
+            if students:
+                prev_term, prev_year = _get_previous_term_year(st['active_term'], st['active_year'])
+                cur.execute("""
+                    WITH subject_averages AS (
+                        SELECT sc.student_id, sc.learning_area_id, AVG(sc.raw_score) AS subject_avg
+                        FROM student_scores sc
+                        WHERE sc.cycle_name IN ('Opener', 'Midterm', 'End Term') AND sc.term = %s AND sc.year = %s
+                        GROUP BY sc.student_id, sc.learning_area_id
+                    ),
+                    student_mean_scores AS (
+                        SELECT s.id AS student_id, s.stream, c.grade_name, COALESCE(SUM(sa.subject_avg), 0) AS total_marks
+                        FROM students s
+                        JOIN classes c ON s.class_id = c.id
+                        JOIN subject_averages sa ON s.id = sa.student_id
+                        WHERE s.school_id = %s AND c.grade_name = %s
+                          AND (s.status IS NULL OR s.status != 'GRADUATED')
+                        GROUP BY s.id, s.stream, c.grade_name
+                    ),
+                    cohort_rankings AS (
+                        SELECT *,
+                            RANK() OVER (PARTITION BY grade_name, stream ORDER BY total_marks DESC) AS stream_position,
+                            COUNT(*) OVER (PARTITION BY grade_name, stream) AS total_in_stream,
+                            RANK() OVER (PARTITION BY grade_name ORDER BY total_marks DESC) AS grade_position,
+                            COUNT(*) OVER (PARTITION BY grade_name) AS total_in_grade
+                        FROM student_mean_scores
+                    )
+                    SELECT student_id, stream_position, total_in_stream, grade_position, total_in_grade FROM cohort_rankings;
+                """, (prev_term, prev_year, school_id, grade_name))
+                for r in cur.fetchall():
+                    previous_positions_stream[r['student_id']] = (r['stream_position'], r['total_in_stream'])
+                    previous_positions_grade[r['student_id']] = (r['grade_position'], r['total_in_grade'])
+
     total_subjects = len(subjects)
 
     # Per-student computed metrics for this single exam sitting
@@ -5444,8 +5490,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                 <td style='text-align:center;'>{esc(s['stream'])}</td>
                 <td style='text-align:center;font-weight:bold;'>{stream_positions.get(s['id'], '-')}</td>
                 <td style='text-align:center;font-weight:bold;'>{overall_positions.get(s['id'], '-')}</td>
-                <td style='text-align:center;color:#94a3b8;'>—</td>
-                <td style='text-align:center;color:#94a3b8;'>—</td>
+                <td style='text-align:center;color:#64748b;'>{f"{previous_positions_stream[s['id']][0]}/{previous_positions_stream[s['id']][1]}" if s['id'] in previous_positions_stream else '—'}</td>
+                <td style='text-align:center;color:#64748b;'>{f"{previous_positions_grade[s['id']][0]}/{previous_positions_grade[s['id']][1]}" if s['id'] in previous_positions_grade else '—'}</td>
                 {subject_cells_html}
                 <td style='text-align:center;'>{row['subjects_entered']}</td>
                 <td style='text-align:center;font-weight:bold;'>{row['total_marks']:.0f}</td>
@@ -6677,7 +6723,7 @@ def educators_bulk_entry_grid(
                     raise HTTPException(status_code=403, detail="You aren't assigned to this class. Ask your admin to add you as its class teacher or a subject teacher there, under Teaching Assignments.")
                 restricted_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
 
-            cur.execute("SELECT active_term, active_year, active_cycle, marks_entry_deadline FROM school_settings WHERE school_id = %s;", (school_id,))
+            cur.execute("SELECT active_term, active_year, active_cycle, marks_entry_deadline, allow_staff_past_cycle_editing FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
             active_term = (settings_row['active_term'] if settings_row else None) or 'Term 1'
             active_year = (settings_row['active_year'] if settings_row else None) or 2026
@@ -6690,26 +6736,26 @@ def educators_bulk_entry_grid(
             # page for staff; whatever gets submitted is always overridden
             # by this for them.
             #
-            # An admin, however, can deliberately switch to editing a
-            # PAST cycle/term/year via edit_term/edit_year/edit_cycle —
-            # the one genuine gap this whole lockdown left: once a school
-            # moves on from Opener to Midterm, there was no way at all,
-            # even for an admin, to go back and fix an Opener mark. This
-            # is gated to admin only, via a real dropdown shown only to
-            # them (staff still see the same locked, read-only label),
-            # and the save endpoint independently re-checks role too —
-            # never trusting this override on the strength of a crafted
-            # request alone.
+            # An admin can always deliberately switch to editing a PAST
+            # cycle/term/year via edit_term/edit_year/edit_cycle — the one
+            # genuine gap this whole lockdown left. A school's admin can
+            # ALSO explicitly extend this same ability to their own staff,
+            # via the allow_staff_past_cycle_editing setting — off by
+            # default, so nothing changes for a school that never touches
+            # it. Either way the save endpoint independently re-checks
+            # both role and this same setting — never trusting this
+            # override on the strength of a crafted request alone.
+            can_edit_past_cycle = bool((not is_restricted_staff) or (settings_row and settings_row.get('allow_staff_past_cycle_editing')))
             active_cycle = (settings_row['active_cycle'] if settings_row else None) or 'Opener'
             school_active_term, school_active_year = active_term, active_year
             is_editing_past_cycle = False
-            if not is_restricted_staff and edit_term and edit_year and edit_cycle:
+            if can_edit_past_cycle and edit_term and edit_year and edit_cycle:
                 active_term, active_year, active_cycle = edit_term, edit_year, edit_cycle
                 is_editing_past_cycle = True
             cycle_name = active_cycle
 
             custom_cycle_names = []
-            if not is_restricted_staff:
+            if can_edit_past_cycle:
                 cur.execute("SELECT cycle_name FROM school_custom_cycles WHERE school_id = %s ORDER BY cycle_name ASC;", (school_id,))
                 custom_cycle_names = [r['cycle_name'] for r in cur.fetchall()]
 
@@ -6889,7 +6935,7 @@ def educators_bulk_entry_grid(
                     <div class="w-full border border-slate-200 bg-slate-50 p-3 rounded-xl mt-1 font-semibold text-sm text-slate-700 flex items-center gap-1.5">
                         🔒 {esc({'Opener': 'Opener Phase', 'Midterm': 'Midterm Cycle', 'End Term': 'End Term Synthesis'}.get(cycle_name, cycle_name))} <span class="text-[10px] font-normal text-slate-400">({esc(active_term)} {active_year})</span>
                     </div>
-                    <p class="text-[10px] text-slate-400 mt-1">{"Set school-wide under School Settings — not editable per class, so marks can never land in the wrong phase by accident." if is_restricted_staff else "Locked for everyday entry to prevent marks landing in the wrong phase by accident. Use \"Edit a past phase\" below to deliberately correct an earlier one."}</p>
+                    <p class="text-[10px] text-slate-400 mt-1">{"Locked for everyday entry to prevent marks landing in the wrong phase by accident. Use \"Edit a past phase\" below to deliberately correct an earlier one." if can_edit_past_cycle else "Set school-wide under School Settings — not editable per class, so marks can never land in the wrong phase by accident."}</p>
                 </div>
                 <div class="hidden sm:flex items-end text-slate-400 text-[11px] italic pb-2">Changing subject auto-updates student listing map.</div>
             </form>
@@ -6922,7 +6968,7 @@ def educators_bulk_entry_grid(
                     </div>
                     <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold px-3 py-2 rounded-lg text-xs transition">Switch</button>
                 </form>
-            </details>''' if not is_restricted_staff else ''}
+            </details>''' if can_edit_past_cycle else ''}
         </div>
 
         {f'''<div class="bg-amber-50 border border-amber-300 text-amber-800 text-sm px-4 py-3 rounded-xl font-bold">
@@ -7766,6 +7812,14 @@ def school_settings_page(school_id: int, request: Request):
                         <p class="text-[10px] text-slate-500 mt-1">After this date/time, staff can no longer save marks for the current Assessment Phase above — you (as admin) can still enter or correct marks at any time. Leave blank for no deadline.</p>
                     </div>
 
+                    <div class="bg-slate-50 p-3 rounded-xl border border-slate-100 flex items-center justify-between">
+                        <div>
+                            <label class="text-xs font-bold text-slate-800 block">Let Staff Edit Past Exam Cycles</label>
+                            <span class="text-[10px] text-slate-400 block">Off by default — only you (admin) can go back and correct an earlier cycle's marks (e.g. fixing an Opener mark after the school has moved on to Midterm). Turn this on to let your teachers do this too.</span>
+                        </div>
+                        <input type="checkbox" name="allow_staff_past_cycle_editing" value="true" {"checked" if st.get('allow_staff_past_cycle_editing') else ""} class="w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500 cursor-pointer shrink-0 ml-3">
+                    </div>
+
                     <div>
                         <label class="text-[11px] font-semibold text-slate-500 block mb-1">Theme Branding Color</label>
                         <select name="theme_color" class="w-full border border-slate-200 p-2 rounded-xl text-xs font-semibold bg-white outline-none focus:border-slate-400">
@@ -7960,6 +8014,7 @@ def update_settings_endpoint(
     head_teacher_name: str = Form(""),
     active_year: int = Form(...),
     marks_entry_deadline: str = Form(""),
+    allow_staff_past_cycle_editing: str = Form(None),
 ):
     auth_error = require_admin_session(request, school_id)
     if auth_error:
@@ -7990,6 +8045,7 @@ def update_settings_endpoint(
     # A checkbox only appears in form data when it's checked — its absence
     # here correctly means "unchecked", not "leave unchanged".
     is_single_stream_bool = bool(is_single_stream)
+    allow_staff_past_cycle_editing_bool = bool(allow_staff_past_cycle_editing)
 
     # datetime-local submits as "2026-05-20T14:30" with no seconds/timezone
     # — Postgres's TIMESTAMP column accepts this format directly. Blank
@@ -8012,8 +8068,8 @@ def update_settings_endpoint(
             old_year = existing_settings_row[1] if existing_settings_row else None
 
             cur.execute("""
-                INSERT INTO school_settings (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream, head_teacher_name, marks_entry_deadline)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO school_settings (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream, head_teacher_name, marks_entry_deadline, allow_staff_past_cycle_editing)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (school_id) DO UPDATE 
                 SET active_term = EXCLUDED.active_term, 
                     active_cycle = EXCLUDED.active_cycle, 
@@ -8022,8 +8078,9 @@ def update_settings_endpoint(
                     closing_date = EXCLUDED.closing_date,
                     is_single_stream = EXCLUDED.is_single_stream,
                     head_teacher_name = EXCLUDED.head_teacher_name,
-                    marks_entry_deadline = EXCLUDED.marks_entry_deadline;
-            """, (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream_bool, head_teacher_name.strip() or None, marks_entry_deadline_value))
+                    marks_entry_deadline = EXCLUDED.marks_entry_deadline,
+                    allow_staff_past_cycle_editing = EXCLUDED.allow_staff_past_cycle_editing;
+            """, (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream_bool, head_teacher_name.strip() or None, marks_entry_deadline_value, allow_staff_past_cycle_editing_bool))
 
             # Carries every scheme of work the school already has forward
             # into the new active year automatically, rather than
@@ -8757,7 +8814,7 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     # silently overwriting Term 1's for the same cycle name.
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT active_term, active_year, active_cycle, marks_entry_deadline FROM school_settings WHERE school_id = %s;", (school_id,))
+            cur.execute("SELECT active_term, active_year, active_cycle, marks_entry_deadline, allow_staff_past_cycle_editing FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
     active_term = settings_row[0] if settings_row else 'Term 1'
     active_year = settings_row[1] if settings_row else 2026
@@ -8768,19 +8825,21 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     # just in the UI.
     cycle_name = (settings_row[2] if settings_row else None) or 'Opener'
 
-    # The one deliberate exception: an admin explicitly editing a PAST
-    # cycle (via the admin-only "Edit a past phase" control on the entry
-    # page) needs their save to actually target that past term/year/
-    # cycle, not silently snap back to whatever's currently active. Only
-    # honored for role == 'admin', re-checked here independently of
-    # whatever the entry page showed — never trusted on the strength of
-    # the hidden form fields alone, since a request can always be
-    # crafted by hand.
+    # The one deliberate exception: an admin — or, if the school's admin
+    # has explicitly turned on allow_staff_past_cycle_editing, staff too
+    # — explicitly editing a PAST cycle (via the "Edit a past phase"
+    # control on the entry page) needs their save to actually target
+    # that past term/year/cycle, not silently snap back to whatever's
+    # currently active. Re-checked here independently of whatever the
+    # entry page showed — never trusted on the strength of the hidden
+    # form fields alone, since a request can always be crafted by hand.
     edit_term = form_data.get("edit_term") or ""
     edit_year_raw = form_data.get("edit_year") or ""
     edit_cycle = form_data.get("edit_cycle") or ""
     is_editing_past_cycle = False
-    if viewer and viewer.get('role') == 'admin' and edit_term and edit_year_raw and edit_cycle:
+    viewer_role = viewer.get('role') if viewer else None
+    can_edit_past_cycle = viewer_role == 'admin' or (viewer_role == 'staff' and settings_row and bool(settings_row[4]))
+    if can_edit_past_cycle and edit_term and edit_year_raw and edit_cycle:
         try:
             edit_year = int(edit_year_raw)
         except ValueError:
