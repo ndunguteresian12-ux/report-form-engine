@@ -205,6 +205,24 @@ def bootstrap_finance_schema():
                     updated_at TIMESTAMP DEFAULT NOW(),
                     UNIQUE(school_id, student_id, fee_category_id, term, year)
                 );
+
+                -- Money going OUT — the missing half of the finance
+                -- picture. description is deliberately required (not
+                -- optional) since a bare amount with no explanation of
+                -- what it was for isn't useful for a school reviewing
+                -- its own spending later.
+                CREATE TABLE IF NOT EXISTS expenditures (
+                    id SERIAL PRIMARY KEY,
+                    school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE,
+                    description VARCHAR(255) NOT NULL,
+                    category VARCHAR(50) NOT NULL DEFAULT 'Other',
+                    amount NUMERIC(10, 2) NOT NULL,
+                    term VARCHAR(20) NOT NULL,
+                    year INTEGER NOT NULL,
+                    spent_on DATE NOT NULL DEFAULT CURRENT_DATE,
+                    recorded_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
             """)
             conn.commit()
 
@@ -475,6 +493,9 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
             """, (school_id,))
             class_rows = cur.fetchall()
 
+            cur.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM expenditures WHERE school_id = %s AND term = %s AND year = %s;", (school_id, term, year))
+            total_expenditure = float(cur.fetchone()['total'])
+
     total_expected = sum(expected_by_category.values())
     total_collected = sum(collected_by_category.values())
     total_outstanding = max(0, total_expected - total_collected)
@@ -518,6 +539,7 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
             </div>
             <div class="flex items-center gap-2 flex-wrap">
                 <a href="/finance/categories/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">🏷️ Fee Categories</a>
+                <a href="/finance/expenditures/{school_id}?term={urllib.parse.quote(term)}&year={year}" class="bg-white hover:bg-slate-50 text-rose-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">💸 Expenditure</a>
                 <a href="/finance/import/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">📥 Import History</a>
                 <a href="/finance/carry-forward/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-4 py-2 rounded-xl text-xs font-bold transition">🔁 Carry Forward Balances</a>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">← Back to Dashboard</a>
@@ -537,6 +559,18 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
                 <div class="bg-white rounded-2xl border shadow-xs p-5 border-l-4" style="border-left-color:#dc2626;">
                     <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Outstanding</p>
                     <p class="text-2xl font-black text-slate-900 mt-1">KSh {total_outstanding:,.0f}</p>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <a href="/finance/expenditures/{school_id}?term={urllib.parse.quote(term)}&year={year}" class="bg-white rounded-2xl border shadow-xs p-5 border-l-4 hover:shadow-md transition block" style="border-left-color:#e11d48;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Expenditure This Term</p>
+                    <p class="text-2xl font-black text-rose-700 mt-1">KSh {total_expenditure:,.0f}</p>
+                    <p class="text-[11px] text-indigo-700 font-bold mt-1">View / record expenditure →</p>
+                </a>
+                <div class="bg-white rounded-2xl border shadow-xs p-5 border-l-4" style="border-left-color:{'#059669' if (total_collected - total_expenditure) >= 0 else '#dc2626'};">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Net Balance (Collected − Expenditure)</p>
+                    <p class="text-2xl font-black mt-1" style="color:{'#065f46' if (total_collected - total_expenditure) >= 0 else '#991b1b'};">KSh {(total_collected - total_expenditure):,.0f}</p>
                 </div>
             </div>
 
@@ -728,6 +762,166 @@ async def carry_forward_balances(school_id: int, request: Request, from_term: st
             conn.commit()
 
     return RedirectResponse(url=f"/finance/carry-forward/{school_id}?done={combinations_written}", status_code=303)
+
+
+# ============================================================
+# Expenditure — money going OUT, the other half of the finance picture
+# alongside fee collection (income). Deliberately simple: a description,
+# a category, an amount, a date — no approval workflow, no budgets,
+# just a record of what was spent and why.
+# ============================================================
+
+EXPENDITURE_CATEGORIES = ["Salaries & Wages", "Utilities", "Learning Materials", "Maintenance & Repairs", "Transport", "Food & Catering", "Administration", "Other"]
+
+
+@router.get("/finance/expenditures/{school_id}", response_class=HTMLResponse)
+def expenditures_view(school_id: int, request: Request, term: str = None, year: int = None, saved: str = None, deleted: str = None):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            school, active_term, active_year = _get_school_and_settings(cur, school_id)
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+            term = term or active_term
+            year = year or active_year
+
+            cur.execute("""
+                SELECT e.*, u.full_name AS recorded_by_name FROM expenditures e
+                LEFT JOIN users u ON e.recorded_by_user_id = u.id
+                WHERE e.school_id = %s AND e.term = %s AND e.year = %s
+                ORDER BY e.spent_on DESC, e.id DESC;
+            """, (school_id, term, year))
+            expenditures = cur.fetchall()
+
+    total_spent = sum(float(e['amount']) for e in expenditures)
+    category_options = "".join(f'<option value="{esc(c)}">{esc(c)}</option>' for c in EXPENDITURE_CATEGORIES)
+
+    rows_html = "".join(f"""
+        <tr class="border-b hover:bg-slate-50">
+            <td class="p-3 text-xs">{e['spent_on'].strftime('%d %b %Y')}</td>
+            <td class="p-3 text-xs font-semibold">{esc(e['description'])}</td>
+            <td class="p-3 text-xs"><span class="bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full text-[10px] font-bold">{esc(e['category'])}</span></td>
+            <td class="p-3 text-xs text-right font-bold text-rose-700">KSh {float(e['amount']):,.0f}</td>
+            <td class="p-3 text-xs text-slate-400">{esc(e['recorded_by_name'] or '—')}</td>
+            <td class="p-3 text-right">
+                <form action="/api/v1/finance/expenditure/delete/{school_id}/{e['id']}" method="post" onsubmit="return confirm('Delete this expenditure record? This cannot be undone.');">
+                    <input type="hidden" name="term" value="{esc(term)}">
+                    <input type="hidden" name="year" value="{year}">
+                    <button type="submit" class="text-rose-500 hover:text-rose-700 text-xs font-bold">Delete</button>
+                </form>
+            </td>
+        </tr>
+    """ for e in expenditures) or "<tr><td colspan='6' class='p-6 text-center text-slate-400 text-xs italic'>No expenditure recorded for this term yet.</td></tr>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Expenditure</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">💸 Expenditure — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">{esc(term)} {year}</p>
+            </div>
+            <a href="/finance/dashboard/{school_id}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">← Back to Finance</a>
+        </header>
+
+        <div class="p-4 sm:p-8 max-w-4xl mx-auto space-y-6">
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-xl'>✅ Expenditure recorded.</div>" if saved else ""}
+            {"<div class='bg-slate-100 border border-slate-200 text-slate-600 text-xs px-4 py-3 rounded-xl'>Expenditure record deleted.</div>" if deleted else ""}
+
+            <div class="bg-white rounded-2xl border shadow-xs p-5 border-l-4" style="border-left-color:#dc2626; max-width: 280px;">
+                <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Total Spent This Term</p>
+                <p class="text-2xl font-black text-slate-900 mt-1">KSh {total_spent:,.0f}</p>
+            </div>
+
+            <div class="bg-white rounded-2xl border shadow-xs p-5">
+                <h2 class="text-sm font-bold text-slate-800 mb-3">+ Record New Expenditure</h2>
+                <form action="/api/v1/finance/expenditure/add/{school_id}" method="post" class="grid grid-cols-1 sm:grid-cols-5 gap-3">
+                    <input type="hidden" name="term" value="{esc(term)}">
+                    <input type="hidden" name="year" value="{year}">
+                    <div class="sm:col-span-2">
+                        <label class="text-[11px] font-bold text-slate-500 block mb-1">Description</label>
+                        <input type="text" name="description" placeholder="e.g. Chalk and exercise books for Term 3" class="w-full border p-2.5 rounded-xl text-sm" required>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500 block mb-1">Category</label>
+                        <select name="category" class="w-full border p-2.5 rounded-xl text-sm">{category_options}</select>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500 block mb-1">Amount (KSh)</label>
+                        <input type="number" name="amount" step="0.01" min="0.01" placeholder="0.00" class="w-full border p-2.5 rounded-xl text-sm" required>
+                    </div>
+                    <div>
+                        <label class="text-[11px] font-bold text-slate-500 block mb-1">Date</label>
+                        <input type="date" name="spent_on" value="{datetime.now().strftime('%Y-%m-%d')}" class="w-full border p-2.5 rounded-xl text-sm" required>
+                    </div>
+                    <button type="submit" class="sm:col-span-5 bg-rose-700 hover:bg-rose-800 text-white font-bold py-3 rounded-xl text-sm transition">+ Record Expenditure</button>
+                </form>
+            </div>
+
+            <div class="bg-white rounded-2xl border shadow-xs overflow-x-auto">
+                <table class="w-full">
+                    <thead class="bg-slate-50 border-b">
+                        <tr class="text-left text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+                            <th class="p-3">Date</th><th class="p-3">Description</th><th class="p-3">Category</th>
+                            <th class="p-3 text-right">Amount</th><th class="p-3">Recorded By</th><th class="p-3"></th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows_html}</tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@router.post("/api/v1/finance/expenditure/add/{school_id}")
+def add_expenditure(school_id: int, request: Request, description: str = Form(...), category: str = Form(...), amount: float = Form(...), spent_on: str = Form(...), term: str = Form(...), year: int = Form(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    description = description.strip()
+    if not description:
+        raise HTTPException(status_code=400, detail="A description is required.")
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than zero.")
+    if category not in EXPENDITURE_CATEGORIES:
+        category = "Other"
+
+    viewer = get_current_session_user(request)
+    recorded_by = viewer['id'] if viewer else None
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO expenditures (school_id, description, category, amount, term, year, spent_on, recorded_by_user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            """, (school_id, description, category, amount, term, year, spent_on, recorded_by))
+            conn.commit()
+
+    return RedirectResponse(url=f"/finance/expenditures/{school_id}?term={urllib.parse.quote(term)}&year={year}&saved=1", status_code=303)
+
+
+@router.post("/api/v1/finance/expenditure/delete/{school_id}/{expenditure_id}")
+def delete_expenditure(school_id: int, expenditure_id: int, request: Request, term: str = Form(...), year: int = Form(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM expenditures WHERE id = %s AND school_id = %s;", (expenditure_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/finance/expenditures/{school_id}?term={urllib.parse.quote(term)}&year={year}&deleted=1", status_code=303)
 
 
 # ============================================================
