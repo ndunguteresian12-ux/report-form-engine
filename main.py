@@ -7489,7 +7489,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                 )
 
                 report_cards_html.append(f"""
-                <div class="report-card-container" style="background: white; padding: 24px; border: 5px solid {theme['hex']}; border-radius: 12px; width: 199mm; min-height: 250mm; max-height: 282mm; overflow: hidden; box-sizing: border-box; margin: 0 auto; font-family: 'Plus Jakarta Sans', Arial, sans-serif; display: flex; flex-direction: column; justify-content: space-between;">
+                <div class="report-card-container" style="background: white; padding: 24px; border: 5px solid {theme['hex']}; border-radius: 12px; width: 199mm; min-height: 250mm; box-sizing: border-box; margin: 0 auto; font-family: 'Plus Jakarta Sans', Arial, sans-serif; display: flex; flex-direction: column; justify-content: space-between;">
                     <div>
                         <div style="display: flex; align-items: center; border-bottom: 4px double {theme['hex']}; padding-bottom: 8px; margin-bottom: 12px;">
                             {logo_markup}
@@ -7664,8 +7664,6 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                             padding: 20px 26px !important;
                             width: 199mm !important;
                             min-height: 267mm !important;
-                            max-height: 282mm !important;
-                            overflow: hidden !important;
                             margin: 6mm auto !important;
                             border-width: 6px !important;
                         }}
