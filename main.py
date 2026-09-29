@@ -7965,6 +7965,15 @@ def school_settings_page(school_id: int, request: Request):
                         🔄 Advance All Classes 1 Year
                     </button>
                 </form>
+                <p class="text-[10px] text-slate-400 mt-2">Note: this does NOT include PP1/PP2 (ECDE) learners — promote them separately below, since moving into Grade 1 needs a stream picked for each learner.</p>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-amber-200/80 shadow-xs p-6">
+                <h2 class="text-sm font-black text-amber-700 mb-1">🧒 Promote ECDE Learners</h2>
+                <p class="text-xs text-slate-400 mb-3">PP1 → PP2 is a simple one-click promotion. PP2 → Grade 1 lets you pick each learner's Grade 1 stream individually — useful when PP1/PP2 is single-streamed but Grade 1 has multiple streams, so incoming learners need to be manually distributed.</p>
+                <a href="/admin/promote-ecde/{school_id}" class="block text-center w-full bg-amber-50 border border-amber-200/80 text-amber-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-amber-100/70 transition">
+                    🧒 Promote PP1 / PP2 →
+                </a>
             </div>
         </div>
     </body>
@@ -9169,6 +9178,173 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
         "edit_cycle": form_data.get("edit_cycle", "") if is_editing_past_cycle else "",
     })
     return RedirectResponse(url=f"/staff/bulk-entry/{school_id}?{redirect_params}", status_code=303)
+
+@app.get("/admin/promote-ecde/{school_id}", response_class=HTMLResponse)
+def promote_ecde_view(school_id: int, request: Request, promoted: str = None):
+    """Kept deliberately separate from the main "Advance All Classes"
+    cascade (class_id 1-9) rather than folded into it — that cascade
+    processes grades in descending order specifically to avoid a
+    student being caught twice in one run, and PP1/PP2 (class_id 10/11,
+    outside that 1-9 range) sit on the wrong side of that ordering:
+    running PP2->Grade 1 in the same pass, before Grade 1->Grade 2 has
+    finished for the students already there, would double-promote a
+    PP2 learner all the way to Grade 2 in a single run. Splitting this
+    into its own page, run separately from the main cascade, avoids
+    that risk entirely — and gives room for the one thing PP2->Grade 1
+    genuinely needs that the main cascade doesn't: picking each
+    learner's actual Grade 1 stream, since PP1/PP2 being single-
+    streamed while Grade 1 has several real streams means there's no
+    way to auto-assign this correctly."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("""
+                SELECT COUNT(*) AS cnt FROM students
+                WHERE school_id = %s AND class_id = 10 AND (status IS NULL OR status != 'GRADUATED');
+            """, (school_id,))
+            pp1_count = cur.fetchone()['cnt']
+
+            cur.execute("""
+                SELECT id, admission_number, first_name, middle_name, last_name, stream
+                FROM students
+                WHERE school_id = %s AND class_id = 11 AND (status IS NULL OR status != 'GRADUATED')
+                ORDER BY first_name ASC;
+            """, (school_id,))
+            pp2_students = cur.fetchall()
+
+            # Real, actual Grade 1 stream values already in use at this
+            # school — shown as choices so an admin picks from what
+            # genuinely exists rather than typing a name that risks not
+            # matching (the same mismatch problem seen and fixed before
+            # for Senior School combinations).
+            cur.execute("""
+                SELECT DISTINCT stream FROM students
+                WHERE school_id = %s AND class_id = 1 AND stream IS NOT NULL AND stream != ''
+                ORDER BY stream ASC;
+            """, (school_id,))
+            real_grade1_streams = [r['stream'] for r in cur.fetchall()]
+
+    stream_options = "".join(f'<option value="{esc(s)}">{esc(s)}</option>' for s in real_grade1_streams)
+
+    pp2_rows = "".join(f"""
+        <tr class="border-b">
+            <td class="p-2.5 text-xs">{esc(full_student_name(s))}</td>
+            <td class="p-2.5 text-xs text-slate-400">{esc(s['admission_number'])}</td>
+            <td class="p-2.5">
+                <input type="text" name="stream_{s['id']}" list="grade1-streams" value="" placeholder="e.g. A" class="w-32 border p-1.5 rounded-lg text-xs" required>
+            </td>
+        </tr>
+    """ for s in pp2_students) or "<tr><td colspan='3' class='p-4 text-center text-slate-400 text-xs italic'>No PP2 learners currently active.</td></tr>"
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-3xl mx-auto space-y-4">
+            <div class="flex items-center justify-between">
+                <h1 class="text-lg font-black text-slate-800">🧒 Promote ECDE Learners — {esc(school['name'])}</h1>
+                <a href="/admin/school-settings/{school_id}" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back to Settings</a>
+            </div>
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg'>✅ Promotion completed.</div>" if promoted else ""}
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-sm font-black text-slate-800 mb-1">Step 1: PP1 → PP2</h2>
+                <p class="text-xs text-slate-400 mb-3">{pp1_count} PP1 learner(s) currently active. Simple one-step move — stream carries over unchanged.</p>
+                <form action="/api/v1/school/promote-pp1/{school_id}" method="post" onsubmit="return confirm('Promote all {pp1_count} PP1 learner(s) to PP2?');">
+                    <button type="submit" {"disabled" if pp1_count == 0 else ""} class="w-full bg-amber-50 border border-amber-200/80 text-amber-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-amber-100/70 transition disabled:opacity-40 disabled:cursor-not-allowed">
+                        Promote {pp1_count} PP1 Learner(s) to PP2
+                    </button>
+                </form>
+            </div>
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-sm font-black text-slate-800 mb-1">Step 2: PP2 → Grade 1</h2>
+                <p class="text-xs text-slate-400 mb-3">Pick each learner's Grade 1 stream individually. {f"Existing Grade 1 streams at this school: {', '.join(esc(s) for s in real_grade1_streams)}." if real_grade1_streams else "No Grade 1 streams exist yet at this school — type the stream name(s) you want to create."}</p>
+                <form action="/api/v1/school/promote-pp2/{school_id}" method="post" onsubmit="return confirm('Promote all listed PP2 learners to Grade 1, with the streams you\\'ve assigned? This cannot be undone automatically.');">
+                    <datalist id="grade1-streams">{stream_options}</datalist>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead><tr class="text-left text-[10px] font-bold text-slate-500 uppercase tracking-wider border-b">
+                                <th class="p-2.5">Name</th><th class="p-2.5">Adm No.</th><th class="p-2.5">Grade 1 Stream</th>
+                            </tr></thead>
+                            <tbody>{pp2_rows}</tbody>
+                        </table>
+                    </div>
+                    {f'<button type="submit" class="w-full mt-4 bg-amber-50 border border-amber-200/80 text-amber-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-amber-100/70 transition">Confirm — Promote {len(pp2_students)} PP2 Learner(s) to Grade 1</button>' if pp2_students else ''}
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/api/v1/school/promote-pp1/{school_id}")
+def promote_pp1_to_pp2(school_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE students SET class_id = 11
+                WHERE school_id = %s AND class_id = 10 AND (status IS NULL OR status != 'GRADUATED');
+            """, (school_id,))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/promote-ecde/{school_id}?promoted=1", status_code=303)
+
+
+@app.post("/api/v1/school/promote-pp2/{school_id}")
+async def promote_pp2_to_grade1(school_id: int, request: Request):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form_data = await request.form()
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            # Confirmed active AND still in PP2 at the moment of saving —
+            # a school_id + class_id=11 check per row here, not just a
+            # blind trust of whichever student ids happened to be in the
+            # submitted form, so a stale page (opened, left a while,
+            # submitted after something else already changed) can't move
+            # the wrong student or a different school's student.
+            cur.execute("""
+                SELECT id FROM students
+                WHERE school_id = %s AND class_id = 11 AND (status IS NULL OR status != 'GRADUATED');
+            """, (school_id,))
+            valid_pp2_ids = {r[0] for r in cur.fetchall()}
+
+            promoted_count = 0
+            for key, value in form_data.items():
+                if not key.startswith("stream_"):
+                    continue
+                student_id = int(key[len("stream_"):])
+                new_stream = value.strip()
+                if student_id in valid_pp2_ids and new_stream:
+                    cur.execute("""
+                        UPDATE students SET class_id = 1, stream = %s
+                        WHERE id = %s AND school_id = %s;
+                    """, (new_stream, student_id, school_id))
+                    promoted_count += 1
+            conn.commit()
+            log_audit_action(cur, request, school_id, "pp2_promoted_to_grade1", f"{promoted_count} PP2 learner(s) promoted to Grade 1 with individually assigned streams")
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/promote-ecde/{school_id}?promoted=1", status_code=303)
+
 
 @app.post("/api/v1/school/promote-classes/{school_id}")
 def promote_school_classes(school_id: int, request: Request):
