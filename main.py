@@ -882,6 +882,24 @@ def bootstrap_database_schema():
                 -- touches this.
                 ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS is_ecde_single_stream BOOLEAN NOT NULL DEFAULT FALSE;
 
+                -- Lets the exam cycle itself (Opener/Midterm/End Term/
+                -- custom) be set independently per education_level,
+                -- instead of one single school-wide value forcing every
+                -- level onto the same exam at once — e.g. Lower Primary
+                -- can sit on "Midterm" while Junior School is still on
+                -- "Opener", both enterable at the same time. Term/Year
+                -- deliberately stay school-wide (school_settings), only
+                -- the cycle itself becomes per-level. A school that never
+                -- sets a row here for a given level just falls back to
+                -- the school-wide school_settings.active_cycle, so
+                -- nothing changes for a school that never touches this.
+                CREATE TABLE IF NOT EXISTS school_level_cycles (
+                    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+                    education_level VARCHAR(50) NOT NULL,
+                    active_cycle VARCHAR(30) NOT NULL,
+                    PRIMARY KEY (school_id, education_level)
+                );
+
                 -- Optional cutoff for the CURRENTLY active assessment
                 -- cycle — once passed, staff (not admins) can no longer
                 -- save marks for it. NULL means no deadline set, so
@@ -5362,6 +5380,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
+            st['active_cycle'] = get_active_cycle_for_level(school_id, education_level)
 
             # Whole grade, every stream combined, when no stream is given —
             # this is the ORIGINAL behavior, kept exactly as-is for any
@@ -5706,6 +5725,7 @@ def print_top10_per_stream(school_id: int, grade_name: str, education_level: str
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
+            st['active_cycle'] = get_active_cycle_for_level(school_id, education_level)
 
             if whole_grade:
                 cur.execute("""
@@ -5857,6 +5877,7 @@ def print_top_student_per_subject(school_id: int, grade_name: str, education_lev
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
+            st['active_cycle'] = get_active_cycle_for_level(school_id, education_level)
 
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
@@ -5991,6 +6012,7 @@ def print_grade_distribution(school_id: int, grade_name: str, education_level: s
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
+            st['active_cycle'] = get_active_cycle_for_level(school_id, education_level)
 
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s;", (education_level,))
             subjects = sort_subjects_for_display(cur.fetchall(), education_level)
@@ -6340,6 +6362,7 @@ def print_subject_analysis(school_id: int, grade_name: str, education_level: str
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
+            st['active_cycle'] = get_active_cycle_for_level(school_id, education_level)
 
             cur.execute("""
                 SELECT s.id
@@ -6864,7 +6887,11 @@ def educators_bulk_entry_grid(
             # both role and this same setting — never trusting this
             # override on the strength of a crafted request alone.
             can_edit_past_cycle = bool((not is_restricted_staff) or (settings_row and settings_row.get('allow_staff_past_cycle_editing')))
-            active_cycle = (settings_row['active_cycle'] if settings_row else None) or 'Opener'
+            # Per-level, not the flat school-wide value — lets e.g. Junior
+            # School be entered on "Opener" while Lower Primary is already
+            # on "Midterm", both at the same time, rather than the whole
+            # school being locked to one single cycle simultaneously.
+            active_cycle = get_active_cycle_for_level(school_id, education_level)
             school_active_term, school_active_year = active_term, active_year
             is_editing_past_cycle = False
             if can_edit_past_cycle and edit_term and edit_year and edit_cycle:
@@ -7159,6 +7186,37 @@ def educators_bulk_entry_grid(
     """
 
 
+def get_active_cycle_for_level(school_id: int, education_level: str) -> str:
+    """The exam cycle for THIS specific education_level — checks
+    school_level_cycles first (a level-specific override, e.g. Junior
+    School deliberately set to "Opener" while the rest of the school has
+    moved to "Midterm"), falling back to the school-wide
+    school_settings.active_cycle if this level has never had its own
+    value set. This is the one, central place this lookup happens —
+    every report/entry function scoped to a specific education_level
+    should call this instead of reading school_settings.active_cycle
+    directly, so a school's per-level cycles are honored consistently
+    everywhere rather than only in some places.
+
+    Deliberately opens its own RealDictCursor rather than reusing the
+    caller's `cur` — callers in this file mix plain cursors and
+    RealDictCursor, and RealDictRow only supports key access (row[0]
+    raises KeyError, not a positional lookup), so relying on the
+    caller's cursor type here would silently break for half of them."""
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as level_cur:
+            level_cur.execute(
+                "SELECT active_cycle FROM school_level_cycles WHERE school_id = %s AND education_level = %s;",
+                (school_id, education_level)
+            )
+            level_row = level_cur.fetchone()
+            if level_row and level_row['active_cycle']:
+                return level_row['active_cycle']
+            level_cur.execute("SELECT active_cycle FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings_row = level_cur.fetchone()
+            return (settings_row['active_cycle'] if settings_row else None) or 'Opener'
+
+
 def _get_previous_term_year(active_term: str, active_year: int):
     """Term 1 -> previous year's Term 3; Term 2 -> this year's Term 1;
     Term 3 -> this year's Term 2. Used to show each student's position
@@ -7196,6 +7254,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
             settings = cur.fetchone()
             
             st = settings or {'active_year': 2026, 'active_term': 'Term 1', 'active_cycle': 'End Term', 'opening_date': 'TBD', 'closing_date': 'TBD'}
+            st['active_cycle'] = get_active_cycle_for_level(school_id, education_level)
             theme = fetch_theme_styles(school.get('theme_color', 'emerald') if school else 'emerald')
 
             if not school:
@@ -7887,6 +7946,10 @@ def school_settings_page(school_id: int, request: Request):
             cur.execute("SELECT id, cycle_name FROM school_custom_cycles WHERE school_id = %s ORDER BY cycle_name ASC;", (school_id,))
             custom_cycles = cur.fetchall()
 
+            school_levels = get_education_levels_for_school(cur, school_id)
+            cur.execute("SELECT education_level, active_cycle FROM school_level_cycles WHERE school_id = %s;", (school_id,))
+            level_cycle_overrides = {r['education_level']: r['active_cycle'] for r in cur.fetchall()}
+
     st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'opening_date': '', 'closing_date': '', 'is_single_stream': False}
     is_single_stream = st.get('is_single_stream', False)
 
@@ -7983,6 +8046,26 @@ def school_settings_page(school_id: int, request: Request):
                         </div>
                     </div>
                     <button type="submit" class="w-full bg-slate-800 hover:bg-slate-900 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer">Commit Engine Settings</button>
+                </form>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6">
+                <h2 class="text-sm font-black text-slate-800 mb-1">📚 Per-Level Exam Cycles</h2>
+                <p class="text-xs text-slate-400 mb-3">Lets different education levels sit on different exam cycles at the same time — e.g. Junior School still on "Opener" while Lower Primary has already moved to "Midterm" — instead of the single Assessment Phase above forcing every level onto the same exam. Leave a level on "Use school default" to keep following the Assessment Phase setting above.</p>
+                <form action="/api/v1/settings/level-cycles/update/{school_id}" method="post" class="space-y-3">
+                    {"".join(f'''
+                    <div class="flex items-center justify-between gap-3">
+                        <label class="text-xs font-bold text-slate-600">{esc(level)}</label>
+                        <select name="cycle_{esc(level)}" class="border border-slate-200 p-2 rounded-xl text-xs font-semibold bg-white outline-none focus:border-slate-400 w-56">
+                            <option value="">Use school default ({esc(st.get('active_cycle') or 'Opener')})</option>
+                            <option value="Opener" {"selected" if level_cycle_overrides.get(level) == "Opener" else ""}>Opener</option>
+                            <option value="Midterm" {"selected" if level_cycle_overrides.get(level) == "Midterm" else ""}>Midterm</option>
+                            <option value="End Term" {"selected" if level_cycle_overrides.get(level) == "End Term" else ""}>End Term</option>
+                            {"".join(f'<option value="{esc(c["cycle_name"])}" {"selected" if level_cycle_overrides.get(level) == c["cycle_name"] else ""}>{esc(c["cycle_name"])}</option>' for c in custom_cycles)}
+                        </select>
+                    </div>
+                    ''' for level in school_levels)}
+                    <button type="submit" class="w-full bg-slate-800 hover:bg-slate-900 text-white text-xs py-2.5 rounded-xl font-semibold transition shadow-xs cursor-pointer mt-2">Save Per-Level Cycles</button>
                 </form>
             </div>
 
@@ -8287,6 +8370,46 @@ def delete_custom_cycle(school_id: int, cycle_id: int, request: Request):
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM school_custom_cycles WHERE id = %s AND school_id = %s;", (cycle_id, school_id))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/school-settings/{school_id}", status_code=303)
+
+
+@app.post("/api/v1/settings/level-cycles/update/{school_id}")
+async def update_level_cycles(school_id: int, request: Request):
+    """One dynamically-named field per education level this school
+    offers (cycle_<level>) — an empty value means "use the school-wide
+    default", which deletes any existing override for that level rather
+    than storing an empty string; a real value upserts the override."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    form_data = await request.form()
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Only ever writes for levels THIS school actually offers —
+            # a crafted request naming some other level is simply
+            # ignored, rather than creating an orphaned override no UI
+            # would ever show or let the admin remove again.
+            valid_levels = set(get_education_levels_for_school(cur, school_id))
+
+            for key, value in form_data.items():
+                if not key.startswith("cycle_"):
+                    continue
+                level = key[len("cycle_"):]
+                if level not in valid_levels:
+                    continue
+                new_cycle = value.strip()
+                if new_cycle:
+                    cur.execute("""
+                        INSERT INTO school_level_cycles (school_id, education_level, active_cycle)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (school_id, education_level) DO UPDATE SET active_cycle = EXCLUDED.active_cycle;
+                    """, (school_id, level, new_cycle))
+                else:
+                    cur.execute("DELETE FROM school_level_cycles WHERE school_id = %s AND education_level = %s;", (school_id, level))
             conn.commit()
 
     return RedirectResponse(url=f"/admin/school-settings/{school_id}", status_code=303)
@@ -8997,8 +9120,9 @@ async def batch_save_class_marks_matrix(school_id: int, request: Request):
     # never trusts whatever the form submitted. The entry page no longer
     # offers any way to pick a different cycle, but a request can always
     # be crafted by hand, so real enforcement has to happen here too, not
-    # just in the UI.
-    cycle_name = (settings_row[2] if settings_row else None) or 'Opener'
+    # just in the UI. Per-level, matching the entry page — see
+    # get_active_cycle_for_level's own docstring for why.
+    cycle_name = get_active_cycle_for_level(school_id, education_level)
 
     # The one deliberate exception: an admin — or, if the school's admin
     # has explicitly turned on allow_staff_past_cycle_editing, staff too
