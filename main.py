@@ -3153,6 +3153,7 @@ def superadmin_db_diagnostic(request: Request, table: str = "student_scores", te
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-class-promotion-history' onsubmit=\"return confirm('Create class_promotion_history and class_promotion_history_students on THIS live database? This is safe to run even if they already exist.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Create class_promotion_history tables now</button></form>" if table == "class_promotion_history" and not columns else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-school-grading-bands' onsubmit=\"return confirm('Create school_grading_bands on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Create school_grading_bands table now</button></form>" if table == "school_grading_bands" and not columns else ""}
                 {"<form method='post' action='/superadmin/db-diagnostic/fix-school-custom-cycles' onsubmit=\"return confirm('Create school_custom_cycles on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Create school_custom_cycles table now</button></form>" if table == "school_custom_cycles" and not columns else ""}
+                {"<form method='post' action='/superadmin/db-diagnostic/fix-school-level-cycles' onsubmit=\"return confirm('Create school_level_cycles on THIS live database? This is safe to run even if it already exists.');\"><button type='submit' class='w-full bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-4 py-2.5 rounded-lg'>🛠 Create school_level_cycles table now</button></form>" if table == "school_level_cycles" and not columns else ""}
                 <form method="get" action="/superadmin/db-diagnostic" class="flex gap-2">
                     <input type="text" name="table" value="{esc(table)}" class="flex-1 border border-slate-200 p-2 rounded-lg text-xs">
                     <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold px-4 py-2 rounded-lg">Check Table</button>
@@ -3370,6 +3371,31 @@ def fix_school_custom_cycles_table(request: Request):
             conn.commit()
 
     return RedirectResponse(url="/superadmin/db-diagnostic?table=school_custom_cycles", status_code=303)
+
+
+@app.post("/superadmin/db-diagnostic/fix-school-level-cycles")
+def fix_school_level_cycles_table(request: Request):
+    """Same self-service pattern — creates school_level_cycles directly
+    through the live app's own connection, for a deployment still
+    running an older main.py from before per-level exam cycles existed.
+    Safe to run repeatedly (IF NOT EXISTS)."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS school_level_cycles (
+                    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+                    education_level VARCHAR(50) NOT NULL,
+                    active_cycle VARCHAR(30) NOT NULL,
+                    PRIMARY KEY (school_id, education_level)
+                );
+            """)
+            conn.commit()
+
+    return RedirectResponse(url="/superadmin/db-diagnostic?table=school_level_cycles", status_code=303)
 
 
 @app.post("/superadmin/db-diagnostic/send-test-email")
