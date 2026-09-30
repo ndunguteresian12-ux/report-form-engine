@@ -873,6 +873,15 @@ def bootstrap_database_schema():
                 -- signature block — a school sets this once in Settings.
                 ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS head_teacher_name VARCHAR(255);
 
+                -- A SEPARATE toggle from is_single_stream above, scoped
+                -- just to ECDE (PP1/PP2) — some comprehensive schools run
+                -- a single-streamed Pre-Primary while every other level
+                -- is genuinely multi-streamed, a real mixed state the one
+                -- school-wide toggle can't represent at all. Off by
+                -- default, so nothing changes for a school that never
+                -- touches this.
+                ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS is_ecde_single_stream BOOLEAN NOT NULL DEFAULT FALSE;
+
                 -- Optional cutoff for the CURRENTLY active assessment
                 -- cycle — once passed, staff (not admins) can no longer
                 -- save marks for it. NULL means no deadline set, so
@@ -6468,9 +6477,10 @@ def add_student_view(school_id: int, request: Request):
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT is_single_stream FROM school_settings WHERE school_id = %s;", (school_id,))
+            cur.execute("SELECT is_single_stream, is_ecde_single_stream FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
             is_single_stream = bool(settings_row['is_single_stream']) if settings_row else False
+            is_ecde_single_stream = bool(settings_row['is_ecde_single_stream']) if settings_row else False
 
             # Was a fully hardcoded Grade 1-9 list before — meant PP1/PP2
             # (and any future class this school gets) could never appear
@@ -6524,9 +6534,38 @@ def add_student_view(school_id: int, request: Request):
     stream_field_html = (
         "<div class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500'>ℹ️ This school is in <b>Single Stream Mode</b> — no stream assignment is needed.</div>"
         if is_single_stream else
-        "<div><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" name=\"stream\" placeholder=\"e.g. N — or a Senior School combination name\" list=\"combo-suggestions\" class=\"w-full border p-2.5 rounded mt-1 text-base\" required>"
+        "<div id='streamFieldWrapper'><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" id=\"streamInput\" name=\"stream\" placeholder=\"e.g. N — or a Senior School combination name\" list=\"combo-suggestions\" class=\"w-full border p-2.5 rounded mt-1 text-base\" required>"
         + (f"<datalist id='combo-suggestions'>{''.join(f'<option value=\"{esc(s)}\">' for s in senior_combination_names)}</datalist><p class='text-[10px] text-slate-400 mt-1'>For Senior School: type it exactly as defined on the Subject Combinations page — start typing to see suggestions.</p>" if senior_combination_names else "")
         + "</div>"
+        + ("""<div id='ecdeSingleStreamNote' class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500 hidden'>ℹ️ PP1/PP2 is Single Stream at this school — no stream assignment needed for this class.</div>
+        <script>
+        (function() {
+            var ECDE_CLASS_IDS = ['10', '11'];
+            var classSelect = document.getElementById('classSelect');
+            var wrapper = document.getElementById('streamFieldWrapper');
+            var input = document.getElementById('streamInput');
+            var note = document.getElementById('ecdeSingleStreamNote');
+            function updateStreamField() {
+                if (!classSelect) return;
+                var isEcde = ECDE_CLASS_IDS.indexOf(classSelect.value) !== -1;
+                if (isEcde) {
+                    wrapper.classList.add('hidden');
+                    note.classList.remove('hidden');
+                    input.required = false;
+                    input.value = 'SINGLE STREAM';
+                } else {
+                    wrapper.classList.remove('hidden');
+                    note.classList.add('hidden');
+                    input.required = true;
+                    if (input.value === 'SINGLE STREAM') { input.value = ''; }
+                }
+            }
+            if (classSelect) {
+                classSelect.addEventListener('change', updateStreamField);
+                updateStreamField();
+            }
+        })();
+        </script>""" if is_ecde_single_stream else "")
     )
 
     class_options_html = "".join(
@@ -6551,7 +6590,7 @@ def add_student_view(school_id: int, request: Request):
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
                         <label class="text-xs font-bold text-slate-600">Education Track Segment</label>
-                        <select name="class_id" class="w-full border p-2.5 rounded mt-1 bg-white text-sm font-medium text-slate-800" required>
+                        <select name="class_id" id="classSelect" class="w-full border p-2.5 rounded mt-1 bg-white text-sm font-medium text-slate-800" required>
                             <option value="" disabled selected>Select Grade...</option>
                             {class_options_html}
                         </select>
@@ -7918,6 +7957,14 @@ def school_settings_page(school_id: int, request: Request):
                         <input type="checkbox" name="is_single_stream" value="true" {"checked" if is_single_stream else ""} class="w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500 cursor-pointer">
                     </div>
 
+                    <div class="bg-slate-50 p-3 rounded-xl border border-slate-100 flex items-center justify-between">
+                        <div>
+                            <label class="text-xs font-bold text-slate-800 block">🧒 ECDE (PP1/PP2) Single Stream</label>
+                            <span class="text-[10px] text-slate-400 block">Separate from the toggle above — for a school where Pre-Primary is single-streamed but Grade 1+ genuinely has multiple streams.</span>
+                        </div>
+                        <input type="checkbox" name="is_ecde_single_stream" value="true" {"checked" if st.get('is_ecde_single_stream') else ""} class="w-4 h-4 text-emerald-600 border-slate-300 rounded focus:ring-emerald-500 cursor-pointer shrink-0 ml-3">
+                    </div>
+
                     <div>
                         <label class="text-[11px] font-semibold text-slate-500 block mb-1">Head of Institution's Name</label>
                         <input type="text" name="head_teacher_name" value="{esc(st.get('head_teacher_name') or '')}" placeholder="e.g. Jane Wanjiru" class="w-full border border-slate-200 p-2 rounded-xl text-xs outline-none focus:border-slate-400">
@@ -8101,6 +8148,7 @@ def update_settings_endpoint(
     closing_date: str = Form(...), 
     theme_color: str = Form(...),
     is_single_stream: str = Form(None),
+    is_ecde_single_stream: str = Form(None),
     head_teacher_name: str = Form(""),
     active_year: int = Form(...),
     marks_entry_deadline: str = Form(""),
@@ -8135,6 +8183,7 @@ def update_settings_endpoint(
     # A checkbox only appears in form data when it's checked — its absence
     # here correctly means "unchecked", not "leave unchanged".
     is_single_stream_bool = bool(is_single_stream)
+    is_ecde_single_stream_bool = bool(is_ecde_single_stream)
     allow_staff_past_cycle_editing_bool = bool(allow_staff_past_cycle_editing)
 
     # datetime-local submits as "2026-05-20T14:30" with no seconds/timezone
@@ -8158,8 +8207,8 @@ def update_settings_endpoint(
             old_year = existing_settings_row[1] if existing_settings_row else None
 
             cur.execute("""
-                INSERT INTO school_settings (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream, head_teacher_name, marks_entry_deadline, allow_staff_past_cycle_editing)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO school_settings (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream, is_ecde_single_stream, head_teacher_name, marks_entry_deadline, allow_staff_past_cycle_editing)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (school_id) DO UPDATE 
                 SET active_term = EXCLUDED.active_term, 
                     active_cycle = EXCLUDED.active_cycle, 
@@ -8167,10 +8216,11 @@ def update_settings_endpoint(
                     opening_date = EXCLUDED.opening_date, 
                     closing_date = EXCLUDED.closing_date,
                     is_single_stream = EXCLUDED.is_single_stream,
+                    is_ecde_single_stream = EXCLUDED.is_ecde_single_stream,
                     head_teacher_name = EXCLUDED.head_teacher_name,
                     marks_entry_deadline = EXCLUDED.marks_entry_deadline,
                     allow_staff_past_cycle_editing = EXCLUDED.allow_staff_past_cycle_editing;
-            """, (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream_bool, head_teacher_name.strip() or None, marks_entry_deadline_value, allow_staff_past_cycle_editing_bool))
+            """, (school_id, active_term, active_cycle, active_year, opening_date, closing_date, is_single_stream_bool, is_ecde_single_stream_bool, head_teacher_name.strip() or None, marks_entry_deadline_value, allow_staff_past_cycle_editing_bool))
 
             # Carries every scheme of work the school already has forward
             # into the new active year automatically, rather than
@@ -8491,9 +8541,10 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
             cur.execute("SELECT id, grade_name FROM classes WHERE education_level = ANY(%s) ORDER BY id ASC;", (allowed_levels,))
             classes = cur.fetchall()
 
-            cur.execute("SELECT is_single_stream FROM school_settings WHERE school_id = %s;", (school_id,))
+            cur.execute("SELECT is_single_stream, is_ecde_single_stream FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
             is_single_stream = bool(settings_row['is_single_stream']) if settings_row else False
+            is_ecde_single_stream = bool(settings_row['is_ecde_single_stream']) if settings_row else False
 
             senior_combination_names = []
             if "Senior School" in allowed_levels:
@@ -8509,9 +8560,36 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
     stream_field_html = (
         "<div class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500'>ℹ️ This school is in <b>Single Stream Mode</b> — no stream assignment is needed.</div>"
         if is_single_stream else
-        f"<div><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" name=\"stream\" value=\"{esc(display_stream)}\" placeholder=\"e.g. N — or a Senior School combination name\" list=\"combo-suggestions\" class=\"w-full border p-2.5 rounded mt-1 text-base\">"
+        f"<div id='streamFieldWrapper'><label class=\"text-xs font-bold text-slate-600\">Class Stream Assignment</label><input type=\"text\" id=\"streamInput\" name=\"stream\" value=\"{esc(display_stream)}\" placeholder=\"e.g. N — or a Senior School combination name\" list=\"combo-suggestions\" class=\"w-full border p-2.5 rounded mt-1 text-base\">"
         + (f"<datalist id='combo-suggestions'>{''.join(f'<option value=\"{esc(s)}\">' for s in senior_combination_names)}</datalist><p class='text-[10px] text-slate-400 mt-1'>For Senior School: type it exactly as defined on the Subject Combinations page — start typing to see suggestions.</p>" if senior_combination_names else "")
         + "</div>"
+        + ("""<div id='ecdeSingleStreamNote' class='sm:col-span-2 bg-slate-50 border border-slate-200 rounded p-2.5 text-xs text-slate-500 hidden'>ℹ️ PP1/PP2 is Single Stream at this school — no stream assignment needed for this class.</div>
+        <script>
+        (function() {
+            var ECDE_CLASS_IDS = ['10', '11'];
+            var classSelect = document.getElementById('classSelect');
+            var wrapper = document.getElementById('streamFieldWrapper');
+            var input = document.getElementById('streamInput');
+            var note = document.getElementById('ecdeSingleStreamNote');
+            function updateStreamField() {
+                if (!classSelect) return;
+                var isEcde = ECDE_CLASS_IDS.indexOf(classSelect.value) !== -1;
+                if (isEcde) {
+                    wrapper.classList.add('hidden');
+                    note.classList.remove('hidden');
+                    input.value = 'SINGLE STREAM';
+                } else {
+                    wrapper.classList.remove('hidden');
+                    note.classList.add('hidden');
+                    if (input.value === 'SINGLE STREAM') { input.value = ''; }
+                }
+            }
+            if (classSelect) {
+                classSelect.addEventListener('change', updateStreamField);
+                updateStreamField();
+            }
+        })();
+        </script>""" if is_ecde_single_stream else "")
     )
 
     return f"""
@@ -8531,7 +8609,7 @@ def edit_student_view(school_id: int, student_id: int, request: Request):
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div>
                         <label class="text-xs font-bold text-slate-600">Education Track Segment</label>
-                        <select name="class_id" class="w-full border p-2.5 rounded mt-1 bg-white text-sm font-medium text-slate-800" required>{grade_options}</select>
+                        <select name="class_id" id="classSelect" class="w-full border p-2.5 rounded mt-1 bg-white text-sm font-medium text-slate-800" required>{grade_options}</select>
                     </div>
                     {stream_field_html}
                 </div>
