@@ -719,6 +719,7 @@ from shared import (
     get_db_connection,
     require_school_session,
     require_admin_session,
+    require_admin_pro_session,
     get_dashboard_url,
     require_superadmin_session,
     sort_subjects_for_display,
