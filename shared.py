@@ -420,10 +420,13 @@ def with_query_param(base_url: str, key: str, value: str) -> str:
 
 def get_dashboard_url(request: Request, school_id: int) -> str:
     """Returns the correct 'home' dashboard URL for whoever is logged in —
-    staff go back to their own portal, not the admin-only dashboard."""
+    staff go back to their own portal, admin_pro to their own separate,
+    narrow dashboard, neither to the regular admin-only dashboard."""
     user = get_current_session_user(request)
     if user and user['role'] == 'staff':
         return f"/staff/dashboard/{school_id}?user_id={user['id']}"
+    if user and user['role'] == 'admin_pro':
+        return f"/admin-pro/dashboard/{school_id}"
     return f"/admin/dashboard/{school_id}"
 
 def require_superadmin_session(request: Request):

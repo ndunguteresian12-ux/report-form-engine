@@ -1731,6 +1731,8 @@ def process_login(email: str = Form(...), password: str = Form(...)):
 
                     if user['role'] == 'admin':
                         response = RedirectResponse(url=f"/admin/dashboard/{user['school_id']}", status_code=303)
+                    elif user['role'] == 'admin_pro':
+                        response = RedirectResponse(url=f"/admin-pro/dashboard/{user['school_id']}", status_code=303)
                     else:
                         if not user['is_verified']:
                             raise HTTPException(status_code=403, detail="Access Denied: Staff verification pending admin approval.")
@@ -3398,54 +3400,6 @@ def fix_school_level_cycles_table(request: Request):
     return RedirectResponse(url="/superadmin/db-diagnostic?table=school_level_cycles", status_code=303)
 
 
-@app.post("/superadmin/migrate-admin-pro")
-def migrate_first_admin_to_admin_pro(request: Request):
-    """One-time, manually-triggered migration for the new admin_pro
-    tier — promotes the OLDEST 'admin' account at each school (the one
-    created when the school itself registered, almost always the Head
-    of Institution who signed up) to 'admin_pro', leaving any other
-    existing admin account at that school (e.g. a deputy, added later)
-    untouched at the regular 'admin' level. Deliberately a manual
-    button, not part of the automatic bootstrap that runs on every
-    startup — an admin_pro who's later intentionally demoted back to
-    'admin' must stay demoted, not get silently re-promoted on the next
-    deploy."""
-    auth_error = require_superadmin_session(request)
-    if auth_error:
-        return auth_error
-
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Only ever touches a school with ZERO existing admin_pro
-            # accounts — without this guard, re-running the button would
-            # keep promoting whichever plain 'admin' happened to be
-            # oldest each time, eventually promoting every admin at a
-            # school to admin_pro over repeated runs, defeating the
-            # entire point of a restricted tier. Caught this directly by
-            # testing a second run before shipping, not by inspection.
-            cur.execute("""
-                UPDATE users SET role = 'admin_pro'
-                WHERE role = 'admin' AND id IN (
-                    SELECT DISTINCT ON (school_id) id FROM users
-                    WHERE role = 'admin'
-                      AND school_id NOT IN (SELECT school_id FROM users WHERE role = 'admin_pro')
-                    ORDER BY school_id, id ASC
-                )
-                RETURNING school_id, email;
-            """)
-            promoted = cur.fetchall()
-            conn.commit()
-
-    return HTMLResponse(f"""
-    <div style="font-family:Arial,sans-serif;padding:30px;">
-        <h2>✅ Migration complete</h2>
-        <p>Promoted {len(promoted)} account(s) to admin_pro (the oldest existing admin account per school):</p>
-        <ul>{"".join(f"<li>School {p['school_id']}: {esc(p['email'])}</li>" for p in promoted)}</ul>
-        <a href="/superadmin/dashboard">← Back to Dashboard</a>
-    </div>
-    """)
-
-
 @app.post("/superadmin/db-diagnostic/send-test-email")
 async def send_test_email_diagnostic(request: Request):
     """Calls send_email() directly and immediately, showing the exact
@@ -3765,14 +3719,6 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
                 <h2 class="text-sm font-bold text-slate-800 mb-1">✉️ Email Teachers &amp; Staff</h2>
                 <p class="text-xs text-slate-400 mb-4">Send a direct email to staff at one school, or across the whole platform — inductions, updates, or feature announcements.</p>
                 <a href="/superadmin/email-staff" class="inline-block bg-indigo-800 hover:bg-indigo-900 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">Compose Email →</a>
-            </div>
-
-            <div class="bg-white rounded-2xl border border-amber-200/80 shadow-xs p-6 mt-6">
-                <h2 class="text-sm font-bold text-amber-700 mb-1">🎓 One-Time: Establish Admin Pro Per School</h2>
-                <p class="text-xs text-slate-400 mb-4">Run once after deploying the admin_pro tier — promotes each school's oldest existing admin account (the one from registration, almost always the HOI) to admin_pro. Safe to run more than once; a school with no remaining 'admin' accounts is simply skipped.</p>
-                <form action="/superadmin/migrate-admin-pro" method="post" onsubmit="return confirm('Promote the oldest admin account at every school to admin_pro? This only affects schools that still have a plain admin account.');">
-                    <button type="submit" class="bg-amber-50 border border-amber-200/80 text-amber-700 font-bold px-5 py-2.5 rounded-xl text-sm transition hover:bg-amber-100/70">Run Migration</button>
-                </form>
             </div>
 
             {support_contact_html()}
@@ -8017,9 +7963,6 @@ def school_settings_page(school_id: int, request: Request):
     if auth_error:
         return auth_error
 
-    viewer = get_current_session_user(request)
-    is_admin_pro_viewer = bool(viewer and viewer.get('role') in ('admin_pro', 'superadmin'))
-
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
@@ -8192,13 +8135,13 @@ def school_settings_page(school_id: int, request: Request):
                 </a>
             </div>
 
-            {f'''<div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6">
-                <h2 class="text-sm font-black text-slate-800 mb-1">👑 Manage Admin Level</h2>
-                <p class="text-xs text-slate-400 mb-3">Total collected and expenditure are reserved for the Head of Institution (Admin Pro). Set who holds that level here.</p>
-                <a href="/admin/manage-admin-level/{school_id}" class="block text-center w-full bg-indigo-50 border border-indigo-200/80 text-indigo-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-indigo-100/70 transition">
-                    👑 Manage Admin Level →
+            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6">
+                <h2 class="text-sm font-black text-slate-800 mb-1">👑 Admin Pro Account</h2>
+                <p class="text-xs text-slate-400 mb-3">A separate login for the Head of Institution — sees total fees collected, balances, and student/staff counts school-wide and per class/grade. Uses their own personal email, with their phone number as the password.</p>
+                <a href="/admin/create-admin-pro/{school_id}" class="block text-center w-full bg-indigo-50 border border-indigo-200/80 text-indigo-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-indigo-100/70 transition">
+                    👑 Create Admin Pro Account →
                 </a>
-            </div>''' if is_admin_pro_viewer else ''}
+            </div>
         </div>
     </body>
     </html>
@@ -8943,6 +8886,275 @@ def backend_delete_student(school_id: int, student_id: int, request: Request):
                 conn.commit()
 
     return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
+@app.get("/admin/create-admin-pro/{school_id}", response_class=HTMLResponse)
+def create_admin_pro_view(school_id: int, request: Request, error: str = None):
+    """A genuinely separate account, not a promotion of the existing
+    admin login — the HOI gets their own credentials here, using their
+    own personal email with their phone number as the password, so they
+    can log in independently of whoever holds the original admin
+    account."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT full_name, email FROM users WHERE school_id = %s AND role = 'admin_pro' ORDER BY id ASC;", (school_id,))
+            existing = cur.fetchall()
+
+    existing_html = "".join(f"<li>{esc(a['full_name'] or a['email'])} — {esc(a['email'])}</li>" for a in existing)
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
+        <div class="bg-white p-8 rounded-2xl border shadow-xs w-full max-w-md">
+            <h2 class="text-lg font-black text-slate-800">👑 Create Admin Pro Account</h2>
+            <p class="text-xs text-slate-400 mb-4">For the Head of Institution. Sees total fees collected, balances, and student/staff counts — school-wide and per class/grade.</p>
+            {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-3 py-2.5 rounded-lg mb-4'>{esc(error)}</div>" if error else ""}
+            {f"<div class='bg-slate-50 border border-slate-200 text-slate-500 text-xs px-3 py-2.5 rounded-lg mb-4'><b>Existing Admin Pro account(s):</b><ul class='list-disc ml-4 mt-1'>{existing_html}</ul></div>" if existing else ""}
+            <form action="/api/v1/admin-pro/create/{school_id}" method="post" class="space-y-3">
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Full Name</label>
+                    <input type="text" name="full_name" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Personal Email (login)</label>
+                    <input type="email" name="email" placeholder="not the school's admin email" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                </div>
+                <div>
+                    <label class="text-xs font-bold text-slate-600">Phone Number</label>
+                    <input type="tel" name="phone_number" placeholder="e.g. 0712345678" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                    <p class="text-[10px] text-slate-400 mt-1">This becomes the login password — the Head of Institution logs in with their email and this phone number.</p>
+                </div>
+                <div class="flex gap-3 pt-2">
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 px-5 rounded-lg text-sm transition">Create Account</button>
+                    <a href="/admin/school-settings/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-lg text-sm transition">Cancel</a>
+                </div>
+            </form>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/api/v1/admin-pro/create/{school_id}")
+def create_admin_pro_submit(school_id: int, request: Request, full_name: str = Form(...), email: str = Form(...), phone_number: str = Form(...)):
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    full_name = full_name.strip()
+    email = email.strip().lower()
+    phone_number = phone_number.strip()
+
+    if not full_name:
+        return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("Full name is required."), status_code=303)
+    if not email:
+        return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("A personal email is required."), status_code=303)
+    if len(phone_number) < 8:
+        return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("Phone number looks too short to use as a password — please check it."), status_code=303)
+
+    # Phone number is the password here — hashed the same way as any
+    # other password, not stored or compared in plain text anywhere.
+    safe_password = phone_number[:72]
+    hashed_password = get_password_hash(safe_password)
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE email = %s;", (email,))
+            if cur.fetchone():
+                return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("That email is already registered to an account."), status_code=303)
+            try:
+                cur.execute("""
+                    INSERT INTO users (email, password_hash, role, school_id, is_verified, full_name, phone_number)
+                    VALUES (%s, %s, 'admin_pro', %s, TRUE, %s, %s);
+                """, (email, hashed_password, school_id, full_name, phone_number))
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("That email is already registered to an account."), status_code=303)
+            log_audit_action(cur, request, school_id, "admin_pro_created", f"Created Admin Pro account for {full_name} ({email})")
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/school-settings/{school_id}?admin_pro_created=1", status_code=303)
+
+
+@app.get("/admin-pro/dashboard/{school_id}", response_class=HTMLResponse)
+def admin_pro_dashboard(school_id: int, request: Request):
+    """The HOI's own, narrow dashboard — total fees collected/balances
+    (school-wide and per class), student counts (school-wide and per
+    grade), and staff count with activate/deactivate. Nothing else —
+    not a restricted view of the admin dashboard, a genuinely separate,
+    purpose-built page. Everything else the admin portal offers stays
+    exactly where it is, reachable only from the regular admin login."""
+    auth_error = require_admin_pro_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT name FROM schools WHERE id = %s;", (school_id,))
+            school = cur.fetchone()
+            if not school:
+                raise HTTPException(status_code=404, detail="School not found.")
+
+            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+            settings_row = cur.fetchone()
+            term = (settings_row['active_term'] if settings_row else None) or 'Term 1'
+            year = (settings_row['active_year'] if settings_row else None) or 2026
+
+            # Three separate, single-level aggregations rather than one
+            # complex join — a join between students and fee_structures
+            # fans out (each student row re-joins the same fee_structures
+            # row), silently multiplying the expected amount by however
+            # many students are in that class. Caught this directly by
+            # testing against real data before shipping, not by
+            # inspection — kept these queries deliberately simple so
+            # each piece stays independently checkable.
+            cur.execute("""
+                SELECT c.grade_name, s.stream, c.education_level, COUNT(*) AS student_count
+                FROM students s JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+                GROUP BY c.grade_name, s.stream, c.education_level
+                ORDER BY c.grade_name, s.stream;
+            """, (school_id,))
+            class_counts = cur.fetchall()
+
+            cur.execute("""
+                SELECT c.grade_name, s.stream, COALESCE(SUM(fp.amount), 0) AS paid
+                FROM fee_payments fp JOIN students s ON fp.student_id = s.id JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND fp.term = %s AND fp.year = %s
+                GROUP BY c.grade_name, s.stream;
+            """, (school_id, term, year))
+            paid_by_class = {(r['grade_name'], r['stream']): float(r['paid']) for r in cur.fetchall()}
+
+            cur.execute("""
+                SELECT c.grade_name, s.stream, COALESCE(SUM(fob.amount), 0) AS opening
+                FROM fee_opening_balances fob JOIN students s ON fob.student_id = s.id JOIN classes c ON s.class_id = c.id
+                WHERE s.school_id = %s AND fob.term = %s AND fob.year = %s
+                GROUP BY c.grade_name, s.stream;
+            """, (school_id, term, year))
+            opening_by_class = {(r['grade_name'], r['stream']): float(r['opening']) for r in cur.fetchall()}
+
+            cur.execute("""
+                SELECT grade_name, COALESCE(SUM(amount), 0) AS per_student
+                FROM fee_structures WHERE school_id = %s AND term = %s AND year = %s
+                GROUP BY grade_name;
+            """, (school_id, term, year))
+            per_student_expected = {r['grade_name']: float(r['per_student']) for r in cur.fetchall()}
+
+            cur.execute("""
+                SELECT id, email, is_verified, full_name FROM users
+                WHERE school_id = %s AND role = 'staff' ORDER BY full_name NULLS LAST, email ASC;
+            """, (school_id,))
+            staff_members = cur.fetchall()
+
+    class_finance = []
+    school_expected, school_paid, school_students = 0, 0, 0
+    for row in class_counts:
+        key = (row['grade_name'], row['stream'])
+        n = row['student_count']
+        expected = per_student_expected.get(row['grade_name'], 0) * n + opening_by_class.get(key, 0)
+        paid = paid_by_class.get(key, 0)
+        school_expected += expected
+        school_paid += paid
+        school_students += n
+        class_finance.append({**row, 'expected': expected, 'paid': paid, 'balance': expected - paid})
+
+    grade_totals = {}
+    for row in class_counts:
+        grade_totals[row['grade_name']] = grade_totals.get(row['grade_name'], 0) + row['student_count']
+
+    class_rows_html = "".join(f"""
+        <tr class="border-b border-slate-50">
+            <td class="p-3 font-semibold text-slate-700">{esc(c['grade_name'])}{' — ' + esc(c['stream']) if c['stream'] != 'SINGLE STREAM' else ''}</td>
+            <td class="p-3 text-center">{c['student_count']}</td>
+            <td class="p-3 text-right">KSh {c['paid']:,.0f}</td>
+            <td class="p-3 text-right {'text-rose-600' if c['balance'] > 0 else 'text-emerald-600'}">KSh {c['balance']:,.0f}</td>
+        </tr>
+    """ for c in class_finance) or "<tr><td colspan='4' class='p-4 text-center text-slate-400 text-xs italic'>No classes with fee data yet.</td></tr>"
+
+    grade_rows_html = "".join(f"""
+        <div class="flex justify-between text-xs py-1.5 border-b border-slate-50 last:border-0">
+            <span class="text-slate-600 font-semibold">{esc(g)}</span><span class="font-bold text-slate-800">{n}</span>
+        </div>
+    """ for g, n in grade_totals.items())
+
+    active_staff_count = sum(1 for s in staff_members if s['is_verified'])
+    staff_rows_html = "".join(f"""
+        <div class="flex items-center justify-between py-2.5 border-b border-slate-50 last:border-0">
+            <div>
+                <p class="text-xs font-bold text-slate-800">{esc(s['full_name'] or s['email'])}</p>
+                <p class="text-[10px] text-slate-400">{esc(s['email'])}</p>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded-full {'bg-emerald-50 text-emerald-700 border border-emerald-200' if s['is_verified'] else 'bg-amber-50 text-amber-700 border border-amber-200'}">{'Active' if s['is_verified'] else 'Inactive'}</span>
+                <form action="/api/v1/staff/toggle-status/{s['id']}/{school_id}" method="post">
+                    <button type="submit" class="text-[10px] font-bold {'text-amber-700 hover:text-amber-900' if s['is_verified'] else 'text-emerald-700 hover:text-emerald-900'}">{'Deactivate' if s['is_verified'] else 'Activate'}</button>
+                </form>
+            </div>
+        </div>
+    """ for s in staff_members) or "<p class='text-xs text-slate-400 italic text-center py-4'>No staff registered yet.</p>"
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | Admin Pro</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen">
+        <header class="bg-white border-b px-6 sm:px-8 py-4 flex justify-between items-center">
+            <div>
+                <h1 class="text-base font-bold text-slate-900">👑 Admin Pro — {esc(school['name'])}</h1>
+                <p class="text-xs text-slate-400">{esc(term)} {year}</p>
+            </div>
+            <a href="/logout" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">Log Out</a>
+        </header>
+
+        <div class="p-4 sm:p-8 max-w-5xl mx-auto space-y-6">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div class="bg-white rounded-2xl border shadow-xs p-5 border-l-4" style="border-left-color:#059669;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Total Fees Collected</p>
+                    <p class="text-2xl font-black text-slate-900 mt-1">KSh {school_paid:,.0f}</p>
+                </div>
+                <div class="bg-white rounded-2xl border shadow-xs p-5 border-l-4" style="border-left-color:#dc2626;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Outstanding Balances</p>
+                    <p class="text-2xl font-black text-slate-900 mt-1">KSh {(school_expected - school_paid):,.0f}</p>
+                </div>
+                <div class="bg-white rounded-2xl border shadow-xs p-5 border-l-4" style="border-left-color:#4f46e5;">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Total Students</p>
+                    <p class="text-2xl font-black text-slate-900 mt-1">{school_students}</p>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div class="lg:col-span-2 bg-white rounded-2xl border shadow-xs overflow-hidden">
+                    <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 p-4 border-b">Fees Per Class</h2>
+                    <div class="overflow-x-auto">
+                        <table class="w-full">
+                            <thead class="bg-slate-50 border-b"><tr class="text-left text-[10px] font-bold text-slate-500 uppercase">
+                                <th class="p-3">Class</th><th class="p-3 text-center">Students</th><th class="p-3 text-right">Paid</th><th class="p-3 text-right">Balance</th>
+                            </tr></thead>
+                            <tbody>{class_rows_html}</tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="bg-white rounded-2xl border shadow-xs p-4">
+                    <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Students Per Grade</h2>
+                    {grade_rows_html or "<p class='text-xs text-slate-400 italic'>No students yet.</p>"}
+                </div>
+            </div>
+
+            <div class="bg-white rounded-2xl border shadow-xs p-6">
+                <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-1">Staff ({active_staff_count}/{len(staff_members)} active)</h2>
+                {staff_rows_html}
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
 @app.post("/api/v1/staff/add/{school_id}")
 def add_staff_node(
     school_id: int,
@@ -9000,89 +9212,6 @@ def add_staff_node(
             log_audit_action(cur, request, school_id, "staff_added", f"Registered staff account for {full_name} ({email})")
             conn.commit()
     return RedirectResponse(url=f"/admin/dashboard/{school_id}?staff_added=1", status_code=303)
-
-
-@app.get("/admin/manage-admin-level/{school_id}", response_class=HTMLResponse)
-def manage_admin_level_view(school_id: int, request: Request, updated: str = None):
-    """Lets an existing admin_pro (the HOI) set who else holds that
-    level at their school — e.g. promoting a deputy who's taking over
-    as HOI, or demoting an account back to regular admin. Deliberately
-    admin_pro-only (via require_admin_pro_session): a regular admin
-    must not be able to promote themselves."""
-    auth_error = require_admin_pro_session(request, school_id)
-    if auth_error:
-        return auth_error
-
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT id, email, full_name, role FROM users
-                WHERE school_id = %s AND role IN ('admin', 'admin_pro')
-                ORDER BY role = 'admin_pro' DESC, id ASC;
-            """, (school_id,))
-            admins = cur.fetchall()
-
-    rows_html = "".join(f"""
-        <div class="flex items-center justify-between py-3 border-b border-slate-50 last:border-0">
-            <div>
-                <p class="text-xs font-bold text-slate-800">{esc(a['full_name'] or a['email'])}</p>
-                <p class="text-[10px] text-slate-400">{esc(a['email'])}</p>
-            </div>
-            <form action="/api/v1/admin/set-admin-level/{school_id}/{a['id']}" method="post" onsubmit="return confirm('Set {esc(a['full_name'] or a['email'])} to {'Admin Pro (HOI)' if a['role'] == 'admin' else 'regular Admin'}?');">
-                <button type="submit" class="text-[11px] font-bold px-3 py-1.5 rounded-lg {'bg-indigo-700 text-white hover:bg-indigo-800' if a['role'] == 'admin' else 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">
-                    {'👑 Make Admin Pro' if a['role'] == 'admin' else '↓ Set to Regular Admin'}
-                </button>
-            </form>
-        </div>
-    """ for a in admins) or "<p class='text-xs text-slate-400 italic text-center py-4'>No admin-level accounts found.</p>"
-
-    return HTMLResponse(f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
-    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
-        <div class="max-w-xl mx-auto space-y-4">
-            <div class="flex items-center justify-between">
-                <h1 class="text-lg font-black text-slate-800">👑 Manage Admin Level</h1>
-                <a href="/admin/school-settings/{school_id}" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back to Settings</a>
-            </div>
-            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg'>✅ Updated.</div>" if updated else ""}
-            <div class="bg-white p-6 rounded-2xl border shadow-xs">
-                <p class="text-xs text-slate-400 mb-3">Admin Pro (Head of Institution) sees everything, including total collected and expenditure. Regular Admin sees everything else, but not those two figures. There must always be at least one Admin Pro — you can't demote the last one.</p>
-                {rows_html}
-            </div>
-        </div>
-    </body>
-    </html>
-    """)
-
-
-@app.post("/api/v1/admin/set-admin-level/{school_id}/{user_id}")
-def set_admin_level(school_id: int, user_id: int, request: Request):
-    auth_error = require_admin_pro_session(request, school_id)
-    if auth_error:
-        return auth_error
-
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, role FROM users WHERE id = %s AND school_id = %s AND role IN ('admin', 'admin_pro');", (user_id, school_id))
-            target = cur.fetchone()
-            if not target:
-                raise HTTPException(status_code=404, detail="Admin-level account not found at this school.")
-
-            if target['role'] == 'admin_pro':
-                # Must never leave a school with zero admin_pro accounts —
-                # that would lock everyone out of total collected and
-                # expenditure with no one left who could restore access.
-                cur.execute("SELECT COUNT(*) AS cnt FROM users WHERE school_id = %s AND role = 'admin_pro';", (school_id,))
-                if cur.fetchone()['cnt'] <= 1:
-                    raise HTTPException(status_code=400, detail="A school must always have at least one Admin Pro — promote someone else first before demoting this one.")
-                cur.execute("UPDATE users SET role = 'admin' WHERE id = %s;", (user_id,))
-            else:
-                cur.execute("UPDATE users SET role = 'admin_pro' WHERE id = %s;", (user_id,))
-            conn.commit()
-
-    return RedirectResponse(url=f"/admin/manage-admin-level/{school_id}?updated=1", status_code=303)
 
 
 @app.get("/admin/staff/edit/{school_id}/{staff_id}", response_class=HTMLResponse)
