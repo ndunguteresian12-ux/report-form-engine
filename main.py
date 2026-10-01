@@ -3398,6 +3398,54 @@ def fix_school_level_cycles_table(request: Request):
     return RedirectResponse(url="/superadmin/db-diagnostic?table=school_level_cycles", status_code=303)
 
 
+@app.post("/superadmin/migrate-admin-pro")
+def migrate_first_admin_to_admin_pro(request: Request):
+    """One-time, manually-triggered migration for the new admin_pro
+    tier — promotes the OLDEST 'admin' account at each school (the one
+    created when the school itself registered, almost always the Head
+    of Institution who signed up) to 'admin_pro', leaving any other
+    existing admin account at that school (e.g. a deputy, added later)
+    untouched at the regular 'admin' level. Deliberately a manual
+    button, not part of the automatic bootstrap that runs on every
+    startup — an admin_pro who's later intentionally demoted back to
+    'admin' must stay demoted, not get silently re-promoted on the next
+    deploy."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Only ever touches a school with ZERO existing admin_pro
+            # accounts — without this guard, re-running the button would
+            # keep promoting whichever plain 'admin' happened to be
+            # oldest each time, eventually promoting every admin at a
+            # school to admin_pro over repeated runs, defeating the
+            # entire point of a restricted tier. Caught this directly by
+            # testing a second run before shipping, not by inspection.
+            cur.execute("""
+                UPDATE users SET role = 'admin_pro'
+                WHERE role = 'admin' AND id IN (
+                    SELECT DISTINCT ON (school_id) id FROM users
+                    WHERE role = 'admin'
+                      AND school_id NOT IN (SELECT school_id FROM users WHERE role = 'admin_pro')
+                    ORDER BY school_id, id ASC
+                )
+                RETURNING school_id, email;
+            """)
+            promoted = cur.fetchall()
+            conn.commit()
+
+    return HTMLResponse(f"""
+    <div style="font-family:Arial,sans-serif;padding:30px;">
+        <h2>✅ Migration complete</h2>
+        <p>Promoted {len(promoted)} account(s) to admin_pro (the oldest existing admin account per school):</p>
+        <ul>{"".join(f"<li>School {p['school_id']}: {esc(p['email'])}</li>" for p in promoted)}</ul>
+        <a href="/superadmin/dashboard">← Back to Dashboard</a>
+    </div>
+    """)
+
+
 @app.post("/superadmin/db-diagnostic/send-test-email")
 async def send_test_email_diagnostic(request: Request):
     """Calls send_email() directly and immediately, showing the exact
@@ -3717,6 +3765,14 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
                 <h2 class="text-sm font-bold text-slate-800 mb-1">✉️ Email Teachers &amp; Staff</h2>
                 <p class="text-xs text-slate-400 mb-4">Send a direct email to staff at one school, or across the whole platform — inductions, updates, or feature announcements.</p>
                 <a href="/superadmin/email-staff" class="inline-block bg-indigo-800 hover:bg-indigo-900 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">Compose Email →</a>
+            </div>
+
+            <div class="bg-white rounded-2xl border border-amber-200/80 shadow-xs p-6 mt-6">
+                <h2 class="text-sm font-bold text-amber-700 mb-1">🎓 One-Time: Establish Admin Pro Per School</h2>
+                <p class="text-xs text-slate-400 mb-4">Run once after deploying the admin_pro tier — promotes each school's oldest existing admin account (the one from registration, almost always the HOI) to admin_pro. Safe to run more than once; a school with no remaining 'admin' accounts is simply skipped.</p>
+                <form action="/superadmin/migrate-admin-pro" method="post" onsubmit="return confirm('Promote the oldest admin account at every school to admin_pro? This only affects schools that still have a plain admin account.');">
+                    <button type="submit" class="bg-amber-50 border border-amber-200/80 text-amber-700 font-bold px-5 py-2.5 rounded-xl text-sm transition hover:bg-amber-100/70">Run Migration</button>
+                </form>
             </div>
 
             {support_contact_html()}
@@ -7961,6 +8017,9 @@ def school_settings_page(school_id: int, request: Request):
     if auth_error:
         return auth_error
 
+    viewer = get_current_session_user(request)
+    is_admin_pro_viewer = bool(viewer and viewer.get('role') in ('admin_pro', 'superadmin'))
+
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
@@ -8132,6 +8191,14 @@ def school_settings_page(school_id: int, request: Request):
                     🧒 Promote PP1 / PP2 →
                 </a>
             </div>
+
+            {f'''<div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6">
+                <h2 class="text-sm font-black text-slate-800 mb-1">👑 Manage Admin Level</h2>
+                <p class="text-xs text-slate-400 mb-3">Total collected and expenditure are reserved for the Head of Institution (Admin Pro). Set who holds that level here.</p>
+                <a href="/admin/manage-admin-level/{school_id}" class="block text-center w-full bg-indigo-50 border border-indigo-200/80 text-indigo-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-indigo-100/70 transition">
+                    👑 Manage Admin Level →
+                </a>
+            </div>''' if is_admin_pro_viewer else ''}
         </div>
     </body>
     </html>
@@ -8933,6 +9000,89 @@ def add_staff_node(
             log_audit_action(cur, request, school_id, "staff_added", f"Registered staff account for {full_name} ({email})")
             conn.commit()
     return RedirectResponse(url=f"/admin/dashboard/{school_id}?staff_added=1", status_code=303)
+
+
+@app.get("/admin/manage-admin-level/{school_id}", response_class=HTMLResponse)
+def manage_admin_level_view(school_id: int, request: Request, updated: str = None):
+    """Lets an existing admin_pro (the HOI) set who else holds that
+    level at their school — e.g. promoting a deputy who's taking over
+    as HOI, or demoting an account back to regular admin. Deliberately
+    admin_pro-only (via require_admin_pro_session): a regular admin
+    must not be able to promote themselves."""
+    auth_error = require_admin_pro_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, email, full_name, role FROM users
+                WHERE school_id = %s AND role IN ('admin', 'admin_pro')
+                ORDER BY role = 'admin_pro' DESC, id ASC;
+            """, (school_id,))
+            admins = cur.fetchall()
+
+    rows_html = "".join(f"""
+        <div class="flex items-center justify-between py-3 border-b border-slate-50 last:border-0">
+            <div>
+                <p class="text-xs font-bold text-slate-800">{esc(a['full_name'] or a['email'])}</p>
+                <p class="text-[10px] text-slate-400">{esc(a['email'])}</p>
+            </div>
+            <form action="/api/v1/admin/set-admin-level/{school_id}/{a['id']}" method="post" onsubmit="return confirm('Set {esc(a['full_name'] or a['email'])} to {'Admin Pro (HOI)' if a['role'] == 'admin' else 'regular Admin'}?');">
+                <button type="submit" class="text-[11px] font-bold px-3 py-1.5 rounded-lg {'bg-indigo-700 text-white hover:bg-indigo-800' if a['role'] == 'admin' else 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">
+                    {'👑 Make Admin Pro' if a['role'] == 'admin' else '↓ Set to Regular Admin'}
+                </button>
+            </form>
+        </div>
+    """ for a in admins) or "<p class='text-xs text-slate-400 italic text-center py-4'>No admin-level accounts found.</p>"
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-xl mx-auto space-y-4">
+            <div class="flex items-center justify-between">
+                <h1 class="text-lg font-black text-slate-800">👑 Manage Admin Level</h1>
+                <a href="/admin/school-settings/{school_id}" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back to Settings</a>
+            </div>
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg'>✅ Updated.</div>" if updated else ""}
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <p class="text-xs text-slate-400 mb-3">Admin Pro (Head of Institution) sees everything, including total collected and expenditure. Regular Admin sees everything else, but not those two figures. There must always be at least one Admin Pro — you can't demote the last one.</p>
+                {rows_html}
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/api/v1/admin/set-admin-level/{school_id}/{user_id}")
+def set_admin_level(school_id: int, user_id: int, request: Request):
+    auth_error = require_admin_pro_session(request, school_id)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, role FROM users WHERE id = %s AND school_id = %s AND role IN ('admin', 'admin_pro');", (user_id, school_id))
+            target = cur.fetchone()
+            if not target:
+                raise HTTPException(status_code=404, detail="Admin-level account not found at this school.")
+
+            if target['role'] == 'admin_pro':
+                # Must never leave a school with zero admin_pro accounts —
+                # that would lock everyone out of total collected and
+                # expenditure with no one left who could restore access.
+                cur.execute("SELECT COUNT(*) AS cnt FROM users WHERE school_id = %s AND role = 'admin_pro';", (school_id,))
+                if cur.fetchone()['cnt'] <= 1:
+                    raise HTTPException(status_code=400, detail="A school must always have at least one Admin Pro — promote someone else first before demoting this one.")
+                cur.execute("UPDATE users SET role = 'admin' WHERE id = %s;", (user_id,))
+            else:
+                cur.execute("UPDATE users SET role = 'admin_pro' WHERE id = %s;", (user_id,))
+            conn.commit()
+
+    return RedirectResponse(url=f"/admin/manage-admin-level/{school_id}?updated=1", status_code=303)
 
 
 @app.get("/admin/staff/edit/{school_id}/{staff_id}", response_class=HTMLResponse)

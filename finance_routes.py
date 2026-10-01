@@ -37,6 +37,7 @@ from shared import (
     RealDictCursor,
     require_school_session,
     require_admin_session,
+    require_admin_pro_session,
     get_dashboard_url,
     full_student_name,
     get_current_session_user,
@@ -449,6 +450,13 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
     if not FINANCE_MODULE_ENABLED:
         return _coming_soon_page(school_id, request)
 
+    # A client specifically asked that total collected and expenditure be
+    # reserved for the HOI (admin_pro) alone — a regular admin (e.g. a
+    # deputy) still sees everything else on this dashboard, just not
+    # these two figures.
+    viewer = get_current_session_user(request)
+    can_see_hoi_finance = bool(viewer and viewer.get('role') in ('admin_pro', 'superadmin'))
+
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             school, active_term, active_year = _get_school_and_settings(cur, school_id)
@@ -539,7 +547,7 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
             </div>
             <div class="flex items-center gap-2 flex-wrap">
                 <a href="/finance/categories/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">🏷️ Fee Categories</a>
-                <a href="/finance/expenditures/{school_id}?term={urllib.parse.quote(term)}&year={year}" class="bg-white hover:bg-slate-50 text-rose-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">💸 Expenditure</a>
+                {f'<a href="/finance/expenditures/{school_id}?term={urllib.parse.quote(term)}&year={year}" class="bg-white hover:bg-slate-50 text-rose-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">💸 Expenditure</a>' if can_see_hoi_finance else ''}
                 <a href="/finance/import/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">📥 Import History</a>
                 <a href="/finance/carry-forward/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-4 py-2 rounded-xl text-xs font-bold transition">🔁 Carry Forward Balances</a>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">← Back to Dashboard</a>
@@ -552,17 +560,20 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
                     <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Expected This Term (All Fees)</p>
                     <p class="text-2xl font-black text-slate-900 mt-1">KSh {total_expected:,.0f}</p>
                 </div>
-                <div class="bg-white rounded-2xl border shadow-xs p-5 border-l-4" style="border-left-color:#059669;">
+                {f'''<div class="bg-white rounded-2xl border shadow-xs p-5 border-l-4" style="border-left-color:#059669;">
                     <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Collected</p>
                     <p class="text-2xl font-black text-slate-900 mt-1">KSh {total_collected:,.0f}</p>
-                </div>
+                </div>''' if can_see_hoi_finance else '''<div class="bg-slate-50 rounded-2xl border border-dashed border-slate-200 p-5 flex flex-col items-center justify-center text-center">
+                    <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">🔒 Collected</p>
+                    <p class="text-[10px] text-slate-400 mt-1">Reserved for the Head of Institution</p>
+                </div>'''}
                 <div class="bg-white rounded-2xl border shadow-xs p-5 border-l-4" style="border-left-color:#dc2626;">
                     <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Outstanding</p>
                     <p class="text-2xl font-black text-slate-900 mt-1">KSh {total_outstanding:,.0f}</p>
                 </div>
             </div>
 
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {f'''<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <a href="/finance/expenditures/{school_id}?term={urllib.parse.quote(term)}&year={year}" class="bg-white rounded-2xl border shadow-xs p-5 border-l-4 hover:shadow-md transition block" style="border-left-color:#e11d48;">
                     <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Expenditure This Term</p>
                     <p class="text-2xl font-black text-rose-700 mt-1">KSh {total_expenditure:,.0f}</p>
@@ -572,7 +583,9 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
                     <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Net Balance (Collected − Expenditure)</p>
                     <p class="text-2xl font-black mt-1" style="color:{'#065f46' if (total_collected - total_expenditure) >= 0 else '#991b1b'};">KSh {(total_collected - total_expenditure):,.0f}</p>
                 </div>
-            </div>
+            </div>''' if can_see_hoi_finance else '''<div class="bg-slate-50 rounded-2xl border border-dashed border-slate-200 p-5 text-center">
+                <p class="text-xs text-slate-400">🔒 Expenditure and Net Balance are reserved for the Head of Institution.</p>
+            </div>'''}
 
             <div>
                 <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-3">By Fee Category</h2>
@@ -776,7 +789,7 @@ EXPENDITURE_CATEGORIES = ["Salaries & Wages", "Utilities", "Learning Materials",
 
 @router.get("/finance/expenditures/{school_id}", response_class=HTMLResponse)
 def expenditures_view(school_id: int, request: Request, term: str = None, year: int = None, saved: str = None, deleted: str = None):
-    auth_error = require_admin_session(request, school_id)
+    auth_error = require_admin_pro_session(request, school_id)
     if auth_error:
         return auth_error
     if not FINANCE_MODULE_ENABLED:
@@ -884,7 +897,7 @@ def expenditures_view(school_id: int, request: Request, term: str = None, year: 
 
 @router.post("/api/v1/finance/expenditure/add/{school_id}")
 def add_expenditure(school_id: int, request: Request, description: str = Form(...), category: str = Form(...), amount: float = Form(...), spent_on: str = Form(...), term: str = Form(...), year: int = Form(...)):
-    auth_error = require_admin_session(request, school_id)
+    auth_error = require_admin_pro_session(request, school_id)
     if auth_error:
         return auth_error
 
@@ -912,7 +925,7 @@ def add_expenditure(school_id: int, request: Request, description: str = Form(..
 
 @router.post("/api/v1/finance/expenditure/delete/{school_id}/{expenditure_id}")
 def delete_expenditure(school_id: int, expenditure_id: int, request: Request, term: str = Form(...), year: int = Form(...)):
-    auth_error = require_admin_session(request, school_id)
+    auth_error = require_admin_pro_session(request, school_id)
     if auth_error:
         return auth_error
 

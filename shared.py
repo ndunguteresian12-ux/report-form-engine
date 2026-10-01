@@ -100,35 +100,101 @@ def is_teacher_of_this_class(cur, school_id: int, user_id: int, grade_name: str,
 # for bulk SMS to parents) can send SMS without importing from main.py
 # directly — that would create exactly the circular import this file
 # exists to avoid.
-# --- SMS provider configuration (Africa's Talking) ---
-# Set these on Render to enable real SMS delivery. Until then, messages
-# are only logged server-side (a clearly-labeled simulation) so features
-# built on top of this can be tested end-to-end without a live account.
+#
+# --- SMS provider configuration ---
+# SMS_PROVIDER selects which backend send_sms() actually uses —
+# "africas_talking" (default) or "android_gateway". Every call site
+# throughout the app just calls send_sms(phone, message); which real
+# service that reaches is purely a config switch here, never something
+# the calling code needs to know or change.
+SMS_PROVIDER = (os.getenv("SMS_PROVIDER") or "africas_talking").strip().lower()
+
+# Africa's Talking config
 AT_USERNAME = (os.getenv("AFRICASTALKING_USERNAME") or "").strip() or None
 AT_API_KEY = (os.getenv("AFRICASTALKING_API_KEY") or "").strip() or None
 AT_SENDER_ID = (os.getenv("AFRICASTALKING_SENDER_ID") or "").strip() or None
-_sms_configured = bool(AT_USERNAME and AT_API_KEY)
+
+# Android SMS Gateway config (github.com/capcom6/android-sms-gateway,
+# cloud mode — the app on the phone connects out to sms-gate.app's cloud
+# relay, since a phone on a home/school WiFi network can't otherwise be
+# reached from Render). The app's own README explicitly warns this isn't
+# recommended for batch sending, due to real mobile-operator throttling
+# risk on a regular consumer SIM — worth remembering if delivery becomes
+# unreliable at higher volumes.
+ANDROID_GATEWAY_USERNAME = (os.getenv("ANDROID_GATEWAY_USERNAME") or "").strip() or None
+ANDROID_GATEWAY_PASSWORD = (os.getenv("ANDROID_GATEWAY_PASSWORD") or "").strip() or None
+ANDROID_GATEWAY_URL = "https://api.sms-gate.app/3rdparty/v1/message"
+# Local-network mode instead of cloud — only reachable if this app and
+# the phone are on the same network, which a Render-hosted app never is.
+# Left here for local testing only; ANDROID_GATEWAY_URL above is what's
+# actually used against a real deployment.
+ANDROID_GATEWAY_LOCAL_URL = (os.getenv("ANDROID_GATEWAY_LOCAL_URL") or "").strip() or None
+
+if SMS_PROVIDER == "android_gateway":
+    _sms_configured = bool(ANDROID_GATEWAY_USERNAME and ANDROID_GATEWAY_PASSWORD)
+else:
+    _sms_configured = bool(AT_USERNAME and AT_API_KEY)
 
 if _sms_configured:
-    logger.info("Africa's Talking SMS configured — messages will be sent via real SMS.")
+    logger.info(f"SMS provider '{SMS_PROVIDER}' configured — messages will be sent via real SMS.")
 else:
     logger.warning(
-        "Africa's Talking SMS NOT configured (AFRICASTALKING_USERNAME / AFRICASTALKING_API_KEY missing). "
+        f"SMS provider '{SMS_PROVIDER}' NOT configured (missing credentials for it). "
         "Messages will only be logged server-side (simulated SMS) until configured."
     )
 
 _last_sms_error = None
 
+
+def _kenyan_phone_to_international(phone_number: str) -> str:
+    """The Android SMS Gateway app expects full international format
+    (+254...); phone numbers are stored in the local "07..."/"01..."
+    format throughout this app (matching how a Kenyan admin actually
+    types them in). Africa's Talking accepts either format directly, so
+    this conversion is only applied for the android_gateway provider."""
+    digits = "".join(c for c in phone_number if c.isdigit() or c == "+")
+    if digits.startswith("+"):
+        return digits
+    if digits.startswith("0"):
+        return "+254" + digits[1:]
+    if digits.startswith("254"):
+        return "+" + digits
+    return "+254" + digits  # best-effort fallback for an unexpected format
+
+
 def send_sms(phone_number: str, message: str) -> bool:
-    """Sends an SMS via Africa's Talking if configured; otherwise logs the
-    message as a simulated send. Returns True if a real send succeeded or a
-    simulated send was logged, False only on a genuine sending failure."""
+    """Sends an SMS via whichever provider SMS_PROVIDER selects, if
+    configured; otherwise logs the message as a simulated send. Returns
+    True if a real send succeeded or a simulated send was logged, False
+    only on a genuine sending failure."""
     global _last_sms_error
 
     if not _sms_configured:
         logger.info(f"[SIMULATED SMS] To: {phone_number} | Message: {message}")
         return True
 
+    if SMS_PROVIDER == "android_gateway":
+        try:
+            url = ANDROID_GATEWAY_LOCAL_URL or ANDROID_GATEWAY_URL
+            response = http_requests.post(
+                url,
+                auth=(ANDROID_GATEWAY_USERNAME, ANDROID_GATEWAY_PASSWORD),
+                headers={"Content-Type": "application/json"},
+                json={
+                    "textMessage": {"text": message},
+                    "phoneNumbers": [_kenyan_phone_to_international(phone_number)],
+                },
+                timeout=15,
+            )
+            response.raise_for_status()
+            _last_sms_error = None
+            return True
+        except Exception as sms_err:
+            _last_sms_error = f"{type(sms_err).__name__}: {sms_err}"
+            logger.error(f"SMS send failed (android_gateway): {_last_sms_error}")
+            return False
+
+    # Default / "africas_talking"
     try:
         response = http_requests.post(
             "https://api.africastalking.com/version1/messaging",
@@ -150,7 +216,7 @@ def send_sms(phone_number: str, message: str) -> bool:
         return True
     except Exception as sms_err:
         _last_sms_error = f"{type(sms_err).__name__}: {sms_err}"
-        logger.error(f"SMS send failed: {_last_sms_error}")
+        logger.error(f"SMS send failed (africas_talking): {_last_sms_error}")
         return False
 
 
@@ -262,7 +328,16 @@ def get_current_session_user(request: Request):
     can be edited client-side via browser dev tools, so authorization
     decisions must never trust their contents — only use session_user_id
     as a lookup key. Returns a dict {id, role, school_id, is_verified} or
-    None if there's no valid session."""
+    None if there's no valid session.
+
+    Also updates last_active_at for the super admin "who's online now"
+    view — throttled to once per 60 seconds per user (checked in the same
+    query, via the WHERE clause, rather than a separate read-then-write)
+    so this doesn't turn into a write on every single page load across
+    the whole app, given this function runs on nearly every authenticated
+    request. The lookup above and this update happen in the same
+    transaction/connection, not a second one, so this adds no extra
+    round-trip in the common case."""
     user_id = request.cookies.get("session_user_id")
     if not user_id:
         return None
@@ -273,7 +348,14 @@ def get_current_session_user(request: Request):
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT id, role, school_id, is_verified FROM users WHERE id = %s;", (user_id,))
-            return cur.fetchone()
+            user = cur.fetchone()
+            if user:
+                cur.execute(
+                    "UPDATE users SET last_active_at = NOW() WHERE id = %s AND (last_active_at IS NULL OR last_active_at < NOW() - INTERVAL '60 seconds');",
+                    (user_id,)
+                )
+                conn.commit()
+            return user
 
 def require_school_session(request: Request, school_id: int):
     """Confirms the request belongs to a real, currently valid account tied
@@ -306,6 +388,29 @@ def require_admin_session(request: Request, school_id: int):
             detail="Access Denied: Administrator privileges required for this action."
         )
     return None
+
+def require_admin_pro_session(request: Request, school_id: int):
+    """Stricter than require_admin_session — only the Head of
+    Institution's own account (role='admin_pro') or the platform
+    superadmin pass. A regular 'admin' (e.g. a deputy) is blocked here,
+    even though they'd pass require_admin_session fine everywhere else.
+    Used specifically for the finance figures a client asked to be
+    reserved for the HOI alone: total collected and expenditure."""
+    user = get_current_session_user(request)
+    if not user:
+        return RedirectResponse(url="/login?error=Authentication+required.", status_code=303)
+    if user['role'] != 'superadmin' and str(user['school_id']) != str(school_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: You do not have privileges for this institution."
+        )
+    if user['role'] not in ('admin_pro', 'superadmin'):
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: This section is reserved for the Head of Institution."
+        )
+    return None
+
 
 def with_query_param(base_url: str, key: str, value: str) -> str:
     """Appends a query param to a URL, correctly using '?' or '&' depending
