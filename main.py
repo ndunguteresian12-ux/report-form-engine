@@ -3722,6 +3722,12 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
                 <a href="/superadmin/email-staff" class="inline-block bg-indigo-800 hover:bg-indigo-900 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">Compose Email →</a>
             </div>
 
+            <div class="bg-white rounded-2xl border border-amber-200/80 shadow-xs p-6 mt-6">
+                <h2 class="text-sm font-bold text-amber-700 mb-1">👑 Admin Pro Accounts</h2>
+                <p class="text-xs text-slate-400 mb-4">Create an Admin Pro account for a school's Head of Institution, or review/fix any account's level across the platform.</p>
+                <a href="/superadmin/admin-pro-accounts" class="inline-block bg-amber-50 border border-amber-200/80 text-amber-700 font-bold px-5 py-2.5 rounded-xl text-sm transition hover:bg-amber-100/70">Manage Admin Pro Accounts →</a>
+            </div>
+
             {support_contact_html()}
             <p class="text-center text-[11px] text-slate-500 pt-6 pb-2">Powered by <img src="{ELIMU_HUB_ICON_DATA_URI}" class="inline w-4 h-4 align-text-bottom rounded" alt=""> <span class="font-bold text-slate-300">Elimu Hub</span></p>
         </div>
@@ -4121,6 +4127,146 @@ def superadmin_email_staff_send(request: Request, scope: str = Form(...), school
             failed_count += 1
 
     return RedirectResponse(url=f"/superadmin/email-staff?sent={sent_count}&failed={failed_count}", status_code=303)
+
+
+@app.get("/superadmin/admin-pro-accounts", response_class=HTMLResponse)
+def superadmin_admin_pro_accounts_view(request: Request, created: str = None, reverted: str = None, error: str = None):
+    """Platform-level, not inside any school's own admin portal — a
+    school's regular admin creating their own Admin Pro account would
+    effectively be a self-demotion of their own access, which doesn't
+    make sense. Also doubles as the fix for a real, now-corrected bug:
+    an earlier, since-removed migration feature promoted some schools'
+    original admin account to admin_pro before it was reverted in code
+    — the DATA change it made was never undone, which is why those
+    specific accounts may still show up as admin_pro here and need a
+    manual revert back."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name FROM schools WHERE status = 'active' ORDER BY name ASC;")
+            schools = cur.fetchall()
+
+            cur.execute("""
+                SELECT u.id, u.email, u.full_name, u.school_id, s.name AS school_name
+                FROM users u JOIN schools s ON u.school_id = s.id
+                WHERE u.role = 'admin_pro' ORDER BY s.name ASC, u.id ASC;
+            """)
+            admin_pro_accounts = cur.fetchall()
+
+    school_options = "".join(f'<option value="{s["id"]}">{esc(s["name"])}</option>' for s in schools)
+
+    accounts_html = "".join(f"""
+        <div class="flex items-center justify-between py-3 border-b border-slate-50 last:border-0">
+            <div>
+                <p class="text-xs font-bold text-slate-800">{esc(a['full_name'] or a['email'])} <span class="text-slate-400 font-normal">— {esc(a['school_name'])}</span></p>
+                <p class="text-[10px] text-slate-400">{esc(a['email'])}</p>
+            </div>
+            <form action="/superadmin/admin-pro-accounts/revert/{a['id']}" method="post" onsubmit="return confirm('Revert {esc(a['full_name'] or a['email'])} back to a regular admin account? Use this only if this account should not be Admin Pro — e.g. it was wrongly promoted by the old, removed migration feature.');">
+                <button type="submit" class="text-[11px] font-bold text-rose-600 hover:text-rose-800">↓ Revert to Admin</button>
+            </form>
+        </div>
+    """ for a in admin_pro_accounts) or "<p class='text-xs text-slate-400 italic text-center py-4'>No Admin Pro accounts exist yet.</p>"
+
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}"><title>Elimu Hub | Admin Pro Accounts</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
+        <div class="max-w-2xl mx-auto space-y-4">
+            <div class="flex items-center justify-between">
+                <h1 class="text-lg font-black text-slate-800">👑 Admin Pro Accounts</h1>
+                <a href="/superadmin/dashboard" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back to Dashboard</a>
+            </div>
+            {f"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-3 rounded-lg'>✅ Admin Pro account created.</div>" if created else ""}
+            {f"<div class='bg-slate-100 border border-slate-200 text-slate-600 text-xs px-4 py-3 rounded-lg'>Account reverted back to regular admin.</div>" if reverted else ""}
+            {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-4 py-3 rounded-lg'>{esc(error)}</div>" if error else ""}
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-sm font-bold text-slate-800 mb-1">+ Create Admin Pro Account</h2>
+                <p class="text-xs text-slate-400 mb-3">For the Head of Institution. A separate login using their own personal email, with their phone number as the password.</p>
+                <form action="/superadmin/admin-pro-accounts/create" method="post" class="space-y-3">
+                    <div>
+                        <label class="text-xs font-bold text-slate-600">School</label>
+                        <select name="school_id" class="w-full border p-2.5 rounded-lg mt-1 text-sm bg-white" required>{school_options}</select>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-600">Full Name</label>
+                        <input type="text" name="full_name" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-600">Personal Email (login)</label>
+                        <input type="email" name="email" placeholder="not the school's admin email" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-600">Phone Number</label>
+                        <input type="tel" name="phone_number" placeholder="e.g. 0712345678" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
+                        <p class="text-[10px] text-slate-400 mt-1">This becomes the login password.</p>
+                    </div>
+                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 px-5 rounded-lg text-sm transition">Create Account</button>
+                </form>
+            </div>
+
+            <div class="bg-white p-6 rounded-2xl border shadow-xs">
+                <h2 class="text-sm font-bold text-slate-800 mb-3">Existing Admin Pro Accounts</h2>
+                {accounts_html}
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
+
+
+@app.post("/superadmin/admin-pro-accounts/create")
+def superadmin_create_admin_pro(request: Request, school_id: int = Form(...), full_name: str = Form(...), email: str = Form(...), phone_number: str = Form(...)):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    full_name = full_name.strip()
+    email = email.strip().lower()
+    phone_number = phone_number.strip()
+
+    if not full_name or not email:
+        return RedirectResponse(url="/superadmin/admin-pro-accounts?error=" + urllib.parse.quote("Full name and email are both required."), status_code=303)
+    if len(phone_number) < 8:
+        return RedirectResponse(url="/superadmin/admin-pro-accounts?error=" + urllib.parse.quote("Phone number looks too short to use as a password."), status_code=303)
+
+    safe_password = phone_number[:72]
+    hashed_password = get_password_hash(safe_password)
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE email = %s;", (email,))
+            if cur.fetchone():
+                return RedirectResponse(url="/superadmin/admin-pro-accounts?error=" + urllib.parse.quote("That email is already registered to an account."), status_code=303)
+            try:
+                cur.execute("""
+                    INSERT INTO users (email, password_hash, role, school_id, is_verified, full_name, phone_number)
+                    VALUES (%s, %s, 'admin_pro', %s, TRUE, %s, %s);
+                """, (email, hashed_password, school_id, full_name, phone_number))
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                return RedirectResponse(url="/superadmin/admin-pro-accounts?error=" + urllib.parse.quote("That email is already registered to an account."), status_code=303)
+
+    return RedirectResponse(url="/superadmin/admin-pro-accounts?created=1", status_code=303)
+
+
+@app.post("/superadmin/admin-pro-accounts/revert/{user_id}")
+def superadmin_revert_admin_pro(user_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET role = 'admin' WHERE id = %s AND role = 'admin_pro';", (user_id,))
+            conn.commit()
+
+    return RedirectResponse(url="/superadmin/admin-pro-accounts?reverted=1", status_code=303)
 
 
 @app.get("/superadmin/school/{school_id}", response_class=HTMLResponse)
@@ -8136,13 +8282,6 @@ def school_settings_page(school_id: int, request: Request):
                 </a>
             </div>
 
-            <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6">
-                <h2 class="text-sm font-black text-slate-800 mb-1">👑 Admin Pro Account</h2>
-                <p class="text-xs text-slate-400 mb-3">A separate login for the Head of Institution — sees total fees collected, balances, and student/staff counts school-wide and per class/grade. Uses their own personal email, with their phone number as the password.</p>
-                <a href="/admin/create-admin-pro/{school_id}" class="block text-center w-full bg-indigo-50 border border-indigo-200/80 text-indigo-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-indigo-100/70 transition">
-                    👑 Create Admin Pro Account →
-                </a>
-            </div>
         </div>
     </body>
     </html>
@@ -8887,99 +9026,6 @@ def backend_delete_student(school_id: int, student_id: int, request: Request):
                 conn.commit()
 
     return RedirectResponse(url=get_dashboard_url(request, school_id), status_code=303)
-@app.get("/admin/create-admin-pro/{school_id}", response_class=HTMLResponse)
-def create_admin_pro_view(school_id: int, request: Request, error: str = None):
-    """A genuinely separate account, not a promotion of the existing
-    admin login — the HOI gets their own credentials here, using their
-    own personal email with their phone number as the password, so they
-    can log in independently of whoever holds the original admin
-    account."""
-    auth_error = require_admin_session(request, school_id)
-    if auth_error:
-        return auth_error
-
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT full_name, email FROM users WHERE school_id = %s AND role = 'admin_pro' ORDER BY id ASC;", (school_id,))
-            existing = cur.fetchall()
-
-    existing_html = "".join(f"<li>{esc(a['full_name'] or a['email'])} — {esc(a['email'])}</li>" for a in existing)
-
-    return HTMLResponse(f"""
-    <!DOCTYPE html>
-    <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
-    <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
-        <div class="bg-white p-8 rounded-2xl border shadow-xs w-full max-w-md">
-            <h2 class="text-lg font-black text-slate-800">👑 Create Admin Pro Account</h2>
-            <p class="text-xs text-slate-400 mb-4">For the Head of Institution. Sees total fees collected, balances, and student/staff counts — school-wide and per class/grade.</p>
-            {f"<div class='bg-rose-50 border border-rose-200 text-rose-700 text-xs px-3 py-2.5 rounded-lg mb-4'>{esc(error)}</div>" if error else ""}
-            {f"<div class='bg-slate-50 border border-slate-200 text-slate-500 text-xs px-3 py-2.5 rounded-lg mb-4'><b>Existing Admin Pro account(s):</b><ul class='list-disc ml-4 mt-1'>{existing_html}</ul></div>" if existing else ""}
-            <form action="/api/v1/admin-pro/create/{school_id}" method="post" class="space-y-3">
-                <div>
-                    <label class="text-xs font-bold text-slate-600">Full Name</label>
-                    <input type="text" name="full_name" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
-                </div>
-                <div>
-                    <label class="text-xs font-bold text-slate-600">Personal Email (login)</label>
-                    <input type="email" name="email" placeholder="not the school's admin email" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
-                </div>
-                <div>
-                    <label class="text-xs font-bold text-slate-600">Phone Number</label>
-                    <input type="tel" name="phone_number" placeholder="e.g. 0712345678" class="w-full border p-2.5 rounded-lg mt-1 text-sm" required>
-                    <p class="text-[10px] text-slate-400 mt-1">This becomes the login password — the Head of Institution logs in with their email and this phone number.</p>
-                </div>
-                <div class="flex gap-3 pt-2">
-                    <button type="submit" class="bg-indigo-700 hover:bg-indigo-800 text-white font-bold py-2.5 px-5 rounded-lg text-sm transition">Create Account</button>
-                    <a href="/admin/school-settings/{school_id}" class="bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 px-5 rounded-lg text-sm transition">Cancel</a>
-                </div>
-            </form>
-        </div>
-    </body>
-    </html>
-    """)
-
-
-@app.post("/api/v1/admin-pro/create/{school_id}")
-def create_admin_pro_submit(school_id: int, request: Request, full_name: str = Form(...), email: str = Form(...), phone_number: str = Form(...)):
-    auth_error = require_admin_session(request, school_id)
-    if auth_error:
-        return auth_error
-
-    full_name = full_name.strip()
-    email = email.strip().lower()
-    phone_number = phone_number.strip()
-
-    if not full_name:
-        return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("Full name is required."), status_code=303)
-    if not email:
-        return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("A personal email is required."), status_code=303)
-    if len(phone_number) < 8:
-        return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("Phone number looks too short to use as a password — please check it."), status_code=303)
-
-    # Phone number is the password here — hashed the same way as any
-    # other password, not stored or compared in plain text anywhere.
-    safe_password = phone_number[:72]
-    hashed_password = get_password_hash(safe_password)
-
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE email = %s;", (email,))
-            if cur.fetchone():
-                return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("That email is already registered to an account."), status_code=303)
-            try:
-                cur.execute("""
-                    INSERT INTO users (email, password_hash, role, school_id, is_verified, full_name, phone_number)
-                    VALUES (%s, %s, 'admin_pro', %s, TRUE, %s, %s);
-                """, (email, hashed_password, school_id, full_name, phone_number))
-                conn.commit()
-            except psycopg2.errors.UniqueViolation:
-                conn.rollback()
-                return RedirectResponse(url=f"/admin/create-admin-pro/{school_id}?error=" + urllib.parse.quote("That email is already registered to an account."), status_code=303)
-            log_audit_action(cur, request, school_id, "admin_pro_created", f"Created Admin Pro account for {full_name} ({email})")
-            conn.commit()
-
-    return RedirectResponse(url=f"/admin/school-settings/{school_id}?admin_pro_created=1", status_code=303)
 
 
 @app.get("/admin-pro/dashboard/{school_id}", response_class=HTMLResponse)
