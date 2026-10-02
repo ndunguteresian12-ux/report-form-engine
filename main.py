@@ -5556,6 +5556,9 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             settings = cur.fetchone()
             st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'active_year': 2026}
             st['active_cycle'] = get_active_cycle_for_level(school_id, education_level)
+            # Same narrow scope as the report card fix — only changes
+            # behavior for a level whose active cycle is a custom one.
+            is_custom_cycle_mode = st['active_cycle'] not in ('Opener', 'Midterm', 'End Term')
 
             # Whole grade, every stream combined, when no stream is given —
             # this is the ORIGINAL behavior, kept exactly as-is for any
@@ -5671,15 +5674,26 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
                 total_marks += score
                 total_points += metrics['points']
                 subjects_entered += 1
-        # Divided by the full subject count for this level (total_subjects),
-        # not just the subjects THIS student happens to have marks entered
-        # for — a student missing one subject's marks should show a lower
-        # average reflecting that gap, not have their average quietly
-        # computed over a smaller subject count than everyone else's,
-        # which would make two students with the same total_marks but a
-        # different number of entered subjects show different averages.
-        avg_marks = (total_marks / total_subjects) if total_subjects else 0.0
-        avg_points = (total_points / total_subjects) if total_subjects else 0.0
+        if is_custom_cycle_mode:
+            # A custom cycle (e.g. ECDE on "Targeter") isn't a full-
+            # curriculum sitting the way a standard term cycle is — only
+            # some subjects may have been tested at all, so a student's
+            # average here should reflect what was actually entered FOR
+            # THEM, not be deflated by subjects nobody necessarily meant
+            # to test under this cycle. Same reasoning, same scope, as
+            # the matching fix already applied to the report card.
+            avg_marks = (total_marks / subjects_entered) if subjects_entered else 0.0
+            avg_points = (total_points / subjects_entered) if subjects_entered else 0.0
+        else:
+            # Divided by the full subject count for this level (total_subjects),
+            # not just the subjects THIS student happens to have marks entered
+            # for — a student missing one subject's marks should show a lower
+            # average reflecting that gap, not have their average quietly
+            # computed over a smaller subject count than everyone else's,
+            # which would make two students with the same total_marks but a
+            # different number of entered subjects show different averages.
+            avg_marks = (total_marks / total_subjects) if total_subjects else 0.0
+            avg_points = (total_points / total_subjects) if total_subjects else 0.0
         overall_metrics = evaluate_performance_metrics(avg_marks, bands=grading_bands)
         overall_level = overall_metrics['desc']
         overall_pld = overall_metrics['pld']
