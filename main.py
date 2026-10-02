@@ -7432,18 +7432,35 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
             st['active_cycle'] = get_active_cycle_for_level(school_id, education_level)
             theme = fetch_theme_styles(school.get('theme_color', 'emerald') if school else 'emerald')
 
+            # A level whose active cycle is a CUSTOM one (e.g. ECDE set to
+            # "Targeter") needs a genuinely different report path below —
+            # the combined-term math, the previous-position comparison,
+            # and the 3-column Opener/Midterm/End Term layout all assume
+            # one of those 3 standard names specifically, so a custom
+            # cycle's marks would otherwise never be found anywhere in
+            # this report, however correctly they were entered and saved.
+            # This flag gates every change to that one case; when it's
+            # False (the standard case, true for virtually every school
+            # today), nothing below behaves any differently than before.
+            is_custom_cycle_mode = st['active_cycle'] not in ('Opener', 'Midterm', 'End Term')
+            # Substituted into the ranking queries below in place of the
+            # hardcoded 3-name IN(...) clause, with its matching params —
+            # identical SQL shape either way, just a different filter.
+            cycle_filter_sql = "sc.cycle_name = %s" if is_custom_cycle_mode else "sc.cycle_name IN ('Opener', 'Midterm', 'End Term')"
+            cycle_filter_params = (st['active_cycle'],) if is_custom_cycle_mode else ()
+
             if not school:
                 raise HTTPException(status_code=404, detail="Institution Tenant context missing.")
 
             # 🌟 Fixed Subject Average Aggregation to align perfectly with report card loop calculations
-            cur.execute("""
+            cur.execute(f"""
                 WITH subject_averages AS (
                     SELECT 
                         sc.student_id,
                         sc.learning_area_id,
                         AVG(sc.raw_score) AS subject_avg
                     FROM student_scores sc
-                    WHERE sc.cycle_name IN ('Opener', 'Midterm', 'End Term') AND sc.term = %s AND sc.year = %s
+                    WHERE {cycle_filter_sql} AND sc.term = %s AND sc.year = %s
                     GROUP BY sc.student_id, sc.learning_area_id
                 ),
                 student_mean_scores AS (
@@ -7502,7 +7519,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                 SELECT * FROM cohort_rankings
                 WHERE stream = %s
                 ORDER BY stream_position ASC, admission_number ASC;
-            """, (st['active_term'], st['active_year'], school_id, grade_name, stream))
+            """, cycle_filter_params + (st['active_term'], st['active_year'], school_id, grade_name, stream))
             students = cur.fetchall()
 
             if not students:
@@ -7519,65 +7536,103 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
             # (new admission, or the school just hasn't been using the
             # system that long) is simply absent from this lookup, and the
             # report card shows "—" for them rather than a wrong number.
-            prev_term, prev_year = _get_previous_term_year(st['active_term'], st['active_year'])
-            cur.execute("""
-                WITH subject_averages AS (
-                    SELECT
-                        sc.student_id,
-                        sc.learning_area_id,
-                        AVG(sc.raw_score) AS subject_avg
-                    FROM student_scores sc
-                    WHERE sc.cycle_name IN ('Opener', 'Midterm', 'End Term') AND sc.term = %s AND sc.year = %s
-                    GROUP BY sc.student_id, sc.learning_area_id
-                ),
-                student_mean_scores AS (
-                    SELECT
-                        s.id AS student_id,
-                        s.stream,
-                        c.grade_name,
-                        COALESCE(SUM(sa.subject_avg), 0) AS total_marks
-                    FROM students s
-                    JOIN classes c ON s.class_id = c.id
-                    JOIN subject_averages sa ON s.id = sa.student_id
-                    WHERE s.school_id = %s AND c.grade_name = %s
-                      AND (s.status IS NULL OR s.status != 'GRADUATED')
-                    GROUP BY s.id, s.stream, c.grade_name
-                ),
-                cohort_rankings AS (
-                    SELECT
-                        *,
-                        RANK() OVER (PARTITION BY grade_name, stream ORDER BY total_marks DESC) AS stream_position,
-                        COUNT(*) OVER (PARTITION BY grade_name, stream) AS total_in_stream,
-                        RANK() OVER (PARTITION BY grade_name ORDER BY total_marks DESC) AS grade_position,
-                        COUNT(*) OVER (PARTITION BY grade_name) AS total_in_grade
-                    FROM student_mean_scores
-                )
-                SELECT student_id, stream_position, total_in_stream, grade_position, total_in_grade FROM cohort_rankings WHERE stream = %s;
-            """, (prev_term, prev_year, school_id, grade_name, stream))
-            previous_positions = {r['student_id']: r for r in cur.fetchall()}
+            #
+            # Skipped entirely in custom-cycle mode: this term's position
+            # is now based on just that one custom cycle, while "previous
+            # term" here always means the standard combined Opener+Midterm
+            # +End Term total — comparing those two would be comparing a
+            # single exam's rank against a 3-exam combined rank, which
+            # isn't a real trend, just a misleading pair of numbers that
+            # happen to both be called "position". Showing "—" is more
+            # honest than a comparison that doesn't actually mean anything.
+            previous_positions = {}
+            if not is_custom_cycle_mode:
+                prev_term, prev_year = _get_previous_term_year(st['active_term'], st['active_year'])
+                cur.execute("""
+                    WITH subject_averages AS (
+                        SELECT
+                            sc.student_id,
+                            sc.learning_area_id,
+                            AVG(sc.raw_score) AS subject_avg
+                        FROM student_scores sc
+                        WHERE sc.cycle_name IN ('Opener', 'Midterm', 'End Term') AND sc.term = %s AND sc.year = %s
+                        GROUP BY sc.student_id, sc.learning_area_id
+                    ),
+                    student_mean_scores AS (
+                        SELECT
+                            s.id AS student_id,
+                            s.stream,
+                            c.grade_name,
+                            COALESCE(SUM(sa.subject_avg), 0) AS total_marks
+                        FROM students s
+                        JOIN classes c ON s.class_id = c.id
+                        JOIN subject_averages sa ON s.id = sa.student_id
+                        WHERE s.school_id = %s AND c.grade_name = %s
+                          AND (s.status IS NULL OR s.status != 'GRADUATED')
+                        GROUP BY s.id, s.stream, c.grade_name
+                    ),
+                    cohort_rankings AS (
+                        SELECT
+                            *,
+                            RANK() OVER (PARTITION BY grade_name, stream ORDER BY total_marks DESC) AS stream_position,
+                            COUNT(*) OVER (PARTITION BY grade_name, stream) AS total_in_stream,
+                            RANK() OVER (PARTITION BY grade_name ORDER BY total_marks DESC) AS grade_position,
+                            COUNT(*) OVER (PARTITION BY grade_name) AS total_in_grade
+                        FROM student_mean_scores
+                    )
+                    SELECT student_id, stream_position, total_in_stream, grade_position, total_in_grade FROM cohort_rankings WHERE stream = %s;
+                """, (prev_term, prev_year, school_id, grade_name, stream))
+                previous_positions = {r['student_id']: r for r in cur.fetchall()}
 
             # Only show a column for an exam cycle if it's actually been keyed
             # in anywhere for this batch — e.g. if only End Term has been
             # entered so far, the report shows just that one column instead
             # of two empty ones for Opener/Midterm.
             student_ids_in_batch = [s['student_id'] for s in students]
-            cur.execute("""
-                SELECT DISTINCT cycle_name FROM student_scores
-                WHERE student_id = ANY(%s) AND cycle_name IN ('Opener', 'Midterm', 'End Term') AND term = %s AND year = %s;
-            """, (student_ids_in_batch, st['active_term'], st['active_year']))
-            cycles_with_data = {r['cycle_name'] for r in cur.fetchall()}
-            show_opener = 'Opener' in cycles_with_data
-            show_midterm = 'Midterm' in cycles_with_data
-            show_endterm = 'End Term' in cycles_with_data
-            # Safety net: if somehow nothing has been entered anywhere yet,
-            # still show all three so the report isn't a table with zero
-            # exam columns at all.
-            if not (show_opener or show_midterm or show_endterm):
-                show_opener = show_midterm = show_endterm = True
+            # In custom-cycle mode there is only ever one column — the
+            # custom cycle itself — labeled with its real name, rather
+            # than a report that silently shows no marks because none of
+            # the 3 standard column slots this logic used to check for
+            # ("Opener"/"Midterm"/"End Term") match a custom cycle's name.
+            show_opener = show_midterm = show_endterm = False
+            show_custom = False
+            if is_custom_cycle_mode:
+                cur.execute("""
+                    SELECT 1 FROM student_scores
+                    WHERE student_id = ANY(%s) AND cycle_name = %s AND term = %s AND year = %s LIMIT 1;
+                """, (student_ids_in_batch, st['active_cycle'], st['active_term'], st['active_year']))
+                show_custom = cur.fetchone() is not None
+            else:
+                cur.execute("""
+                    SELECT DISTINCT cycle_name FROM student_scores
+                    WHERE student_id = ANY(%s) AND cycle_name IN ('Opener', 'Midterm', 'End Term') AND term = %s AND year = %s;
+                """, (student_ids_in_batch, st['active_term'], st['active_year']))
+                cycles_with_data = {r['cycle_name'] for r in cur.fetchall()}
+                show_opener = 'Opener' in cycles_with_data
+                show_midterm = 'Midterm' in cycles_with_data
+                show_endterm = 'End Term' in cycles_with_data
+                # Safety net: if somehow nothing has been entered anywhere yet,
+                # still show all three so the report isn't a table with zero
+                # exam columns at all.
+                if not (show_opener or show_midterm or show_endterm):
+                    show_opener = show_midterm = show_endterm = True
 
-            # 2. Extract curriculum guidelines dynamically based on structural segment parameters
+            # 2. Extract curriculum guidelines dynamically based on structural segment parameters.
+            # In custom-cycle mode, only subjects with at least one score
+            # entered under this cycle (for any student in this batch) are
+            # kept — this is the "no blank rows" request, scoped narrowly
+            # to custom cycles only, exactly as agreed, so a standard
+            # Opener/Midterm/End Term report's subject list is completely
+            # untouched by this.
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
             subjects = cur.fetchall()
+            if is_custom_cycle_mode:
+                cur.execute("""
+                    SELECT DISTINCT learning_area_id FROM student_scores
+                    WHERE student_id = ANY(%s) AND cycle_name = %s AND term = %s AND year = %s;
+                """, (student_ids_in_batch, st['active_cycle'], st['active_term'], st['active_year']))
+                entered_subject_ids = {r['learning_area_id'] for r in cur.fetchall()}
+                subjects = [sub for sub in subjects if sub['id'] in entered_subject_ids]
 
             # Class teacher (homeroom) name, for the signature block —
             # falls back gracefully to a blank line if never assigned.
@@ -7685,16 +7740,29 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                 op_count, mid_count, end_count = 0, 0, 0
 
                 for sub in subjects:
-                    op = score_map.get(sub['id'], {}).get('Opener')
-                    mid = score_map.get(sub['id'], {}).get('Midterm')
-                    end = score_map.get(sub['id'], {}).get('End Term')
+                    if is_custom_cycle_mode:
+                        # Only one real column in this mode — the custom
+                        # cycle itself, looked up by its actual name
+                        # instead of the 3 standard ones that would never
+                        # match it. Everything below this line (grading,
+                        # row rendering) treats it as the single entry in
+                        # active_cycles, same as a normal single-cycle
+                        # subject average would be.
+                        op = score_map.get(sub['id'], {}).get(st['active_cycle'])
+                        mid = end = None
+                        if op is not None:
+                            opener_sum += op; op_count += 1
+                    else:
+                        op = score_map.get(sub['id'], {}).get('Opener')
+                        mid = score_map.get(sub['id'], {}).get('Midterm')
+                        end = score_map.get(sub['id'], {}).get('End Term')
 
-                    if op is not None:
-                        opener_sum += op; op_count += 1
-                    if mid is not None:
-                        midterm_sum += mid; mid_count += 1
-                    if end is not None:
-                        endterm_sum += end; end_count += 1
+                        if op is not None:
+                            opener_sum += op; op_count += 1
+                        if mid is not None:
+                            midterm_sum += mid; mid_count += 1
+                        if end is not None:
+                            endterm_sum += end; end_count += 1
 
                     active_cycles = [v for v in [op, mid, end] if v is not None]
                     if active_cycles:
@@ -7716,7 +7784,12 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                     exam_body_cells = (
                         (f'<td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-size:{row_font};">{op_str}</td>' if show_opener else "") +
                         (f'<td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-size:{row_font};">{mid_str}</td>' if show_midterm else "") +
-                        (f'<td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-size:{row_font};">{end_str}</td>' if show_endterm else "")
+                        (f'<td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-size:{row_font};">{end_str}</td>' if show_endterm else "") +
+                        # op_str holds the custom cycle's own score here —
+                        # same variable, reused, since op was looked up
+                        # under st['active_cycle'] instead of "Opener"
+                        # specifically when is_custom_cycle_mode is True.
+                        (f'<td style="padding: {row_vpad} 6px; border: 1px solid #222; text-align:center; font-size:{row_font};">{op_str}</td>' if show_custom else "")
                     )
 
                     subject_teacher_name = subject_teacher_names.get(sub['id'], "")
@@ -7749,6 +7822,27 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                 mid_avg = (midterm_sum / mid_count) if mid_count > 0 else 0.0
                 end_avg = (endterm_sum / end_count) if end_count > 0 else 0.0
 
+                # A 3-point "milestone" line only means something when
+                # there really are 3 cycles' worth of data — in custom-
+                # cycle mode there's exactly one, so a single labeled
+                # point replaces the line-and-3-dots entirely, rather
+                # than showing Midterm/End Term pinned at a misleading 0%.
+                if is_custom_cycle_mode:
+                    milestone_svg_points = f"""
+                        <circle cx="105" cy="{60 - (op_avg * 0.5)}" r="4" fill="{theme['hex']}" />
+                        <text x="72" y="73" font-size="7.5" font-weight="bold" fill="#334155" font-family="sans-serif">{esc(st['active_cycle'])} ({op_avg:.1f}%)</text>
+                    """
+                else:
+                    milestone_svg_points = f"""
+                        <path d="M 40 {60 - (op_avg * 0.5)} L 105 {60 - (mid_avg * 0.5)} L 170 {60 - (end_avg * 0.5)}" fill="none" stroke="{theme['hex']}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
+                        <circle cx="40" cy="{60 - (op_avg * 0.5)}" r="3.5" fill="#0f172a" />
+                        <circle cx="105" cy="{60 - (mid_avg * 0.5)}" r="3.5" fill="#0f172a" />
+                        <circle cx="170" cy="{60 - (end_avg * 0.5)}" r="3.5" fill="#0f172a" />
+                        <text x="28" y="73" font-size="7.5" font-weight="bold" fill="#334155" font-family="sans-serif">Opener ({op_avg:.1f}%)</text>
+                        <text x="90" y="73" font-size="7.5" font-weight="bold" fill="#334155" font-family="sans-serif">Mid ({mid_avg:.1f}%)</text>
+                        <text x="155" y="73" font-size="7.5" font-weight="bold" fill="#334155" font-family="sans-serif">End ({end_avg:.1f}%)</text>
+                    """
+
                 report_logo_src = school.get('logo_url')
                 if report_logo_src:
                     report_final_logo_src = report_logo_src if report_logo_src.startswith("http") else f"/{report_logo_src.lstrip('/')}"
@@ -7759,7 +7853,8 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                 exam_header_cells = (
                     ('<th style="padding:6px; border:1px solid #222; width:65px; text-align:center;">Opener</th>' if show_opener else "") +
                     ('<th style="padding:6px; border:1px solid #222; width:65px; text-align:center;">Midterm</th>' if show_midterm else "") +
-                    ('<th style="padding:6px; border:1px solid #222; width:65px; text-align:center;">End Term</th>' if show_endterm else "")
+                    ('<th style="padding:6px; border:1px solid #222; width:65px; text-align:center;">End Term</th>' if show_endterm else "") +
+                    (f'<th style="padding:6px; border:1px solid #222; width:65px; text-align:center;">{esc(st["active_cycle"])}</th>' if show_custom else "")
                 )
 
                 report_cards_html.append(f"""
@@ -7827,16 +7922,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                                     <text x="5" y="13" font-size="7" fill="#64748b" font-family="sans-serif">100%</text>
                                     <text x="5" y="38" font-size="7" fill="#64748b" font-family="sans-serif">50%</text>
                                     <text x="8" y="63" font-size="7" fill="#64748b" font-family="sans-serif">0%</text>
-                                    
-                                    <path d="M 40 {60 - (op_avg * 0.5)} L 105 {60 - (mid_avg * 0.5)} L 170 {60 - (end_avg * 0.5)}" fill="none" stroke="{theme['hex']}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
-                                    
-                                    <circle cx="40" cy="{60 - (op_avg * 0.5)}" r="3.5" fill="#0f172a" />
-                                    <circle cx="105" cy="{60 - (mid_avg * 0.5)}" r="3.5" fill="#0f172a" />
-                                    <circle cx="170" cy="{60 - (end_avg * 0.5)}" r="3.5" fill="#0f172a" />
-                                    
-                                    <text x="28" y="73" font-size="7.5" font-weight="bold" fill="#334155" font-family="sans-serif">Opener ({op_avg:.1f}%)</text>
-                                    <text x="90" y="73" font-size="7.5" font-weight="bold" fill="#334155" font-family="sans-serif">Mid ({mid_avg:.1f}%)</text>
-                                    <text x="155" y="73" font-size="7.5" font-weight="bold" fill="#334155" font-family="sans-serif">End ({end_avg:.1f}%)</text>
+                                    {milestone_svg_points}
                                 </svg>
                             </div>
 
