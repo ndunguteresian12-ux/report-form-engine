@@ -7812,15 +7812,35 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                     </tr>
                     """
 
-                # Divided by the full subject count for this level
-                # (len(subjects)), not total_subjects_count (which only
-                # counts subjects that actually had at least one score
-                # entered) — matching the same methodology fix applied to
-                # the merit list, so a student missing marks in one
-                # subject shows a correspondingly lower average here too,
-                # rather than having it quietly computed over fewer
-                # subjects than the level actually has.
-                avg_summary_percentage = total_evaluated_weight / len(subjects) if subjects else 0.0
+                if is_custom_cycle_mode:
+                    # subjects here is already the CLASS-wide filtered
+                    # list (any subject entered for ANYONE in the batch
+                    # under this custom cycle) — not necessarily what
+                    # THIS student individually has. Dividing by that
+                    # class-wide count would still wrongly deflate a
+                    # student's average whenever their own entered set
+                    # is smaller than the class's, exactly the kind of
+                    # blank-penalizing this custom-cycle mode is meant to
+                    # avoid. total_subjects_count is this student's own
+                    # actually-entered count, computed just above in this
+                    # same loop — the correct divisor here.
+                    avg_summary_percentage = total_evaluated_weight / total_subjects_count if total_subjects_count > 0 else 0.0
+                    # So the "Total Marks: X / Y" ratio shown below stays
+                    # mathematically consistent with this same percentage
+                    # — Y here must be this student's own entered-subject
+                    # count, not the class-wide filtered list's length.
+                    total_marks_denominator = total_subjects_count * 100
+                else:
+                    # Divided by the full subject count for this level
+                    # (len(subjects)), not total_subjects_count (which only
+                    # counts subjects that actually had at least one score
+                    # entered) — matching the same methodology fix applied to
+                    # the merit list, so a student missing marks in one
+                    # subject shows a correspondingly lower average here too,
+                    # rather than having it quietly computed over fewer
+                    # subjects than the level actually has.
+                    avg_summary_percentage = total_evaluated_weight / len(subjects) if subjects else 0.0
+                    total_marks_denominator = len(subjects) * 100
                 summary_meta = evaluate_performance_metrics(avg_summary_percentage, bands=grading_bands)
 
                 # Compute baseline averages safely for graph generation
@@ -7935,7 +7955,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                             <div style="border:1px solid {theme['hex']}; background:#f4faf6; padding:16px; border-radius:8px; display:flex; flex-direction:column; justify-content:center; gap:10px; height:140px; box-sizing:border-box;">
                                 <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:13px;">
                                     <span>Total Marks:</span>
-                                    <span style="color:{theme['hex']}; font-weight:800;">{total_evaluated_weight:.0f} / {len(subjects) * 100}</span>
+                                    <span style="color:{theme['hex']}; font-weight:800;">{total_evaluated_weight:.0f} / {total_marks_denominator}</span>
                                 </div>
                                 <div style="display:flex; justify-content:space-between; font-weight:bold; font-size:13px;">
                                     <span>Cumulative Scale Points:</span>
