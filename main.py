@@ -7545,9 +7545,15 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
             # isn't a real trend, just a misleading pair of numbers that
             # happen to both be called "position". Showing "—" is more
             # honest than a comparison that doesn't actually mean anything.
+            # Always computed, even in custom-cycle mode — it's a cheap,
+            # pure calculation (no DB query), and the report's "Previous
+            # (Term X):" label text references prev_term unconditionally
+            # further down regardless of mode. Only the actual lookup
+            # query below it, and therefore previous_positions itself,
+            # stays conditional.
+            prev_term, prev_year = _get_previous_term_year(st['active_term'], st['active_year'])
             previous_positions = {}
             if not is_custom_cycle_mode:
-                prev_term, prev_year = _get_previous_term_year(st['active_term'], st['active_year'])
                 cur.execute("""
                     WITH subject_averages AS (
                         SELECT
