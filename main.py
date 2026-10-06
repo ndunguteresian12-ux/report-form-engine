@@ -4446,38 +4446,60 @@ def superadmin_reset_admin_password_form(school_id: int, request: Request, done:
             cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'admin' ORDER BY id ASC LIMIT 1;", (school_id,))
             admin = cur.fetchone()
 
+    # One banner per outcome. The new password itself is never put in the
+    # URL — the emailed route sends it straight to the admin, and the
+    # "set password now" route renders it once in its own response.
+    banners = {
+        "1": ("emerald", "New password emailed.", "They can log in with it and change it afterward. It was never shown here."),
+        "failed": ("rose", "Couldn't send the email.", "The password was NOT changed — their current one still works. If the inbox is dead, change the email below, or set a password directly."),
+        "email_updated": ("emerald", "Admin email updated.", "They now log in with the new address, and password reset links will go there."),
+        "email_taken": ("rose", "That email is already registered to a different account.", "Nothing was changed."),
+        "email_invalid": ("rose", "That doesn't look like a valid email address.", "Nothing was changed."),
+        "email_same": ("amber", "That is already this admin's email.", "Nothing was changed."),
+        "weak": ("rose", "Password must be at least 8 characters.", "Nothing was changed."),
+    }
     result_html = ""
-    if done == "1" and admin:
-        # The new password itself is never shown here or passed through
-        # the URL — it's emailed straight to the admin's own account, so
-        # the super admin never sees it at all, matching how a real
-        # password reset should work.
+    if done in banners and admin:
+        colour, headline, detail = banners[done]
         result_html = f"""
-        <div class="bg-emerald-50 border border-emerald-200 text-emerald-800 text-sm px-4 py-3 rounded-lg mb-4">
-            <p class="font-bold">New password emailed to {esc(admin['email'])}.</p>
-            <p class="text-xs mt-1">They can log in with it and change it afterward. It was never shown here.</p>
-        </div>
-        """
-    elif done == "failed" and admin:
-        # The email genuinely failed to send — the password was
-        # deliberately left unchanged (see the POST handler), so the
-        # admin's old password still works and this is safe to retry
-        # once the email issue is fixed.
-        result_html = f"""
-        <div class="bg-rose-50 border border-rose-200 text-rose-800 text-sm px-4 py-3 rounded-lg mb-4">
-            <p class="font-bold">Couldn't send the email to {esc(admin['email'])}.</p>
-            <p class="text-xs mt-1">The password was NOT changed — their current one still works. Check your RESEND_API_KEY on Render and try again.</p>
+        <div class="bg-{colour}-50 border border-{colour}-200 text-{colour}-800 text-sm px-4 py-3 rounded-lg mb-4">
+            <p class="font-bold">{esc(headline)}</p>
+            <p class="text-xs mt-1">{esc(detail)}</p>
         </div>
         """
 
     if not admin:
         admin_block = "<p class='text-sm text-rose-600'>No admin account found for this school.</p>"
     else:
+        safe_email = esc(admin['email'])
         admin_block = f"""
-        <p class="text-xs text-slate-500 mb-4">Admin account: <b>{esc(admin['full_name'] or admin['email'])}</b> ({esc(admin['email'])})</p>
-        <form action="/api/v1/superadmin/school/reset-admin-password/{school_id}" method="post" onsubmit="return confirm('Generate a new password for this admin and email it to {esc(admin["email"])}? Their current password will stop working immediately.');">
-            <button type="submit" class="w-full bg-indigo-700 text-white p-3 rounded-lg font-black tracking-wide hover:bg-indigo-800 transition shadow-md">Generate New Password &amp; Email It</button>
-        </form>
+        <p class="text-xs text-slate-500 mb-5">Admin account: <b>{esc(admin['full_name'] or admin['email'])}</b> ({safe_email})</p>
+
+        <div class="border rounded-xl p-4 mb-4">
+            <p class="text-sm font-black text-slate-700">1. Change the admin's email</p>
+            <p class="text-[11px] text-slate-400 mb-3">Use this when the registered email is inactive. Reset links and codes will go to the new address.</p>
+            <form action="/api/v1/superadmin/school/update-admin-email/{school_id}" method="post" onsubmit="return confirm('Change this admin\\'s login email? They will need to log in with the new address.');" class="space-y-2">
+                <input type="email" name="new_email" placeholder="new-email@example.com" class="w-full border p-2.5 rounded-lg text-sm" required>
+                <button type="submit" class="w-full bg-slate-800 text-white p-2.5 rounded-lg font-bold text-sm hover:bg-slate-900 transition">Update Email</button>
+            </form>
+        </div>
+
+        <div class="border rounded-xl p-4 mb-4">
+            <p class="text-sm font-black text-slate-700">2. Set a new password now</p>
+            <p class="text-[11px] text-slate-400 mb-3">No email needed. Leave the box blank to auto-generate one. It is shown once on the next screen, so pass it on securely (in person or by phone call), not in a group chat.</p>
+            <form action="/api/v1/superadmin/school/set-admin-password/{school_id}" method="post" onsubmit="return confirm('Set a new password for this admin? Their current password will stop working immediately.');" class="space-y-2">
+                <input type="text" name="new_password" placeholder="Leave blank to auto-generate (min 8 characters if typed)" class="w-full border p-2.5 rounded-lg text-sm" autocomplete="off">
+                <button type="submit" class="w-full bg-emerald-700 text-white p-2.5 rounded-lg font-bold text-sm hover:bg-emerald-800 transition">Set Password</button>
+            </form>
+        </div>
+
+        <div class="border rounded-xl p-4">
+            <p class="text-sm font-black text-slate-700">3. Email a new password</p>
+            <p class="text-[11px] text-slate-400 mb-3">Only works if {safe_email} can actually receive email.</p>
+            <form action="/api/v1/superadmin/school/reset-admin-password/{school_id}" method="post" onsubmit="return confirm('Generate a new password and email it to this admin? Their current password will stop working immediately.');">
+                <button type="submit" class="w-full bg-indigo-700 text-white p-2.5 rounded-lg font-bold text-sm hover:bg-indigo-800 transition">Generate New Password &amp; Email It</button>
+            </form>
+        </div>
         """
 
     return f"""
@@ -4490,7 +4512,7 @@ def superadmin_reset_admin_password_form(school_id: int, request: Request, done:
     </head>
     <body class="bg-slate-900 flex items-center justify-center min-h-screen font-sans p-6">
         <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-indigo-700">
-            <h2 class="text-xl font-black text-slate-800 mb-1">Reset Admin Password</h2>
+            <h2 class="text-xl font-black text-slate-800 mb-1">Reset Admin Access</h2>
             <p class="text-xs text-slate-400 mb-4">{esc(school['name'])}</p>
             {result_html}
             {admin_block}
@@ -4547,6 +4569,118 @@ def superadmin_reset_admin_password_submit(school_id: int, request: Request):
         url=f"/superadmin/school/reset-admin-password/{school_id}?done={'1' if email_sent else 'failed'}",
         status_code=303
     )
+
+
+@app.post("/api/v1/superadmin/school/update-admin-email/{school_id}")
+def superadmin_update_admin_email(school_id: int, request: Request, new_email: str = Form(...)):
+    """Lets the super admin repoint a school admin's login/reset email
+    when the registered one is dead. Needed because the self-service
+    profile page requires the CURRENT password, which is exactly what a
+    locked-out admin doesn't have."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    base = f"/superadmin/school/reset-admin-password/{school_id}"
+    new_email = new_email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", new_email) or len(new_email) > 254:
+        return RedirectResponse(url=f"{base}?done=email_invalid", status_code=303)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'admin' ORDER BY id ASC LIMIT 1;", (school_id,))
+            admin = cur.fetchone()
+            if not admin:
+                raise HTTPException(status_code=404, detail="No admin account found for this school.")
+
+            old_email = admin['email']
+            if new_email == (old_email or "").lower():
+                return RedirectResponse(url=f"{base}?done=email_same", status_code=303)
+
+            try:
+                cur.execute("UPDATE users SET email = %s WHERE id = %s;", (new_email, admin['id']))
+                # Any reset code already issued went to the old address,
+                # so it must not stay valid.
+                cur.execute("DELETE FROM password_resets WHERE user_id = %s AND used = FALSE;", (admin['id'],))
+                conn.commit()
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                return RedirectResponse(url=f"{base}?done=email_taken", status_code=303)
+
+            log_audit_action(cur, request, school_id, "admin_email_changed_by_superadmin", f"Super admin changed the school admin's email from {old_email} to {new_email}")
+            conn.commit()
+
+    # Best-effort heads-up to the NEW address (the old one is the one
+    # that's unreachable). A failure here must not undo the change.
+    greeting_name = (admin['full_name'] or new_email).split(" ")[0]
+    send_email(
+        new_email,
+        "Your Elimu Hub login email was updated",
+        f"""
+        <p>Hi {esc(greeting_name)},</p>
+        <p>The login email on your Elimu Hub administrator account was changed to this address. Use it to sign in, and use "Forgot your password?" on the login page if you need a reset link.</p>
+        <p>If you weren't expecting this, contact your Elimu Hub administrator right away.</p>
+        """
+    )
+
+    return RedirectResponse(url=f"{base}?done=email_updated", status_code=303)
+
+
+@app.post("/api/v1/superadmin/school/set-admin-password/{school_id}", response_class=HTMLResponse)
+def superadmin_set_admin_password(school_id: int, request: Request, new_password: str = Form("")):
+    """Sets (or auto-generates) a password with no email involved, for
+    admins whose inbox can't receive anything. The plaintext is shown
+    once in this response and never stored, logged, or put in a URL."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    base = f"/superadmin/school/reset-admin-password/{school_id}"
+    new_password = new_password.strip()
+    if new_password and len(new_password) < 8:
+        return RedirectResponse(url=f"{base}?done=weak", status_code=303)
+
+    auto_generated = not new_password
+    if auto_generated:
+        new_password = secrets.token_urlsafe(9)
+    hashed_password = get_password_hash(new_password[:72])
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, email, full_name FROM users WHERE school_id = %s AND role = 'admin' ORDER BY id ASC LIMIT 1;", (school_id,))
+            admin = cur.fetchone()
+            if not admin:
+                raise HTTPException(status_code=404, detail="No admin account found for this school.")
+
+            cur.execute("UPDATE users SET password_hash = %s WHERE id = %s;", (hashed_password, admin['id']))
+            cur.execute("DELETE FROM password_resets WHERE user_id = %s AND used = FALSE;", (admin['id'],))
+            conn.commit()
+
+            # The password itself is deliberately NOT written to the audit log.
+            log_audit_action(cur, request, school_id, "admin_password_set_by_superadmin", f"Super admin set a new password for {admin['email']} ({'auto-generated' if auto_generated else 'chosen by super admin'})")
+            conn.commit()
+
+    page = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
+        <title>Elimu Hub | Password Set</title>
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    </head>
+    <body class="bg-slate-900 flex items-center justify-center min-h-screen font-sans p-6">
+        <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-8 border-emerald-600">
+            <h2 class="text-xl font-black text-slate-800 mb-1">Password set</h2>
+            <p class="text-xs text-slate-500 mb-4">Admin account: <b>{esc(admin['full_name'] or admin['email'])}</b> ({esc(admin['email'])})</p>
+            <p class="text-xs font-bold text-slate-600 mb-1">New password (shown once):</p>
+            <p class="font-mono text-lg font-bold bg-slate-100 border rounded-lg px-4 py-3 mb-4 select-all break-all">{esc(new_password)}</p>
+            <p class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4">Copy it now. This screen won't show it again. Give it to the admin securely and ask them to change it from <b>My Profile</b> after logging in.</p>
+            <a href="{base}" class="block text-center text-xs text-slate-400 hover:text-slate-600 hover:underline">← Back</a>
+        </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(page, headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})
 
 
 @app.get("/admin/system/diagnostics/{school_id}", response_class=HTMLResponse)
