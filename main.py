@@ -1193,6 +1193,18 @@ def bootstrap_database_schema():
             # in ways that vary between a fresh install and a database
             # that's been through several migrations already, and that
             # must never take down the whole app on startup.
+            # Commit everything above (all the CREATE TABLE / ALTER / backfill
+            # work) BEFORE the defensive blocks below. Their `except` calls
+            # conn.rollback(), and on a database where these constraints
+            # already exist the ADD CONSTRAINT fails on EVERY startup — so
+            # without this commit, each rollback silently undid every
+            # table/column created earlier in this same transaction. Any
+            # table added to this function after the constraints first
+            # existed (e.g. school_email_verifications) was therefore
+            # created and then rolled back on every restart, and never
+            # actually existed.
+            conn.commit()
+
             try:
                 cur.execute("ALTER TABLE student_scores DROP CONSTRAINT IF EXISTS student_scores_student_id_learning_area_id_cycle_name_key;")
                 cur.execute("ALTER TABLE student_scores ADD CONSTRAINT student_scores_student_subject_cycle_term_year_key UNIQUE (student_id, learning_area_id, cycle_name, term, year);")
@@ -1264,7 +1276,12 @@ def bootstrap_database_schema():
             cur.execute("""
                 DELETE FROM learning_areas
                 WHERE education_level = 'Lower Primary'
-                AND name NOT IN ('MATHEMATICS', 'ENGLISH', 'LUGHA', 'INTEGRATED SCIENCE');
+                AND name NOT IN ('MATHEMATICS', 'ENGLISH', 'LUGHA', 'INTEGRATED SCIENCE')
+                -- Safety: only remove legacy subjects that have NO marks
+                -- recorded against them, so this cleanup can never cascade
+                -- into deleting a live school's scores.
+                AND NOT EXISTS (SELECT 1 FROM student_scores ss WHERE ss.learning_area_id = learning_areas.id)
+                AND NOT EXISTS (SELECT 1 FROM paper_based_scores pbs WHERE pbs.learning_area_id = learning_areas.id);
             """)
 
             # Indexes on columns hit by frequent WHERE/JOIN clauses. Several
@@ -1295,6 +1312,10 @@ def bootstrap_database_schema():
             # story; wrapped here the same way every other live-schema
             # migration in this app is, so a problem on one specific
             # school's data can never crash startup for every school.
+            # Same reason as above: persist the seed data, indexes and cleanup
+            # before this block's rollback-on-failure can touch them.
+            conn.commit()
+
             try:
                 _fix_foreign_key_on_delete(cur, "student_scores", "entered_by_user_id", "users", "SET NULL")
                 conn.commit()
