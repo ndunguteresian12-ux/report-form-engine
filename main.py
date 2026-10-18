@@ -990,6 +990,13 @@ def bootstrap_database_schema():
                     is_active BOOLEAN DEFAULT TRUE,
                     created_at TIMESTAMP DEFAULT NOW()
                 );
+                -- Portal notifications: who sees a notice, for which school,
+                -- who sent it, and when it expires. DEFAULT 'admins' keeps
+                -- every existing announcement behaving exactly as before.
+                ALTER TABLE platform_announcements ADD COLUMN IF NOT EXISTS audience VARCHAR(10) NOT NULL DEFAULT 'admins';
+                ALTER TABLE platform_announcements ADD COLUMN IF NOT EXISTS school_id INTEGER REFERENCES schools(id) ON DELETE CASCADE;
+                ALTER TABLE platform_announcements ADD COLUMN IF NOT EXISTS source VARCHAR(12) NOT NULL DEFAULT 'superadmin';
+                ALTER TABLE platform_announcements ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;
 
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id SERIAL PRIMARY KEY,
@@ -1402,6 +1409,104 @@ bootstrap_senior_school_schema()
 app.include_router(senior_school_router)
 
 # --- Core Business & CBE Analytics Helper Logic ---
+# ============================================================
+# Portal notifications — banners shown on the ADMIN and STAFF dashboards.
+# One table (platform_announcements) serves two senders:
+#   * the super admin, from the Super Admin portal (manual), and
+#   * the system itself, via post_system_notification() (automatic).
+# Each notice can target everyone / admins only / staff only, either
+# platform-wide or one school, and may expire on its own.
+# ============================================================
+
+NOTICE_AUDIENCES = ("all", "admins", "staff")
+
+def notice_audience_label(a) -> str:
+    return {"all": "Admins + staff", "admins": "Admins", "staff": "Staff"}.get((a.get("audience") if hasattr(a, "get") else None) or "admins", "Admins")
+
+
+def get_active_notifications(cur, school_id: int, portal: str):
+    """Live notices for one school's 'admins' or 'staff' portal. Fails
+    SAFE: if the new columns aren't there yet (a migration that hasn't
+    run), the admin portal falls back to the original behaviour and the
+    staff portal simply shows nothing — a notice problem must never
+    break a live dashboard."""
+    portal = "staff" if portal == "staff" else "admins"
+    try:
+        cur.execute("SAVEPOINT notices_read;")
+        cur.execute("""
+            SELECT message, source FROM platform_announcements
+            WHERE is_active = TRUE
+              AND (expires_at IS NULL OR expires_at > NOW())
+              AND (school_id IS NULL OR school_id = %s)
+              AND audience IN ('all', %s)
+            ORDER BY created_at DESC LIMIT 5;
+        """, (school_id, portal))
+        rows = cur.fetchall()
+        cur.execute("RELEASE SAVEPOINT notices_read;")
+        return rows
+    except Exception as e:
+        logger.warning(f"Notifications query failed, using fallback (non-fatal): {e}")
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT notices_read;")
+        except Exception:
+            pass
+        if portal != "admins":
+            return []
+        try:
+            cur.execute("SELECT message FROM platform_announcements WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 3;")
+            return cur.fetchall()
+        except Exception:
+            return []
+
+
+def render_notification_banners(notices) -> str:
+    if not notices:
+        return ""
+    parts = []
+    for n in notices:
+        is_system = False
+        try:
+            is_system = (n["source"] == "system")
+        except (KeyError, TypeError, IndexError):
+            pass
+        if is_system:
+            parts.append(f"""<div class="bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl px-5 py-3 flex items-center gap-3 shadow-xs">
+                <span class="text-lg">🔔</span>
+                <p class="text-sm font-semibold">{esc(n['message'])}</p>
+            </div>""")
+        else:
+            parts.append(f"""<div class="bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-2xl px-5 py-3 flex items-center gap-3 shadow-xs">
+                <span class="text-lg">📣</span>
+                <p class="text-sm font-semibold">{esc(n['message'])}</p>
+            </div>""")
+    return '<div class="space-y-3 mb-6">' + "".join(parts) + "</div>"
+
+
+def post_system_notification(cur, message: str, audience: str = "admins", school_id=None, expires_in_days: int = 14):
+    """Lets the SYSTEM post a notice to the admin and/or staff portals
+    (e.g. after a security-relevant change). Same transaction as the caller
+    — it commits or rolls back with it — and it never raises: a failed
+    notice must not block the action that triggered it."""
+    if audience not in NOTICE_AUDIENCES:
+        return False
+    try:
+        cur.execute("SAVEPOINT system_notice;")
+        cur.execute(
+            "INSERT INTO platform_announcements (message, is_active, audience, school_id, source, expires_at) "
+            "VALUES (%s, TRUE, %s, %s, 'system', NOW() + (%s || ' days')::INTERVAL);",
+            (message[:300], audience, school_id, str(int(expires_in_days)))
+        )
+        cur.execute("RELEASE SAVEPOINT system_notice;")
+        return True
+    except Exception as e:
+        logger.warning(f"System notification failed (non-fatal): {e}")
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT system_notice;")
+        except Exception:
+            pass
+        return False
+
+
 def log_audit_action(cur, request: Request, school_id: int, action: str, details: str = ""):
     """Records an entry in the audit log, using the same cursor/transaction
     as the action it's logging, so they commit together. Never raises — a
@@ -2662,8 +2767,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
             cur.execute("SELECT COUNT(*) AS cnt FROM timetable_periods WHERE school_id = %s;", (school_id,))
             has_timetable_periods = cur.fetchone()['cnt'] > 0
 
-            cur.execute("SELECT message FROM platform_announcements WHERE is_active = TRUE ORDER BY created_at DESC LIMIT 3;")
-            active_announcements = cur.fetchall()
+            active_announcements = get_active_notifications(cur, school_id, 'admins')
 
             # Performance trend, broken down by EDUCATION LEVEL rather
             # than one flat school-wide number — one line per level
@@ -2739,13 +2843,7 @@ def administrative_dashboard(school_id: int, request: Request, logo_storage: str
         </div>
         """
 
-    announcement_banners_html = "".join(
-        f"""<div class="bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-2xl px-5 py-3 flex items-center gap-3 shadow-xs">
-            <span class="text-lg">📣</span>
-            <p class="text-sm font-semibold">{esc(a['message'])}</p>
-        </div>"""
-        for a in active_announcements
-    )
+    announcement_banners_html = render_notification_banners(active_announcements)
 
     CYCLE_ORDER_DASH = ["Opener", "Midterm", "End Term"]
     level_trend_series = {}  # education_level -> {cycle_name: avg_score}
@@ -3562,6 +3660,7 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
             cur.execute("SELECT * FROM platform_announcements ORDER BY created_at DESC LIMIT 20;")
             announcements = cur.fetchall()
 
+    notice_school_options_html = "".join(f'<option value="{sc["id"]}">{esc(sc["name"])}</option>' for sc in schools)
     total_schools = len(schools)
     pending_count = len([s for s in schools if s['status'] == 'pending'])
     active_count = len([s for s in schools if s['status'] == 'active'])
@@ -3711,18 +3810,36 @@ def superadmin_dashboard(request: Request, backup_started: str = None, backup_er
             </div>
 
             <div class="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-6 mt-6">
-                <h2 class="text-sm font-bold text-slate-800 mb-1">📣 Platform Announcements</h2>
-                <p class="text-xs text-slate-400 mb-4">Active announcements show as a banner on every school admin's dashboard.</p>
-                <form action="/api/v1/superadmin/announcements/add" method="post" class="flex gap-2 mb-4">
-                    <input type="text" name="message" placeholder="e.g. Finance module coming soon!" class="flex-1 border p-2.5 rounded-xl text-sm" required maxlength="300">
-                    <button type="submit" class="bg-indigo-800 hover:bg-indigo-900 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">+ Post</button>
+                <h2 class="text-sm font-bold text-slate-800 mb-1">📣 Portal Notifications</h2>
+                <p class="text-xs text-slate-400 mb-4">Post a banner to the admin portals, the staff portals, or both — across every school or just one. The system also posts its own notices (shown in amber) after security-relevant changes.</p>
+                <form action="/api/v1/superadmin/announcements/add" method="post" class="space-y-2 mb-4">
+                    <input type="text" id="notice-message" name="message" placeholder="e.g. Finance module coming soon!" class="w-full border p-2.5 rounded-xl text-sm" required maxlength="300">
+                    <div class="flex gap-2 flex-wrap items-center">
+                        <select name="audience" class="border p-2.5 rounded-xl text-sm bg-white">
+                            <option value="all">Admins + staff</option>
+                            <option value="admins">Admins only</option>
+                            <option value="staff">Staff only</option>
+                        </select>
+                        <select name="school_id" class="border p-2.5 rounded-xl text-sm bg-white max-w-[16rem]">
+                            <option value="">All schools</option>
+                            {notice_school_options_html}
+                        </select>
+                        <select name="expires_in_days" class="border p-2.5 rounded-xl text-sm bg-white">
+                            <option value="">Until I hide it</option>
+                            <option value="3">Expires in 3 days</option>
+                            <option value="7">Expires in 7 days</option>
+                            <option value="30">Expires in 30 days</option>
+                        </select>
+                        <button type="submit" class="bg-indigo-800 hover:bg-indigo-900 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">+ Post</button>
+                    </div>
+                    <button type="button" onclick="document.getElementById('notice-message').value='Please check that the email on your Elimu Hub account is correct and active — it is used to recover your password. Update it under 👤 My Profile.'" class="text-[11px] font-bold text-indigo-700 hover:underline">Use template: “update your email”</button>
                 </form>
                 <div class="space-y-2">
                     {"".join(f'''
                     <div class="flex items-center justify-between gap-3 p-3 rounded-xl border {'border-emerald-200 bg-emerald-50/50' if a['is_active'] else 'border-slate-100 bg-slate-50'}">
                         <div class="min-w-0">
                             <p class="text-sm {'text-slate-800 font-semibold' if a['is_active'] else 'text-slate-400 line-through'}">{esc(a['message'])}</p>
-                            <p class="text-[11px] text-slate-400 mt-0.5">{a['created_at'].strftime('%d %b %Y, %H:%M') if a['created_at'] else ''} {'· Live' if a['is_active'] else '· Hidden'}</p>
+                            <p class="text-[11px] text-slate-400 mt-0.5">{a['created_at'].strftime('%d %b %Y, %H:%M') if a['created_at'] else ''} {'· Live' if a['is_active'] else '· Hidden'} · {notice_audience_label(a)} · {'This school only' if a.get('school_id') else 'All schools'}{' · 🔔 System' if a.get('source') == 'system' else ''}{(' · Expires ' + a['expires_at'].strftime('%d %b')) if a.get('expires_at') else ''}</p>
                         </div>
                         <div class="flex items-center gap-2 shrink-0">
                             <form action="/api/v1/superadmin/announcements/toggle/{a['id']}" method="post">
@@ -3978,16 +4095,30 @@ def superadmin_delete_school(school_id: int, request: Request):
 
 
 @app.post("/api/v1/superadmin/announcements/add")
-def add_platform_announcement(request: Request, message: str = Form(...)):
+def add_platform_announcement(request: Request, message: str = Form(...), audience: str = Form("all"), school_id: str = Form(""), expires_in_days: str = Form("")):
     auth_error = require_superadmin_session(request)
     if auth_error:
         return auth_error
     message = message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Announcement message cannot be empty.")
+    if audience not in NOTICE_AUDIENCES:
+        raise HTTPException(status_code=400, detail="Choose who should see this notification.")
+    target_school = int(school_id) if school_id.strip().isdigit() else None
+    days = int(expires_in_days) if expires_in_days.strip().isdigit() and 0 < int(expires_in_days) <= 365 else None
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO platform_announcements (message, is_active) VALUES (%s, TRUE);", (message,))
+            try:
+                cur.execute(
+                    "INSERT INTO platform_announcements (message, is_active, audience, school_id, source, expires_at) "
+                    "VALUES (%s, TRUE, %s, %s, 'superadmin', CASE WHEN %s::int IS NULL THEN NULL ELSE NOW() + (%s::int || ' days')::INTERVAL END);",
+                    (message, audience, target_school, days, days)
+                )
+            except Exception as e:
+                # Columns not migrated yet: post the original admin-only banner instead of failing.
+                logger.warning(f"Targeted notification insert failed, using legacy insert: {e}")
+                conn.rollback()
+                cur.execute("INSERT INTO platform_announcements (message, is_active) VALUES (%s, TRUE);", (message,))
             conn.commit()
     return RedirectResponse(url="/superadmin/dashboard", status_code=303)
 
@@ -4629,6 +4760,7 @@ def superadmin_update_admin_email(school_id: int, request: Request, new_email: s
                 return RedirectResponse(url=f"{base}?done=email_taken", status_code=303)
 
             log_audit_action(cur, request, school_id, "admin_email_changed_by_superadmin", f"Super admin changed the school admin's email from {old_email} to {new_email}")
+            post_system_notification(cur, "The login email on this school's administrator account was changed by the platform administrator. If you did not expect this, please contact support.", "admins", school_id, 14)
             conn.commit()
 
     # Best-effort heads-up to the NEW address (the old one is the one
@@ -4679,6 +4811,7 @@ def superadmin_set_admin_password(school_id: int, request: Request, new_password
 
             # The password itself is deliberately NOT written to the audit log.
             log_audit_action(cur, request, school_id, "admin_password_set_by_superadmin", f"Super admin set a new password for {admin['email']} ({'auto-generated' if auto_generated else 'chosen by super admin'})")
+            post_system_notification(cur, "The platform administrator set a new password on this school's administrator account. If you were given a temporary password, please change it now under 👤 My Profile.", "admins", school_id, 14)
             conn.commit()
 
     page = f"""
@@ -4769,6 +4902,8 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
 
             cur.execute("SELECT * FROM school_settings WHERE school_id = %s;", (school_id,))
             settings = cur.fetchone()
+
+            staff_notifications = get_active_notifications(cur, school_id, 'staff')
 
             viewer = get_current_session_user(request)
             is_restricted_staff = bool(viewer and viewer.get('role') == 'staff')
@@ -5061,6 +5196,7 @@ def staff_dashboard(school_id: int, request: Request, user_id: int = None, stude
         {toast_trigger("Student registered successfully!") if student_added else ""}
 
         <div class="p-8 max-w-6xl mx-auto w-full flex-1">
+            {render_notification_banners(staff_notifications)}
             {dashboard_deadline_html}
             <div class="flex items-center justify-between mb-4">
                 <h2 class="text-xs font-bold uppercase tracking-wider text-slate-400">🏫 Your Classroom Cohorts</h2>
@@ -5937,7 +6073,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             <tr>
                 <td style='text-align:center;'>{i}</td>
                 <td style='font-family:monospace;'>{esc(s['admission_number'])}</td>
-                <td>{esc(full_student_name(s))}</td>
+                <td class="ml-name">{esc(full_student_name(s))}</td>
                 <td style='text-align:center;'>{esc(s['stream'])}</td>
                 <td style='text-align:center;font-weight:bold;'>{stream_positions.get(s['id'], '-')}</td>
                 <td style='text-align:center;font-weight:bold;'>{overall_positions.get(s['id'], '-')}</td>
@@ -5973,8 +6109,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
             <div>
-                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:13px;font-weight:bold;">REPORT: STUDENTS' PERFORMANCE MERIT LIST{scope_label}{' — COMBINED TERM (OPENER + MID-TERM + END TERM)' if combined else ''}</p>
+                <h1 style="margin:0;font-size:calc(var(--ml-fs) + 7px);">{esc(school['name'])}</h1>
+                <p style="margin:2px 0 0;font-size:calc(var(--ml-fs) + 2px);font-weight:bold;">REPORT: STUDENTS' PERFORMANCE MERIT LIST{scope_label}{' — COMBINED TERM (OPENER + MID-TERM + END TERM)' if combined else ''}</p>
             </div>
         </div>
         <table class="header-fields" style="margin-top:8px;">
@@ -6005,7 +6141,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             <tbody>{rows_html or f"<tr><td colspan='{15 + total_subjects}' style='padding:20px;text-align:center;color:#94a3b8;'>No students found for this grade.</td></tr>"}</tbody>
         </table>
 
-        <div style="margin-top:24px; font-weight:bold; font-size:13px;">CLASS AVERAGE MARKS: {class_average_marks:.1f}</div>
+        <div style="margin-top:24px; font-weight:bold; font-size:calc(var(--ml-fs) + 1px);">CLASS AVERAGE MARKS: {class_average_marks:.1f}</div>
         <table style="margin-top:6px;">
             <thead><tr><th>Subject</th>{footer_subject_cells}</tr></thead>
             <tbody>
@@ -6014,7 +6150,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             </tbody>
         </table>
 
-        <p style="margin-top:16px; font-size:10px; color:#64748b;">
+        <p style="margin-top:16px; font-size:calc(var(--ml-fs) - 2px); color:#64748b;">
             — Student position is assigned using Total Marks.<br>
             — Student performance level is calculated using the student's average points.<br>
             — "Prv Str Pos" / "Prv Ovr Pos" (previous exam positions) are not yet tracked by this system and are shown blank.
@@ -6029,13 +6165,25 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Merit List — {esc(grade_name)}</title>
         <style>
-            @page {{ size: landscape; margin: 10mm; }}
-            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; font-size: 11px; }}
-            @media print {{ .no-print {{ display: none !important; }} }}
+            @page {{ size: A4 landscape; margin: 8mm; }}
+            :root {{ --ml-fs: 13px; }}
+            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; font-size: var(--ml-fs); }}
+            @media print {{
+                .no-print {{ display: none !important; }}
+                body {{ padding: 0; }}
+                table {{ width: 100%; }}
+                th, td.ml-name {{ white-space: normal; }}
+                thead {{ display: table-header-group; }}
+                tr {{ page-break-inside: avoid; }}
+            }}
+            /* Same wrapping rules, applied by the script while it measures the
+               table for printing (print media rules are not active on screen). */
+            html.ml-fit body {{ padding: 0; }}
+            html.ml-fit th, html.ml-fit td.ml-name {{ white-space: normal; }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
-            th, td {{ padding: 4px 6px; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }}
-            th {{ text-align:left; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:9px; text-transform:uppercase; color:#64748b; }}
-            .header-fields td {{ border: none; padding: 2px 10px 2px 0; font-size: 11px; }}
+            th, td {{ padding: .4em .55em; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }}
+            th {{ text-align:left; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:calc(var(--ml-fs) - 2px); text-transform:uppercase; color:#64748b; }}
+            .header-fields td {{ border: none; padding: 2px 10px 2px 0; font-size: var(--ml-fs); }}
         </style>
         {extra_style_html}
     </head>
@@ -6043,9 +6191,69 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
             <a href="/admin/reports/merit-list/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}{'&combined=1' if not combined else ''}{'&stream=' + urllib.parse.quote(stream) if stream else ''}" style="background:#0d9488;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">{'📄 Switch to Single Cycle (' + str(st['active_cycle']) + ')' if combined else '📊 Switch to Combined Term (Opener + Mid + End)'}</a>
             {f'<a href="/admin/reports/merit-list/{school_id}?grade_name=' + urllib.parse.quote(grade_name) + '&education_level=' + urllib.parse.quote(education_level) + ('&combined=1' if combined else '') + '" style="background:#7c3aed;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">🏫 Switch to Whole Grade (All Streams)</a>' if is_single_stream_view else ''}
+            <span style="display:inline-flex;align-items:center;gap:4px;margin-right:8px;">
+                <button type="button" onclick="mlFont(-1)" title="Smaller text" style="background:#e2e8f0;border:0;border-radius:8px;padding:6px 10px;font-weight:bold;cursor:pointer;">A&minus;</button>
+                <button type="button" onclick="mlFont(1)" title="Larger text" style="background:#e2e8f0;border:0;border-radius:8px;padding:6px 10px;font-weight:bold;cursor:pointer;">A+</button>
+            </span>
             {toolbar_button}
         </div>
         {content_html}
+        <script>
+            // Merit list text size + automatic fit-to-page for printing.
+            (function () {{
+                var KEY = 'merit_list_font_px';
+                var DEFAULT_PX = 13, MIN_PRINT_PX = 6;
+                // A4 landscape 297mm wide minus 2 x 8mm margins = 281mm = ~1062 CSS px.
+                // A few px are kept spare so the last column never touches the edge.
+                var PRINT_WIDTH_PX = 1050;
+                var root = document.documentElement;
+
+                function apply(px) {{ root.style.setProperty('--ml-fs', px + 'px'); }}
+                function current() {{ return parseFloat(getComputedStyle(root).getPropertyValue('--ml-fs')) || DEFAULT_PX; }}
+
+                var saved = DEFAULT_PX;
+                try {{ var v = parseFloat(localStorage.getItem(KEY)); if (v >= 9 && v <= 22) saved = v; }} catch (e) {{}}
+                apply(saved);
+
+                window.mlFont = function (delta) {{
+                    var next = Math.max(9, Math.min(22, current() + delta));
+                    apply(next);
+                    saved = next;
+                    try {{ localStorage.setItem(KEY, String(next)); }} catch (e) {{}}
+                }};
+
+                // Narrowest width every table can be squeezed to at the current font size.
+                function widestMinWidth() {{
+                    var widest = 0;
+                    var tables = document.querySelectorAll('table');
+                    for (var i = 0; i < tables.length; i++) {{
+                        var t = tables[i], old = t.style.width;
+                        t.style.width = '1px';            // a table cannot go below its minimum content width
+                        widest = Math.max(widest, t.offsetWidth);
+                        t.style.width = old;
+                    }}
+                    return widest;
+                }}
+
+                function fitForPrint() {{
+                    root.classList.add('ml-fit');
+                    var fs = saved;
+                    apply(fs);
+                    var guard = 0;
+                    while (widestMinWidth() > PRINT_WIDTH_PX && fs > MIN_PRINT_PX && guard++ < 60) {{
+                        fs -= 0.25;
+                        apply(fs);
+                    }}
+                }}
+                function restoreAfterPrint() {{
+                    root.classList.remove('ml-fit');
+                    apply(saved);
+                }}
+
+                window.addEventListener('beforeprint', fitForPrint);
+                window.addEventListener('afterprint', restoreAfterPrint);
+            }})();
+        </script>
     </body>
     </html>
     """
