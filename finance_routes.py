@@ -27,7 +27,7 @@ import logging
 import urllib.parse
 from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException, Form, File, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, JSONResponse
 
 logger = logging.getLogger("cbe_engine")
 
@@ -40,6 +40,7 @@ from shared import (
     get_dashboard_url,
     full_student_name,
     get_current_session_user,
+    verify_password,
 )
 
 router = APIRouter()
@@ -449,11 +450,11 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
     if not FINANCE_MODULE_ENABLED:
         return _coming_soon_page(school_id, request)
 
-    # Only the fees TOTALS (Expected/Collected/Outstanding summary cards)
-    # move exclusively to the separate Admin Pro dashboard — everything
-    # else on this page, including Expenditure and Net Balance, stays
-    # exactly as it was for a regular admin. The admin role itself is
-    # otherwise completely unchanged.
+    # The fees TOTALS (Expected/Collected/Outstanding) are no longer
+    # simply absent for a regular admin: they sit behind a Show button,
+    # are never part of the page HTML, and a regular admin must enter the
+    # school's Admin Pro password to reveal them (see reveal_fee_totals).
+    # Everything else on this page, including Expenditure, is unchanged.
     show_fees_totals = False
 
     with get_db_connection() as conn:
@@ -534,6 +535,9 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
         </tr>
         """
 
+    viewer = get_current_session_user(request)
+    fee_totals_card_html = _fee_totals_card_html(school_id, term, year, viewer.get('role') if viewer else None)
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -554,9 +558,7 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
         </header>
 
         <div class="p-4 sm:p-8 max-w-5xl mx-auto space-y-6">
-            <div class="bg-slate-50 rounded-2xl border border-dashed border-slate-200 p-4 text-center">
-                <p class="text-xs text-slate-400">🔒 Fees totals (Expected / Collected / Outstanding) have moved to the separate Admin Pro dashboard.</p>
-            </div>
+            {fee_totals_card_html}
 
             <div class="grid grid-cols-1 sm:grid-cols-1 gap-4">
                 <a href="/finance/expenditures/{school_id}?term={urllib.parse.quote(term)}&year={year}" class="bg-white rounded-2xl border shadow-xs p-5 border-l-4 hover:shadow-md transition block max-w-xs" style="border-left-color:#e11d48;">
@@ -586,6 +588,302 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
     </body>
     </html>
     """
+
+
+# ============================================================
+# Fees totals (Expected / Collected / Outstanding) on the admin finance
+# dashboard — hidden until the admin clicks Show.
+#
+#   - A regular admin must enter the school's ADMIN PRO password to
+#     reveal them (checked on the server, with a failed-attempt limit).
+#   - An Admin Pro (Head of Institution) clicks Show with no password.
+#   - Any other role (e.g. staff) can never reveal them.
+#   - The figures are NOT in the page when it loads — they are fetched
+#     from the server only when Show succeeds, and the page re-hides
+#     them on Hide, after 60 seconds, and when navigating back to it.
+# ============================================================
+
+FEE_TOTALS_MAX_FAILED_ATTEMPTS = 5
+FEE_TOTALS_LOCK_WINDOW_MINUTES = 15
+
+_FEE_TOTALS_CARD_TEMPLATE = """
+<div id="fee-totals-card" class="bg-white rounded-2xl border shadow-xs p-5" data-school-id="__SCHOOL_ID__" data-term="__TERM__" data-year="__YEAR__" data-needs-password="__NEEDS_PW__">
+    <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
+        <div>
+            <h2 class="text-sm font-bold text-slate-800">Fees Totals — __TERM__ __YEAR__</h2>
+            <p class="text-[11px] text-slate-400">Hidden by default. __HINT__</p>
+        </div>
+        <button type="button" id="fee-totals-toggle" class="bg-indigo-700 hover:bg-indigo-800 text-white px-4 py-2 rounded-xl text-xs font-bold transition">👁 Show totals</button>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div class="rounded-xl border border-slate-100 bg-slate-50/60 p-3">
+            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Expected</p>
+            <p id="fee-expected" class="text-lg font-black text-slate-800 mt-1">KSh ••••••</p>
+        </div>
+        <div class="rounded-xl border border-slate-100 bg-slate-50/60 p-3">
+            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Collected</p>
+            <p id="fee-collected" class="text-lg font-black text-emerald-700 mt-1">KSh ••••••</p>
+        </div>
+        <div class="rounded-xl border border-slate-100 bg-slate-50/60 p-3">
+            <p class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Outstanding</p>
+            <p id="fee-outstanding" class="text-lg font-black text-rose-700 mt-1">KSh ••••••</p>
+        </div>
+    </div>
+    <form id="fee-totals-pw" class="hidden mt-4 border border-amber-200 bg-amber-50/60 rounded-xl p-3" autocomplete="off">
+        <label for="fee-totals-pw-input" class="block text-xs font-bold text-amber-800 mb-1">🔑 Admin Pro password</label>
+        <p class="text-[11px] text-amber-700 mb-2">Ask your school's Head of Institution (Admin Pro) to enter their password to unlock these totals.</p>
+        <div class="flex gap-2 flex-wrap">
+            <input id="fee-totals-pw-input" type="password" autocomplete="off" class="border rounded-lg px-3 py-2 text-sm flex-1 min-w-[12rem]" placeholder="Admin Pro password">
+            <button type="submit" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-lg text-xs font-bold">Unlock</button>
+            <button type="button" id="fee-totals-cancel" class="bg-white border border-slate-200 text-slate-600 px-4 py-2 rounded-lg text-xs font-bold">Cancel</button>
+        </div>
+    </form>
+    <p id="fee-totals-msg" class="text-xs mt-3 hidden"></p>
+</div>
+<script>
+(function () {
+    var card = document.getElementById('fee-totals-card');
+    if (!card) return;
+    var btn = document.getElementById('fee-totals-toggle');
+    var form = document.getElementById('fee-totals-pw');
+    var input = document.getElementById('fee-totals-pw-input');
+    var cancel = document.getElementById('fee-totals-cancel');
+    var msg = document.getElementById('fee-totals-msg');
+    var cells = {
+        expected: document.getElementById('fee-expected'),
+        collected: document.getElementById('fee-collected'),
+        outstanding: document.getElementById('fee-outstanding')
+    };
+    var MASK = 'KSh ••••••';
+    var revealed = false, timer = null;
+
+    function setMsg(text, isError) {
+        if (!text) { msg.className = 'text-xs mt-3 hidden'; msg.textContent = ''; return; }
+        msg.className = 'text-xs mt-3 ' + (isError ? 'text-rose-700 font-bold' : 'text-slate-500');
+        msg.textContent = text;
+    }
+    function maskAll() {
+        cells.expected.textContent = MASK;
+        cells.collected.textContent = MASK;
+        cells.outstanding.textContent = MASK;
+        revealed = false;
+        btn.textContent = '👁 Show totals';
+        btn.disabled = false;
+        if (timer) { clearTimeout(timer); timer = null; }
+    }
+    function request(password) {
+        var fd = new FormData();
+        fd.append('term', card.dataset.term);
+        fd.append('year', card.dataset.year);
+        if (password) fd.append('admin_pro_password', password);
+        return fetch('/api/v1/finance/totals/' + card.dataset.schoolId, {
+            method: 'POST', body: fd, credentials: 'same-origin', cache: 'no-store'
+        }).then(function (r) {
+            return r.json().catch(function () { return { ok: false, error: 'Unexpected response. Please try again.' }; });
+        }).catch(function () {
+            return { ok: false, error: 'Could not reach the server. Check your connection and try again.' };
+        });
+    }
+    function reveal(password) {
+        btn.disabled = true;
+        setMsg('Checking…', false);
+        request(password).then(function (data) {
+            btn.disabled = false;
+            input.value = '';
+            if (data && data.ok) {
+                cells.expected.textContent = data.expected;
+                cells.collected.textContent = data.collected;
+                cells.outstanding.textContent = data.outstanding;
+                revealed = true;
+                btn.textContent = '🙈 Hide totals';
+                form.classList.add('hidden');
+                setMsg('', false);
+                timer = setTimeout(maskAll, 60000);   // auto-hide after 1 minute
+            } else {
+                setMsg((data && data.error) || 'Could not load the totals.', true);
+            }
+        });
+    }
+    btn.addEventListener('click', function () {
+        if (revealed) { maskAll(); setMsg('', false); return; }
+        if (card.dataset.needsPassword === '1') {
+            form.classList.remove('hidden');
+            input.focus();
+        } else {
+            reveal('');
+        }
+    });
+    form.addEventListener('submit', function (e) { e.preventDefault(); reveal(input.value); });
+    cancel.addEventListener('click', function () { form.classList.add('hidden'); input.value = ''; setMsg('', false); });
+    // Coming back to this page with the Back button must not show old figures.
+    window.addEventListener('pageshow', function (e) { if (e.persisted) { maskAll(); input.value = ''; } });
+})();
+</script>
+"""
+
+
+def _fee_totals_card_html(school_id: int, term: str, year, viewer_role) -> str:
+    """The Show/Hide totals card, or a short lock note for roles that may never see totals."""
+    if viewer_role not in ("admin", "admin_pro", "superadmin"):
+        return ('<div class="bg-slate-50 rounded-2xl border border-dashed border-slate-200 p-4 text-center">'
+                '<p class="text-xs text-slate-400">🔒 Fees totals are available to school administrators only.</p></div>')
+    needs_pw = viewer_role == "admin"
+    hint = ("Enter the Admin Pro password to view them." if needs_pw
+            else "They are fetched fresh each time you click Show.")
+    return (_FEE_TOTALS_CARD_TEMPLATE
+            .replace("__SCHOOL_ID__", str(int(school_id)))
+            .replace("__TERM__", esc(str(term)))
+            .replace("__YEAR__", esc(str(year)))
+            .replace("__NEEDS_PW__", "1" if needs_pw else "0")
+            .replace("__HINT__", hint))
+
+
+def _compute_fee_totals(cur, school_id: int, term: str, year: int):
+    """School-wide (expected, paid) for a term — the SAME calculation the
+    Admin Pro dashboard uses, so the Head and an unlocked admin always see
+    identical figures: per-student fee x students in each class, plus
+    opening balances, against payments by currently enrolled students."""
+    cur.execute("""
+        SELECT c.grade_name, s.stream, COUNT(*) AS student_count
+        FROM students s JOIN classes c ON s.class_id = c.id
+        WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED')
+        GROUP BY c.grade_name, s.stream;
+    """, (school_id,))
+    class_counts = cur.fetchall()
+
+    cur.execute("""
+        SELECT c.grade_name, s.stream, COALESCE(SUM(fp.amount), 0) AS paid
+        FROM fee_payments fp JOIN students s ON fp.student_id = s.id JOIN classes c ON s.class_id = c.id
+        WHERE s.school_id = %s AND fp.term = %s AND fp.year = %s
+        GROUP BY c.grade_name, s.stream;
+    """, (school_id, term, year))
+    paid_by_class = {(r['grade_name'], r['stream']): float(r['paid']) for r in cur.fetchall()}
+
+    cur.execute("""
+        SELECT c.grade_name, s.stream, COALESCE(SUM(fob.amount), 0) AS opening
+        FROM fee_opening_balances fob JOIN students s ON fob.student_id = s.id JOIN classes c ON s.class_id = c.id
+        WHERE s.school_id = %s AND fob.term = %s AND fob.year = %s
+        GROUP BY c.grade_name, s.stream;
+    """, (school_id, term, year))
+    opening_by_class = {(r['grade_name'], r['stream']): float(r['opening']) for r in cur.fetchall()}
+
+    cur.execute("""
+        SELECT grade_name, COALESCE(SUM(amount), 0) AS per_student
+        FROM fee_structures WHERE school_id = %s AND term = %s AND year = %s
+        GROUP BY grade_name;
+    """, (school_id, term, year))
+    per_student_expected = {r['grade_name']: float(r['per_student']) for r in cur.fetchall()}
+
+    expected_total, paid_total = 0.0, 0.0
+    for row in class_counts:
+        key = (row['grade_name'], row['stream'])
+        expected_total += per_student_expected.get(row['grade_name'], 0) * row['student_count'] + opening_by_class.get(key, 0)
+        paid_total += paid_by_class.get(key, 0)
+    return expected_total, paid_total
+
+
+def _audit_fee_totals(conn, cur, school_id: int, viewer, action: str, details: str):
+    """Best-effort audit-log entry. Never raises and never blocks the
+    request: a logging problem must not stop the totals from working."""
+    try:
+        uid = viewer.get('id') if viewer else None
+        role = (viewer.get('role') if viewer else None) or 'unknown'
+        cur.execute(
+            "INSERT INTO audit_log (school_id, user_id, actor_label, action, details) VALUES (%s, %s, %s, %s, %s);",
+            (school_id, uid, f"{role} #{uid}", action, details)
+        )
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning(f"Fee-totals audit entry failed (non-fatal): {e}")
+
+
+@router.post("/api/v1/finance/totals/{school_id}")
+def reveal_fee_totals(school_id: int, request: Request, term: str = Form(...), year: int = Form(...), admin_pro_password: str = Form("")):
+    def _json(payload: dict, status: int = 200):
+        return JSONResponse(payload, status_code=status, headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})
+
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return _json({"ok": False, "error": "Your session has expired. Please log in again."}, 401)
+    if not FINANCE_MODULE_ENABLED:
+        return _json({"ok": False, "error": "The finance module is not enabled."}, 404)
+
+    viewer = get_current_session_user(request)
+    role = viewer.get('role') if viewer else None
+    if role not in ('admin', 'admin_pro', 'superadmin'):
+        return _json({"ok": False, "error": "You do not have access to the fees totals."}, 403)
+
+    needs_password = (role == 'admin')
+    identifier = f"fee-totals:{int(school_id)}"
+
+    if needs_password:
+        password = (admin_pro_password or "")[:72]
+        if not password.strip():
+            return _json({"ok": False, "error": "Enter the Admin Pro password to view the totals."}, 400)
+
+        # Phase 1 — short DB visit: is this school locked out, and which
+        # Admin Pro hashes exist? (The slow password check below runs with
+        # no connection held, as the login route does.)
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(f"""
+                    SELECT COUNT(*) AS cnt FROM login_attempts
+                    WHERE identifier = %s AND attempted_at > NOW() - INTERVAL '{FEE_TOTALS_LOCK_WINDOW_MINUTES} minutes';
+                """, (identifier,))
+                if cur.fetchone()['cnt'] >= FEE_TOTALS_MAX_FAILED_ATTEMPTS:
+                    return _json({"ok": False, "error": f"Too many incorrect attempts. Try again in {FEE_TOTALS_LOCK_WINDOW_MINUTES} minutes."}, 429)
+                cur.execute("SELECT password_hash FROM users WHERE school_id = %s AND role = 'admin_pro';", (school_id,))
+                hashes = [r['password_hash'] for r in cur.fetchall() if r['password_hash']]
+
+        if not hashes:
+            return _json({"ok": False, "error": "This school has no Admin Pro account yet, so the totals can't be unlocked. Ask the platform administrator to create one."}, 403)
+
+        # Phase 2 — verify with no DB connection held.
+        is_valid = False
+        for stored_hash in hashes:
+            try:
+                if verify_password(password, stored_hash):
+                    is_valid = True
+                    break
+            except Exception:
+                continue
+
+        if not is_valid:
+            with get_db_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("INSERT INTO login_attempts (identifier) VALUES (%s);", (identifier,))
+                    cur.execute("DELETE FROM login_attempts WHERE attempted_at < NOW() - INTERVAL '1 day';")
+                    conn.commit()
+                    cur.execute(f"""
+                        SELECT COUNT(*) AS cnt FROM login_attempts
+                        WHERE identifier = %s AND attempted_at > NOW() - INTERVAL '{FEE_TOTALS_LOCK_WINDOW_MINUTES} minutes';
+                    """, (identifier,))
+                    used = cur.fetchone()['cnt']
+                    _audit_fee_totals(conn, cur, school_id, viewer, "fee_totals_unlock_failed", "Wrong Admin Pro password entered to view fee totals")
+            left = max(0, FEE_TOTALS_MAX_FAILED_ATTEMPTS - used)
+            if left == 0:
+                return _json({"ok": False, "error": f"Incorrect password. Too many attempts — try again in {FEE_TOTALS_LOCK_WINDOW_MINUTES} minutes."}, 429)
+            return _json({"ok": False, "error": f"Incorrect Admin Pro password. {left} attempt{'s' if left != 1 else ''} left."}, 403)
+
+    # Authorised — compute and return.
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            expected, paid = _compute_fee_totals(cur, school_id, term, year)
+            if needs_password:
+                cur.execute("DELETE FROM login_attempts WHERE identifier = %s;", (identifier,))
+                conn.commit()
+            _audit_fee_totals(conn, cur, school_id, viewer, "fee_totals_viewed", f"Viewed fee totals for {term} {year}")
+
+    return _json({
+        "ok": True,
+        "expected": f"KSh {expected:,.0f}",
+        "collected": f"KSh {paid:,.0f}",
+        "outstanding": f"KSh {(expected - paid):,.0f}",
+    })
 
 
 # ============================================================

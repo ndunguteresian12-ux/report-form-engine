@@ -5937,7 +5937,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             <tr>
                 <td style='text-align:center;'>{i}</td>
                 <td style='font-family:monospace;'>{esc(s['admission_number'])}</td>
-                <td>{esc(full_student_name(s))}</td>
+                <td class="ml-name">{esc(full_student_name(s))}</td>
                 <td style='text-align:center;'>{esc(s['stream'])}</td>
                 <td style='text-align:center;font-weight:bold;'>{stream_positions.get(s['id'], '-')}</td>
                 <td style='text-align:center;font-weight:bold;'>{overall_positions.get(s['id'], '-')}</td>
@@ -5973,8 +5973,8 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         <div style="display:flex;align-items:center;gap:16px;border-bottom:3px double #4f46e5;padding-bottom:12px;">
             {logo_html}
             <div>
-                <h1 style="margin:0;font-size:18px;">{esc(school['name'])}</h1>
-                <p style="margin:2px 0 0;font-size:13px;font-weight:bold;">REPORT: STUDENTS' PERFORMANCE MERIT LIST{scope_label}{' — COMBINED TERM (OPENER + MID-TERM + END TERM)' if combined else ''}</p>
+                <h1 style="margin:0;font-size:calc(var(--ml-fs) + 7px);">{esc(school['name'])}</h1>
+                <p style="margin:2px 0 0;font-size:calc(var(--ml-fs) + 2px);font-weight:bold;">REPORT: STUDENTS' PERFORMANCE MERIT LIST{scope_label}{' — COMBINED TERM (OPENER + MID-TERM + END TERM)' if combined else ''}</p>
             </div>
         </div>
         <table class="header-fields" style="margin-top:8px;">
@@ -6005,7 +6005,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             <tbody>{rows_html or f"<tr><td colspan='{15 + total_subjects}' style='padding:20px;text-align:center;color:#94a3b8;'>No students found for this grade.</td></tr>"}</tbody>
         </table>
 
-        <div style="margin-top:24px; font-weight:bold; font-size:13px;">CLASS AVERAGE MARKS: {class_average_marks:.1f}</div>
+        <div style="margin-top:24px; font-weight:bold; font-size:calc(var(--ml-fs) + 1px);">CLASS AVERAGE MARKS: {class_average_marks:.1f}</div>
         <table style="margin-top:6px;">
             <thead><tr><th>Subject</th>{footer_subject_cells}</tr></thead>
             <tbody>
@@ -6014,7 +6014,7 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
             </tbody>
         </table>
 
-        <p style="margin-top:16px; font-size:10px; color:#64748b;">
+        <p style="margin-top:16px; font-size:calc(var(--ml-fs) - 2px); color:#64748b;">
             — Student position is assigned using Total Marks.<br>
             — Student performance level is calculated using the student's average points.<br>
             — "Prv Str Pos" / "Prv Ovr Pos" (previous exam positions) are not yet tracked by this system and are shown blank.
@@ -6029,13 +6029,25 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         <meta name="viewport" content="width=device-width, initial-scale=1.0"><link rel="icon" href="{ELIMU_HUB_ICON_DATA_URI}">
         <title>Elimu Hub | Merit List — {esc(grade_name)}</title>
         <style>
-            @page {{ size: landscape; margin: 10mm; }}
-            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; font-size: 11px; }}
-            @media print {{ .no-print {{ display: none !important; }} }}
+            @page {{ size: A4 landscape; margin: 8mm; }}
+            :root {{ --ml-fs: 13px; }}
+            body {{ font-family: Arial, sans-serif; padding: 20px; color: #1e293b; font-size: var(--ml-fs); }}
+            @media print {{
+                .no-print {{ display: none !important; }}
+                body {{ padding: 0; }}
+                table {{ width: 100%; }}
+                th, td.ml-name {{ white-space: normal; }}
+                thead {{ display: table-header-group; }}
+                tr {{ page-break-inside: avoid; }}
+            }}
+            /* Same wrapping rules, applied by the script while it measures the
+               table for printing (print media rules are not active on screen). */
+            html.ml-fit body {{ padding: 0; }}
+            html.ml-fit th, html.ml-fit td.ml-name {{ white-space: normal; }}
             table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
-            th, td {{ padding: 4px 6px; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }}
-            th {{ text-align:left; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:9px; text-transform:uppercase; color:#64748b; }}
-            .header-fields td {{ border: none; padding: 2px 10px 2px 0; font-size: 11px; }}
+            th, td {{ padding: .4em .55em; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }}
+            th {{ text-align:left; background:#f8fafc; border-bottom:2px solid #cbd5e1; font-size:calc(var(--ml-fs) - 2px); text-transform:uppercase; color:#64748b; }}
+            .header-fields td {{ border: none; padding: 2px 10px 2px 0; font-size: var(--ml-fs); }}
         </style>
         {extra_style_html}
     </head>
@@ -6043,9 +6055,69 @@ def print_merit_list(school_id: int, grade_name: str, education_level: str, requ
         <div class="no-print" style="text-align:right; margin-bottom:16px;">
             <a href="/admin/reports/merit-list/{school_id}?grade_name={urllib.parse.quote(grade_name)}&education_level={urllib.parse.quote(education_level)}{'&combined=1' if not combined else ''}{'&stream=' + urllib.parse.quote(stream) if stream else ''}" style="background:#0d9488;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">{'📄 Switch to Single Cycle (' + str(st['active_cycle']) + ')' if combined else '📊 Switch to Combined Term (Opener + Mid + End)'}</a>
             {f'<a href="/admin/reports/merit-list/{school_id}?grade_name=' + urllib.parse.quote(grade_name) + '&education_level=' + urllib.parse.quote(education_level) + ('&combined=1' if combined else '') + '" style="background:#7c3aed;color:white;border:none;padding:10px 16px;border-radius:8px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block;margin-right:8px;">🏫 Switch to Whole Grade (All Streams)</a>' if is_single_stream_view else ''}
+            <span style="display:inline-flex;align-items:center;gap:4px;margin-right:8px;">
+                <button type="button" onclick="mlFont(-1)" title="Smaller text" style="background:#e2e8f0;border:0;border-radius:8px;padding:6px 10px;font-weight:bold;cursor:pointer;">A&minus;</button>
+                <button type="button" onclick="mlFont(1)" title="Larger text" style="background:#e2e8f0;border:0;border-radius:8px;padding:6px 10px;font-weight:bold;cursor:pointer;">A+</button>
+            </span>
             {toolbar_button}
         </div>
         {content_html}
+        <script>
+            // Merit list text size + automatic fit-to-page for printing.
+            (function () {{
+                var KEY = 'merit_list_font_px';
+                var DEFAULT_PX = 13, MIN_PRINT_PX = 6;
+                // A4 landscape 297mm wide minus 2 x 8mm margins = 281mm = ~1062 CSS px.
+                // A few px are kept spare so the last column never touches the edge.
+                var PRINT_WIDTH_PX = 1050;
+                var root = document.documentElement;
+
+                function apply(px) {{ root.style.setProperty('--ml-fs', px + 'px'); }}
+                function current() {{ return parseFloat(getComputedStyle(root).getPropertyValue('--ml-fs')) || DEFAULT_PX; }}
+
+                var saved = DEFAULT_PX;
+                try {{ var v = parseFloat(localStorage.getItem(KEY)); if (v >= 9 && v <= 22) saved = v; }} catch (e) {{}}
+                apply(saved);
+
+                window.mlFont = function (delta) {{
+                    var next = Math.max(9, Math.min(22, current() + delta));
+                    apply(next);
+                    saved = next;
+                    try {{ localStorage.setItem(KEY, String(next)); }} catch (e) {{}}
+                }};
+
+                // Narrowest width every table can be squeezed to at the current font size.
+                function widestMinWidth() {{
+                    var widest = 0;
+                    var tables = document.querySelectorAll('table');
+                    for (var i = 0; i < tables.length; i++) {{
+                        var t = tables[i], old = t.style.width;
+                        t.style.width = '1px';            // a table cannot go below its minimum content width
+                        widest = Math.max(widest, t.offsetWidth);
+                        t.style.width = old;
+                    }}
+                    return widest;
+                }}
+
+                function fitForPrint() {{
+                    root.classList.add('ml-fit');
+                    var fs = saved;
+                    apply(fs);
+                    var guard = 0;
+                    while (widestMinWidth() > PRINT_WIDTH_PX && fs > MIN_PRINT_PX && guard++ < 60) {{
+                        fs -= 0.25;
+                        apply(fs);
+                    }}
+                }}
+                function restoreAfterPrint() {{
+                    root.classList.remove('ml-fit');
+                    apply(saved);
+                }}
+
+                window.addEventListener('beforeprint', fitForPrint);
+                window.addEventListener('afterprint', restoreAfterPrint);
+            }})();
+        </script>
     </body>
     </html>
     """
