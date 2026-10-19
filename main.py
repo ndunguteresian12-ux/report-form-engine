@@ -7621,13 +7621,54 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
             if not school:
                 raise HTTPException(status_code=404, detail="Institution Tenant context missing.")
 
+            # How many exam cycles (Opener / Midterm / End Term) have actually
+            # been entered for this class this term. Every subject average on
+            # the report form is the learner's TOTAL across cycles divided by
+            # THIS number — not by however many cycles that one learner
+            # happens to have a mark for. So with Opener and End Term entered,
+            # every subject is divided by 2, and a learner who only sat one of
+            # them gets that mark / 2 (the missed cycle counts as 0). This is
+            # the same rule that decides which cycle columns print, so the
+            # divisor always matches the columns on the page. A custom cycle
+            # (single column) always divides by 1, exactly as before.
+            def _count_cycles_entered(term_value, year_value):
+                cur.execute("""
+                    SELECT DISTINCT sc.cycle_name
+                    FROM student_scores sc
+                    JOIN students s ON sc.student_id = s.id
+                    JOIN classes c ON s.class_id = c.id
+                    WHERE s.school_id = %s AND c.grade_name = %s AND s.stream = %s
+                      AND (s.status IS NULL OR s.status != 'GRADUATED')
+                      AND sc.cycle_name IN ('Opener', 'Midterm', 'End Term')
+                      AND sc.term = %s AND sc.year = %s;
+                """, (school_id, grade_name, stream, term_value, year_value))
+                names = {r['cycle_name'] for r in cur.fetchall()}
+                return [n for n in ('Opener', 'Midterm', 'End Term') if n in names]
+
+            if is_custom_cycle_mode:
+                cycles_entered_names = []
+                cycles_entered_count = 1
+            else:
+                cycles_entered_names = _count_cycles_entered(st['active_term'], st['active_year'])
+                cycles_entered_count = max(1, len(cycles_entered_names))
+            subject_avg_sql = "AVG(sc.raw_score)" if is_custom_cycle_mode else "SUM(sc.raw_score) / %s"
+            subject_avg_params = () if is_custom_cycle_mode else (cycles_entered_count,)
+
+            cycles_note_banner = ""
+            if cycles_entered_count >= 2:
+                cycles_note_banner = f"""
+                <div class="no-print" style="max-width:223mm; margin:0 auto 16px auto; background:#eff6ff; border:1px solid #bfdbfe; color:#1e3a8a; padding:12px 18px; border-radius:10px; font-family:'Plus Jakarta Sans',Arial,sans-serif; font-size:12px; line-height:1.5;">
+                    <b>ℹ️ How the averages are worked out:</b> each subject average is the total of the learner's marks across the {cycles_entered_count} exam cycles entered ({esc(', '.join(cycles_entered_names))}) divided by {cycles_entered_count}. A cycle a learner did not sit counts as 0.
+                </div>
+                """
+
             # 🌟 Fixed Subject Average Aggregation to align perfectly with report card loop calculations
             cur.execute(f"""
                 WITH subject_averages AS (
                     SELECT 
                         sc.student_id,
                         sc.learning_area_id,
-                        AVG(sc.raw_score) AS subject_avg
+                        {subject_avg_sql} AS subject_avg
                     FROM student_scores sc
                     WHERE {cycle_filter_sql} AND sc.term = %s AND sc.year = %s
                     GROUP BY sc.student_id, sc.learning_area_id
@@ -7688,7 +7729,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                 SELECT * FROM cohort_rankings
                 WHERE stream = %s
                 ORDER BY stream_position ASC, admission_number ASC;
-            """, cycle_filter_params + (st['active_term'], st['active_year'], school_id, grade_name, stream))
+            """, subject_avg_params + cycle_filter_params + (st['active_term'], st['active_year'], school_id, grade_name, stream))
             students = cur.fetchall()
 
             if not students:
@@ -7728,7 +7769,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                         SELECT
                             sc.student_id,
                             sc.learning_area_id,
-                            AVG(sc.raw_score) AS subject_avg
+                            SUM(sc.raw_score) / %s AS subject_avg
                         FROM student_scores sc
                         WHERE sc.cycle_name IN ('Opener', 'Midterm', 'End Term') AND sc.term = %s AND sc.year = %s
                         GROUP BY sc.student_id, sc.learning_area_id
@@ -7756,7 +7797,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
                         FROM student_mean_scores
                     )
                     SELECT student_id, stream_position, total_in_stream, grade_position, total_in_grade FROM cohort_rankings WHERE stream = %s;
-                """, (prev_term, prev_year, school_id, grade_name, stream))
+                """, (max(1, len(_count_cycles_entered(prev_term, prev_year))), prev_term, prev_year, school_id, grade_name, stream))
                 previous_positions = {r['student_id']: r for r in cur.fetchall()}
 
             # Only show a column for an exam cycle if it's actually been keyed
@@ -7941,7 +7982,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
 
                     active_cycles = [v for v in [op, mid, end] if v is not None]
                     if active_cycles:
-                        weighted_total = sum(active_cycles) / len(active_cycles)
+                        weighted_total = sum(active_cycles) / cycles_entered_count
                         meta = evaluate_performance_metrics(weighted_total, bands=grading_bands)
                         pld, pts, descriptor = meta['pld'], f"{meta['points']} Pt", meta['desc']
                         
@@ -8179,7 +8220,7 @@ def output_batch_class_report_forms(school_id: int, request: Request, grade_name
             from mpesa_routes import render_admin_print_toolbar_and_content
             toolbar_button, wrapped_pages, extra_style_html = render_admin_print_toolbar_and_content(
                 school_id,
-                f"{missing_marks_banner}{joined_report_pages}",
+                f"{cycles_note_banner}{missing_marks_banner}{joined_report_pages}",
                 "batch of report cards",
                 "#0f172a",
                 max_height_px=900,
