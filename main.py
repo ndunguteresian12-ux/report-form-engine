@@ -1597,11 +1597,23 @@ def get_grading_bands(cur, school_id: int):
 # differences (e.g. a trailing period).
 PAPER_BASED_SUBJECTS = {"english", "kiswahili", "integrated science"}
 
+# Master switch for the two-paper entry screen. Schools asked for ONE mark per
+# subject instead (the same single "Score %" / "out of" grid every other
+# subject uses), so this is OFF. The two-paper code below and the
+# paper_based_scores table are deliberately left in place, untouched, so that
+# (a) nothing already saved is lost and (b) this can be switched back on by
+# setting it to True. With it off, existing marks keep showing: a combined
+# percentage was always stored in student_scores, which is what the single
+# grid reads.
+TWO_PAPER_ENTRY_ENABLED = False
+
 def is_paper_based_subject(subject_name: str, education_level: str) -> bool:
     """Paper 1 / Paper 2 assessment is a Junior School thing only — English,
     Kiswahili, and Integrated Science also exist at Lower/Upper Primary
     under similar names, so the education_level check is required, not
     just a name match."""
+    if not TWO_PAPER_ENTRY_ENABLED:
+        return False
     if (education_level or "").strip() != "Junior School":
         return False
     return (subject_name or "").strip().lower().rstrip(".") in PAPER_BASED_SUBJECTS
