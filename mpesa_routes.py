@@ -21,6 +21,12 @@ All prices (subscription termly/yearly amounts, scheme print price) are
 set by the Super Admin at /superadmin/billing/settings and stored in the
 billing_settings table — nothing money-related is hardcoded here.
 
+Receipts: every successful payment automatically issues a receipt in the name
+of RECEIPT_BUSINESS_NAME (default "CoreDesk Technologies"). Optional extras to
+print on it: RECEIPT_KRA_PIN, RECEIPT_ADDRESS, RECEIPT_PHONE, RECEIPT_EMAIL.
+It is shown on screen, listed under "payment receipts", and emailed to the payer
+(uses the same RESEND_API_KEY / RESEND_FROM_EMAIL as the rest of Elimu Hub).
+
 Environment variables (set these on Render):
     MPESA_ENV                 "sandbox" or "production"        (default: sandbox)
     MPESA_CONSUMER_KEY        from your Daraja app
@@ -42,6 +48,7 @@ import os
 import re
 import hmac
 import math
+import threading
 import base64
 import logging
 import datetime
@@ -187,6 +194,31 @@ def bootstrap_mpesa_schema():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+
+            # One immutable receipt per completed payment (snapshot of what was
+            # paid, to whom, and for what — never recalculated later).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS payment_receipts (
+                    id INTEGER PRIMARY KEY,
+                    receipt_number VARCHAR(30) UNIQUE NOT NULL,
+                    transaction_id INTEGER UNIQUE NOT NULL REFERENCES mpesa_transactions(id) ON DELETE CASCADE,
+                    school_id INTEGER NOT NULL REFERENCES schools(id) ON DELETE CASCADE,
+                    user_id INTEGER,
+                    purpose VARCHAR(30) NOT NULL,
+                    payer_name TEXT,
+                    payer_email TEXT,
+                    payer_phone VARCHAR(20),
+                    description TEXT NOT NULL,
+                    period_note TEXT,
+                    amount NUMERIC(10, 2) NOT NULL,
+                    mpesa_receipt_number VARCHAR(50),
+                    email_status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                    issued_at TIMESTAMP NOT NULL
+                );
+            """)
+            cur.execute("CREATE SEQUENCE IF NOT EXISTS payment_receipts_id_seq;")
+            cur.execute("ALTER TABLE payment_receipts ALTER COLUMN id SET DEFAULT nextval('payment_receipts_id_seq');")
+            cur.execute("ALTER SEQUENCE payment_receipts_id_seq OWNED BY payment_receipts.id;")
             conn.commit()
 
 
@@ -360,6 +392,7 @@ def subscription_billing_page(school_id: int, request: Request):
             <h2 class="text-lg font-black text-slate-800">Elimu Hub Subscription</h2>
             {status_html if BILLING_ENFORCED else ""}
             {payment_section}
+            {f'<a href="/billing/receipts/{school_id}" class="block text-center text-emerald-700 text-xs font-bold">🧾 View payment receipts</a>' if BILLING_ENFORCED else ""}
         </div>
     """
     return _page_shell("Subscription", body)
@@ -483,6 +516,7 @@ def staff_wallet_page(school_id: int, request: Request):
                 </div>
                 <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 rounded-xl text-sm font-bold transition">🚀 Top Up with M-Pesa</button>
             </form>
+            <a href="/billing/receipts/{school_id}" class="block text-center text-emerald-700 text-xs font-bold">🧾 View my payment receipts</a>
         </div>
     """
     return _page_shell("My Wallet", body)
@@ -699,17 +733,27 @@ def billing_status_page(checkout_request_id: str, request: Request):
 
 @router.get("/api/v1/mpesa/status/{checkout_request_id}")
 def mpesa_status_check(checkout_request_id: str):
+    receipt_id = None
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM mpesa_transactions WHERE checkout_request_id = %s;", (checkout_request_id,))
             txn = cur.fetchone()
+            if txn and txn["status"] == "completed":
+                try:
+                    cur.execute("SELECT id FROM payment_receipts WHERE transaction_id = %s;", (txn["id"],))
+                    row = cur.fetchone()
+                    receipt_id = row["id"] if row else None
+                except Exception:
+                    conn.rollback()
 
     if not txn:
         return JSONResponse({"status": "pending"})
 
     redirect_url = None
     if txn["status"] == "completed":
-        if txn["purpose"] == "subscription":
+        if receipt_id:
+            redirect_url = f"/billing/receipt/{txn['school_id']}/{receipt_id}"
+        elif txn["purpose"] == "subscription":
             redirect_url = f"/billing/subscription/{txn['school_id']}"
         elif txn["purpose"] == "wallet_topup":
             redirect_url = f"/staff/wallet/{txn['school_id']}"
@@ -719,6 +763,277 @@ def mpesa_status_check(checkout_request_id: str):
         "result_desc": txn["result_desc"],
         "redirect_url": redirect_url,
     })
+
+
+# ---------------------------------------------------------------------
+# Automatic payment receipts.
+#
+# The moment Safaricom confirms a payment, a receipt is issued in the
+# name of the business that received the money (default: CoreDesk
+# Technologies), shown to the payer on screen straight away, kept in
+# their receipts list, and emailed to them. The receipt is a SNAPSHOT
+# stored once — later changes to a school name or price never alter it.
+# Issuing a receipt can never block or undo the payment itself.
+# ---------------------------------------------------------------------
+
+RECEIPT_BUSINESS_NAME = (os.getenv("RECEIPT_BUSINESS_NAME") or "CoreDesk Technologies").strip()
+RECEIPT_KRA_PIN = (os.getenv("RECEIPT_KRA_PIN") or "").strip()
+RECEIPT_ADDRESS = (os.getenv("RECEIPT_ADDRESS") or "").strip()
+RECEIPT_PHONE = (os.getenv("RECEIPT_PHONE") or "").strip()
+RECEIPT_EMAIL = (os.getenv("RECEIPT_EMAIL") or "").strip()
+
+# Same email settings the rest of Elimu Hub uses (see send_email in main.py).
+RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip() or None
+RESEND_FROM_EMAIL = (os.getenv("RESEND_FROM_EMAIL") or "onboarding@resend.dev").strip()
+SMTP_FROM_NAME = (os.getenv("SMTP_FROM_NAME") or "Elimu Hub").strip()
+
+
+def _eat_now() -> datetime.datetime:
+    """Kenya time (UTC+3, no daylight saving) regardless of the server's timezone."""
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=3)
+
+
+def _mask_phone(phone: str) -> str:
+    phone = phone or ""
+    return f"{phone[:4]}•••••{phone[-3:]}" if len(phone) >= 9 else phone
+
+
+def _issue_receipt(cur, txn: dict, mpesa_receipt_number):
+    """Writes the receipt snapshot for a payment that has just been credited
+    (same transaction). Returns the receipt as a dict, or None."""
+    cur.execute("SELECT name FROM schools WHERE id = %s;", (txn["school_id"],))
+    school = cur.fetchone()
+    school_name = school["name"] if school else ""
+
+    payer_name, payer_email = None, None
+    if txn.get("initiated_by_user_id"):
+        cur.execute("SELECT full_name, email FROM users WHERE id = %s;", (txn["initiated_by_user_id"],))
+        u = cur.fetchone()
+        if u:
+            payer_name, payer_email = u["full_name"], u["email"]
+
+    purpose = txn["purpose"]
+    period_note = None
+    if purpose == "subscription":
+        days = txn["reference_id"] or 30
+        plan_label = next((SUBSCRIPTION_PLAN_LABELS[k] for k, d in SUBSCRIPTION_PLAN_DAYS.items() if d == days), f"{days} days")
+        description = f"Elimu Hub school subscription — {plan_label}"
+        cur.execute("SELECT subscription_expires_at FROM schools WHERE id = %s;", (txn["school_id"],))
+        row = cur.fetchone()
+        if row and row["subscription_expires_at"]:
+            period_note = f"Subscription active until {row['subscription_expires_at']:%d %b %Y}"
+    elif purpose == "wallet_topup":
+        description = "Elimu Hub wallet top-up (credit for scheme printing/downloads)"
+        cur.execute("SELECT balance FROM staff_wallets WHERE user_id = %s;", (txn["reference_id"],))
+        row = cur.fetchone()
+        if row:
+            period_note = f"Wallet balance after this top-up: KES {float(row['balance']):,.2f}"
+    else:
+        description = "Elimu Hub payment"
+
+    issued_at = _eat_now()
+    cur.execute("SELECT nextval(pg_get_serial_sequence('payment_receipts', 'id')) AS id;")
+    receipt_id = cur.fetchone()["id"]
+    receipt_number = f"RCT-{issued_at:%Y}-{int(receipt_id):05d}"
+    cur.execute("""
+        INSERT INTO payment_receipts
+            (id, receipt_number, transaction_id, school_id, user_id, purpose, payer_name, payer_email,
+             payer_phone, description, period_note, amount, mpesa_receipt_number, issued_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (transaction_id) DO NOTHING
+        RETURNING id;
+    """, (receipt_id, receipt_number, txn["id"], txn["school_id"], txn.get("initiated_by_user_id"), purpose, payer_name, payer_email,
+          txn["phone_number"], description, period_note, txn["amount"], mpesa_receipt_number, issued_at))
+    if cur.fetchone() is None:
+        return None
+    return {
+        "id": receipt_id, "receipt_number": receipt_number, "school_id": txn["school_id"], "school_name": school_name,
+        "purpose": purpose, "payer_name": payer_name, "payer_email": payer_email, "payer_phone": txn["phone_number"],
+        "description": description, "period_note": period_note, "amount": float(txn["amount"]),
+        "mpesa_receipt_number": mpesa_receipt_number, "issued_at": issued_at,
+    }
+
+
+def _issue_receipt_safely(cur, txn: dict, mpesa_receipt_number):
+    """A receipt problem must never block or undo a real payment, so any
+    failure here is rolled back to a savepoint and logged, and crediting stands."""
+    try:
+        cur.execute("SAVEPOINT issue_receipt;")
+        receipt = _issue_receipt(cur, txn, mpesa_receipt_number)
+        cur.execute("RELEASE SAVEPOINT issue_receipt;")
+        return receipt
+    except Exception as e:
+        logger.error("Receipt could not be issued for payment %s (payment itself is unaffected): %s", txn.get("id"), e)
+        try:
+            cur.execute("ROLLBACK TO SAVEPOINT issue_receipt;")
+        except Exception:
+            pass
+        return None
+
+
+def _receipt_inner_html(r: dict) -> str:
+    """The receipt itself. Inline styles only, so the exact same markup works
+    on the page, when printed, and inside an email."""
+    contact_bits = [b for b in (RECEIPT_ADDRESS, RECEIPT_PHONE, RECEIPT_EMAIL) if b]
+    contact_html = f"<div style='font-size:12px;color:#64748b;margin-top:2px;'>{esc(' · '.join(contact_bits))}</div>" if contact_bits else ""
+    pin_html = f"<div style='font-size:12px;color:#64748b;'>KRA PIN: {esc(RECEIPT_KRA_PIN)}</div>" if RECEIPT_KRA_PIN else ""
+    note_html = f"<tr><td style='padding:6px 0;color:#64748b;'>Note</td><td style='padding:6px 0;text-align:right;'>{esc(r['period_note'])}</td></tr>" if r.get("period_note") else ""
+    payer_line = esc(r.get("payer_name") or "")
+    school_line = esc(r.get("school_name") or "")
+    when = r["issued_at"].strftime("%d %b %Y, %I:%M %p") + " (EAT)" if r.get("issued_at") else ""
+    return f"""
+    <div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;border:1px solid #e2e8f0;border-radius:14px;padding:24px;background:#ffffff;color:#0f172a;">
+        <div style="text-align:center;border-bottom:2px solid #0f172a;padding-bottom:14px;margin-bottom:16px;">
+            <div style="font-size:20px;font-weight:800;">{esc(RECEIPT_BUSINESS_NAME)}</div>
+            <div style="font-size:12px;color:#64748b;">Elimu Hub</div>
+            {pin_html}{contact_html}
+        </div>
+        <div style="text-align:center;font-size:13px;font-weight:800;letter-spacing:2px;color:#047857;margin-bottom:14px;">PAYMENT RECEIPT</div>
+        <table style="width:100%;border-collapse:collapse;font-size:14px;">
+            <tr><td style="padding:6px 0;color:#64748b;">Receipt no.</td><td style="padding:6px 0;text-align:right;font-weight:700;">{esc(r['receipt_number'])}</td></tr>
+            <tr><td style="padding:6px 0;color:#64748b;">Date</td><td style="padding:6px 0;text-align:right;">{esc(when)}</td></tr>
+            <tr><td style="padding:6px 0;color:#64748b;">Received from</td><td style="padding:6px 0;text-align:right;">{school_line}{"<br>" if school_line and payer_line else ""}{payer_line}</td></tr>
+            <tr><td style="padding:6px 0;color:#64748b;">Paid by</td><td style="padding:6px 0;text-align:right;">{esc(_mask_phone(r.get('payer_phone')))}</td></tr>
+            <tr><td style="padding:6px 0;color:#64748b;">Payment method</td><td style="padding:6px 0;text-align:right;">M-Pesa (Paybill {esc(MPESA_SHORTCODE)})</td></tr>
+            <tr><td style="padding:6px 0;color:#64748b;">M-Pesa code</td><td style="padding:6px 0;text-align:right;font-family:monospace;font-weight:700;">{esc(r.get('mpesa_receipt_number') or '—')}</td></tr>
+            <tr><td style="padding:6px 0;color:#64748b;">For</td><td style="padding:6px 0;text-align:right;">{esc(r['description'])}</td></tr>
+            {note_html}
+        </table>
+        <div style="margin-top:14px;padding:14px;background:#ecfdf5;border-radius:10px;text-align:center;">
+            <div style="font-size:11px;color:#047857;font-weight:700;letter-spacing:1px;">AMOUNT PAID</div>
+            <div style="font-size:26px;font-weight:800;">KES {float(r['amount']):,.2f}</div>
+        </div>
+        <div style="margin-top:14px;font-size:11px;color:#94a3b8;text-align:center;">This is a computer-generated receipt and is valid without a signature. Thank you for your payment.</div>
+    </div>
+    """
+
+
+def _send_receipt_email_now(r: dict) -> str:
+    """Emails the receipt. Returns 'sent', 'failed', 'no_email' or 'not_configured'.
+    Never raises. Records the outcome on the receipt row."""
+    status = "no_email"
+    try:
+        if r.get("payer_email"):
+            if not RESEND_API_KEY:
+                status = "not_configured"
+            else:
+                resp = requests.post(
+                    "https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "from": f"{SMTP_FROM_NAME} <{RESEND_FROM_EMAIL}>",
+                        "to": [r["payer_email"]],
+                        "subject": f"Payment receipt {r['receipt_number']} — {RECEIPT_BUSINESS_NAME}",
+                        "html": f"<div style='background:#f1f5f9;padding:24px;'>{_receipt_inner_html(r)}</div>",
+                    },
+                    timeout=15,
+                )
+                status = "sent" if resp.status_code < 400 else "failed"
+                if status == "failed":
+                    logger.error("Receipt email failed: HTTP %s %s", resp.status_code, resp.text[:200])
+    except Exception as e:
+        status = "failed"
+        logger.error("Receipt email failed: %s", e)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE payment_receipts SET email_status = %s WHERE id = %s;", (status, r["id"]))
+                conn.commit()
+    except Exception as e:
+        logger.warning("Could not record receipt email status: %s", e)
+    return status
+
+
+def _email_receipt_in_background(r: dict):
+    """Fire-and-forget so Safaricom's callback is answered immediately."""
+    threading.Thread(target=_send_receipt_email_now, args=(r,), daemon=True).start()
+
+
+def _receipt_visibility_sql(viewer: dict):
+    """Which receipts a signed-in user may see. Teachers: only their own.
+    School admins: the school's subscription receipts + their own. Super admin: all."""
+    role = viewer.get("role")
+    if role == "superadmin":
+        return "TRUE", ()
+    if role in ("admin", "admin_pro"):
+        return "(purpose = 'subscription' OR user_id = %s)", (viewer["id"],)
+    return "user_id = %s", (viewer["id"],)
+
+
+@router.get("/billing/receipt/{school_id}/{receipt_id}", response_class=HTMLResponse)
+def view_receipt(school_id: int, receipt_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+    viewer = get_current_session_user(request)
+    if not viewer:
+        raise HTTPException(status_code=401, detail="Not logged in.")
+
+    where, params = _receipt_visibility_sql(viewer)
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT pr.*, s.name AS school_name FROM payment_receipts pr
+                JOIN schools s ON s.id = pr.school_id
+                WHERE pr.id = %s AND pr.school_id = %s AND {where.replace('purpose', 'pr.purpose').replace('user_id', 'pr.user_id')};
+            """, (receipt_id, school_id) + params)
+            r = cur.fetchone()
+    if not r:
+        raise HTTPException(status_code=404, detail="Receipt not found.")
+
+    back_url = f"/billing/subscription/{school_id}" if r["purpose"] == "subscription" else f"/staff/wallet/{school_id}"
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Receipt {esc(r['receipt_number'])}</title>
+    <style>body{{background:#f1f5f9;margin:0;padding:24px;font-family:Arial,Helvetica,sans-serif}}
+    .bar{{max-width:520px;margin:0 auto 14px auto;display:flex;gap:10px;justify-content:space-between;align-items:center}}
+    .bar a,.bar button{{font-size:13px;font-weight:700;color:#334155;background:#fff;border:1px solid #cbd5e1;border-radius:10px;padding:8px 14px;text-decoration:none;cursor:pointer}}
+    @media print{{body{{background:#fff;padding:0}} .bar{{display:none}}}}</style></head>
+    <body>
+        <div class="bar"><a href="{back_url}">← Back</a><a href="/billing/receipts/{school_id}">All receipts</a><button onclick="window.print()">🖨️ Print / Save as PDF</button></div>
+        {_receipt_inner_html(r)}
+    </body>
+    </html>
+    """
+
+
+@router.get("/billing/receipts/{school_id}", response_class=HTMLResponse)
+def list_receipts(school_id: int, request: Request):
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+    viewer = get_current_session_user(request)
+    if not viewer:
+        raise HTTPException(status_code=401, detail="Not logged in.")
+
+    where, params = _receipt_visibility_sql(viewer)
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT id, receipt_number, description, amount, issued_at FROM payment_receipts
+                WHERE school_id = %s AND {where} ORDER BY id DESC LIMIT 100;
+            """, (school_id,) + params)
+            rows = cur.fetchall()
+
+    items = "".join(f"""
+        <tr class="border-b">
+            <td class="p-3 text-xs font-mono"><a class="text-emerald-700 font-bold" href="/billing/receipt/{school_id}/{r['id']}">{esc(r['receipt_number'])}</a></td>
+            <td class="p-3 text-xs text-slate-500">{r['issued_at']:%d %b %Y}</td>
+            <td class="p-3 text-xs">{esc(r['description'])}</td>
+            <td class="p-3 text-xs font-bold text-right">KES {float(r['amount']):,.2f}</td>
+        </tr>""" for r in rows) or "<tr><td colspan='4' class='p-6 text-center text-xs text-slate-400'>No receipts yet — one appears here automatically after every successful payment.</td></tr>"
+    body = f"""
+        <a href="{get_dashboard_url(request, school_id)}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Dashboard</a>
+        <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-3">
+            <h2 class="text-lg font-black text-slate-800">🧾 Payment Receipts</h2>
+            <div class="overflow-x-auto"><table class="w-full text-sm">
+                <thead><tr class="border-b-2 text-left text-[11px] uppercase text-slate-400"><th class="p-3">Receipt</th><th class="p-3">Date</th><th class="p-3">For</th><th class="p-3 text-right">Amount</th></tr></thead>
+                <tbody>{items}</tbody>
+            </table></div>
+        </div>
+    """
+    return _page_shell("Receipts", body)
 
 
 def _callback_token_ok(request: Request) -> bool:
@@ -758,6 +1073,7 @@ async def mpesa_callback(request: Request):
         logger.warning("M-Pesa callback missing CheckoutRequestID: %s", payload)
         return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
+    issued_receipt = None
     mpesa_receipt_number = None
     paid_amount = None
     if result_code == 0:
@@ -820,7 +1136,13 @@ async def mpesa_callback(request: Request):
                         ON CONFLICT (user_id) DO UPDATE SET balance = staff_wallets.balance + EXCLUDED.balance, updated_at = NOW();
                     """, (txn["reference_id"], txn["school_id"], txn["amount"]))
 
+                # Receipt for the payer — after crediting, and never able to undo it.
+                issued_receipt = _issue_receipt_safely(cur, txn, mpesa_receipt_number)
+
             conn.commit()
+
+    if issued_receipt:
+        _email_receipt_in_background(issued_receipt)
 
     return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
