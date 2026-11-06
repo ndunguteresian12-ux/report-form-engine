@@ -28,12 +28,20 @@ Environment variables (set these on Render):
     MPESA_SHORTCODE           your Paybill/Till (sandbox default: 174379)
     MPESA_PASSKEY             your Lipa Na M-Pesa Online passkey
     MPESA_CALLBACK_URL        full public HTTPS URL Safaricom should POST
-                               results to, e.g.
-                               https://elimuhub.onrender.com/api/v1/mpesa/callback
+                               results to, INCLUDING the secret token, e.g.
+                               https://elimuhub.onrender.com/api/v1/mpesa/callback?token=<MPESA_CALLBACK_SECRET>
+    MPESA_CALLBACK_SECRET     a long random string (e.g. 48 hex characters).
+                               Required in production. Safaricom does not sign
+                               callbacks, so this secret in the URL is what
+                               proves a "payment succeeded" message really came
+                               from Safaricom and not from someone who read the
+                               checkout id off their own browser's address bar.
 """
 
 import os
 import re
+import hmac
+import math
 import base64
 import logging
 import datetime
@@ -83,6 +91,7 @@ MPESA_CONSUMER_SECRET = (os.getenv("MPESA_CONSUMER_SECRET") or "").strip()
 MPESA_SHORTCODE = (os.getenv("MPESA_SHORTCODE") or "174379").strip()
 MPESA_PASSKEY = (os.getenv("MPESA_PASSKEY") or "").strip()
 MPESA_CALLBACK_URL = (os.getenv("MPESA_CALLBACK_URL") or "").strip()
+MPESA_CALLBACK_SECRET = (os.getenv("MPESA_CALLBACK_SECRET") or "").strip()
 
 MPESA_BASE_URL = (
     "https://api.safaricom.co.ke" if MPESA_ENV == "production"
@@ -237,6 +246,10 @@ def _initiate_stk_push(phone: str, amount: int, account_reference: str, transact
         raise RuntimeError("MPESA_SHORTCODE / MPESA_PASSKEY are not set.")
     if not MPESA_CALLBACK_URL:
         raise RuntimeError("MPESA_CALLBACK_URL is not set.")
+    if MPESA_ENV == "production" and not MPESA_CALLBACK_SECRET:
+        raise RuntimeError("MPESA_CALLBACK_SECRET is not set (required in production).")
+    if MPESA_CALLBACK_SECRET and MPESA_CALLBACK_SECRET not in MPESA_CALLBACK_URL:
+        raise RuntimeError("MPESA_CALLBACK_URL must contain ?token=<MPESA_CALLBACK_SECRET>.")
 
     token = _get_access_token()
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
@@ -255,7 +268,7 @@ def _initiate_stk_push(phone: str, amount: int, account_reference: str, transact
         "PhoneNumber": phone,
         "CallBackURL": MPESA_CALLBACK_URL,
         "AccountReference": account_reference[:12],
-        "TransactionDesc": transaction_desc[:20],
+        "TransactionDesc": transaction_desc[:13],
     }
 
     resp = requests.post(
@@ -488,8 +501,13 @@ async def staff_wallet_topup(school_id: int, request: Request, phone_number: str
     if not viewer:
         raise HTTPException(status_code=401, detail="Not logged in.")
 
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="Top-up amount must be greater than zero.")
+    # Whole shillings only: STK Push charges int(amount), so a fractional
+    # figure would credit the wallet with more than was actually paid.
+    if not math.isfinite(amount) or amount < 1 or amount != int(amount):
+        raise HTTPException(status_code=400, detail="Top-up amount must be a whole number of shillings, at least 1.")
+    if amount > 150000:
+        raise HTTPException(status_code=400, detail="Top-up amount cannot be more than KES 150,000 at a time.")
+    amount = int(amount)
 
     msisdn = _normalize_msisdn(phone_number)
     if not msisdn or len(msisdn) != 12:
@@ -703,12 +721,28 @@ def mpesa_status_check(checkout_request_id: str):
     })
 
 
+def _callback_token_ok(request: Request) -> bool:
+    """Safaricom does not sign STK callbacks, and a payer can see their own
+    checkout id in the browser address bar — so without a secret, anyone could
+    POST a fake 'payment succeeded' for their own id and get free credit. The
+    secret lives only in the callback URL we give Safaricom (server-to-server),
+    never on any page a user sees."""
+    if not MPESA_CALLBACK_SECRET:
+        return MPESA_ENV != "production"   # sandbox testing only; production always needs the secret
+    supplied = request.query_params.get("token", "")
+    return hmac.compare_digest(supplied.encode(), MPESA_CALLBACK_SECRET.encode())
+
+
 @router.post("/api/v1/mpesa/callback")
 async def mpesa_callback(request: Request):
     """Safaricom POSTs here after the customer completes or cancels the
     STK prompt. No session auth here — this call comes from Safaricom's
     servers, not a logged-in browser. Must always return 200 quickly or
     Daraja will retry."""
+    if not _callback_token_ok(request):
+        logger.warning("M-Pesa callback REJECTED: missing/incorrect token (or MPESA_CALLBACK_SECRET not set in production)")
+        return JSONResponse({"ResultCode": 1, "ResultDesc": "Rejected"}, status_code=403)
+
     try:
         payload = await request.json()
     except Exception:
@@ -725,11 +759,14 @@ async def mpesa_callback(request: Request):
         return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
     mpesa_receipt_number = None
+    paid_amount = None
     if result_code == 0:
         items = ((stk_callback.get("CallbackMetadata") or {}).get("Item")) or []
         for item in items:
             if item.get("Name") == "MpesaReceiptNumber":
                 mpesa_receipt_number = item.get("Value")
+            elif item.get("Name") == "Amount":
+                paid_amount = item.get("Value")
 
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -741,11 +778,30 @@ async def mpesa_callback(request: Request):
                 return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
             new_status = "completed" if result_code == 0 else "failed"
+
+            # The amount Safaricom says was paid must match what we asked for.
+            if new_status == "completed" and paid_amount is not None:
+                try:
+                    amount_ok = int(float(paid_amount)) == int(float(txn["amount"]))
+                except (TypeError, ValueError):
+                    amount_ok = False
+                if not amount_ok:
+                    logger.error("M-Pesa callback amount mismatch for %s: paid %s, expected %s", checkout_request_id, paid_amount, txn["amount"])
+                    new_status = "failed"
+                    result_desc = f"Amount mismatch: paid {paid_amount}, expected {txn['amount']}. Not credited — check manually."
+
+            # Only the FIRST callback for a payment may change it. Safaricom can
+            # retry a callback, and a repeat must never credit twice. A payment
+            # that is no longer 'pending' is left exactly as it is.
             cur.execute("""
                 UPDATE mpesa_transactions
                 SET status = %s, result_desc = %s, mpesa_receipt_number = %s, updated_at = NOW()
-                WHERE checkout_request_id = %s;
+                WHERE checkout_request_id = %s AND status = 'pending'
+                RETURNING id;
             """, (new_status, result_desc, mpesa_receipt_number, checkout_request_id))
+            if cur.fetchone() is None:
+                logger.info("M-Pesa callback for already-processed payment %s ignored (duplicate or late).", checkout_request_id)
+                return JSONResponse({"ResultCode": 0, "ResultDesc": "Accepted"})
 
             if new_status == "completed":
                 if txn["purpose"] == "subscription":
@@ -848,6 +904,7 @@ def superadmin_mpesa_diagnostic(request: Request):
         ("MPESA_SHORTCODE", MPESA_SHORTCODE, "174379 in sandbox"),
         ("MPESA_PASSKEY", MPESA_PASSKEY, None),
         ("MPESA_CALLBACK_URL", MPESA_CALLBACK_URL, None),
+        ("MPESA_CALLBACK_SECRET", MPESA_CALLBACK_SECRET, "required in production"),
     ]
 
     rows = ""
@@ -857,7 +914,8 @@ def superadmin_mpesa_diagnostic(request: Request):
         if not is_set:
             preview = ""
         elif name in NON_SENSITIVE:
-            preview = f"<span class='text-slate-600 text-xs font-mono'>{esc(value)}</span>"
+            shown_value = re.sub(r"(token=)[^&]+", lambda m: m.group(1) + "••••", value)
+            preview = f"<span class='text-slate-600 text-xs font-mono'>{esc(shown_value)}</span>"
         elif len(value) > 4:
             preview = f"<span class='text-slate-400 text-xs'>starts with: {esc(value[:4])}…</span>"
         else:
