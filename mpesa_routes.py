@@ -21,7 +21,7 @@ All prices (subscription termly/yearly amounts, scheme print price) are
 set by the Super Admin at /superadmin/billing/settings and stored in the
 billing_settings table — nothing money-related is hardcoded here.
 
-Receipts: every successful payment automatically issues a receipt in the name
+Receipts: every successful school SUBSCRIPTION payment (not teacher wallet top-ups) issues a receipt in the name
 of RECEIPT_BUSINESS_NAME (default "CoreDesk Technologies"). Optional extras to
 print on it: RECEIPT_KRA_PIN, RECEIPT_ADDRESS, RECEIPT_PHONE, RECEIPT_EMAIL.
 It is shown on screen, listed under "payment receipts", and emailed to the payer
@@ -516,7 +516,6 @@ def staff_wallet_page(school_id: int, request: Request):
                 </div>
                 <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 rounded-xl text-sm font-bold transition">🚀 Top Up with M-Pesa</button>
             </form>
-            <a href="/billing/receipts/{school_id}" class="block text-center text-emerald-700 text-xs font-bold">🧾 View my payment receipts</a>
         </div>
     """
     return _page_shell("My Wallet", body)
@@ -766,9 +765,9 @@ def mpesa_status_check(checkout_request_id: str):
 
 
 # ---------------------------------------------------------------------
-# Automatic payment receipts.
+# Automatic payment receipts — for school SUBSCRIPTIONS only.
 #
-# The moment Safaricom confirms a payment, a receipt is issued in the
+# The moment Safaricom confirms a subscription payment, a receipt is issued in the
 # name of the business that received the money (default: CoreDesk
 # Technologies), shown to the payer on screen straight away, kept in
 # their receipts list, and emailed to them. The receipt is a SNAPSHOT
@@ -800,7 +799,12 @@ def _mask_phone(phone: str) -> str:
 
 def _issue_receipt(cur, txn: dict, mpesa_receipt_number):
     """Writes the receipt snapshot for a payment that has just been credited
-    (same transaction). Returns the receipt as a dict, or None."""
+    (same transaction). Returns the receipt as a dict, or None.
+
+    Receipts are issued for school SUBSCRIPTIONS only. Teacher wallet
+    top-ups (and anything else) never get one."""
+    if txn["purpose"] != "subscription":
+        return None
     cur.execute("SELECT name FROM schools WHERE id = %s;", (txn["school_id"],))
     school = cur.fetchone()
     school_name = school["name"] if school else ""
@@ -822,14 +826,6 @@ def _issue_receipt(cur, txn: dict, mpesa_receipt_number):
         row = cur.fetchone()
         if row and row["subscription_expires_at"]:
             period_note = f"Subscription active until {row['subscription_expires_at']:%d %b %Y}"
-    elif purpose == "wallet_topup":
-        description = "Elimu Hub wallet top-up (credit for scheme printing/downloads)"
-        cur.execute("SELECT balance FROM staff_wallets WHERE user_id = %s;", (txn["reference_id"],))
-        row = cur.fetchone()
-        if row:
-            period_note = f"Wallet balance after this top-up: KES {float(row['balance']):,.2f}"
-    else:
-        description = "Elimu Hub payment"
 
     issued_at = _eat_now()
     cur.execute("SELECT nextval(pg_get_serial_sequence('payment_receipts', 'id')) AS id;")
@@ -878,6 +874,10 @@ def _receipt_inner_html(r: dict) -> str:
     contact_html = f"<div style='font-size:12px;color:#64748b;margin-top:2px;'>{esc(' · '.join(contact_bits))}</div>" if contact_bits else ""
     pin_html = f"<div style='font-size:12px;color:#64748b;'>KRA PIN: {esc(RECEIPT_KRA_PIN)}</div>" if RECEIPT_KRA_PIN else ""
     note_html = f"<tr><td style='padding:6px 0;color:#64748b;'>Note</td><td style='padding:6px 0;text-align:right;'>{esc(r['period_note'])}</td></tr>" if r.get("period_note") else ""
+    test_banner_html = (
+        "<div style='text-align:center;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;font-size:12px;font-weight:700;padding:8px;border-radius:8px;margin-bottom:12px;'>"
+        "TEST RECEIPT — sandbox payment, no real money was received</div>"
+    ) if MPESA_ENV != "production" else ""
     payer_line = esc(r.get("payer_name") or "")
     school_line = esc(r.get("school_name") or "")
     when = r["issued_at"].strftime("%d %b %Y, %I:%M %p") + " (EAT)" if r.get("issued_at") else ""
@@ -888,6 +888,7 @@ def _receipt_inner_html(r: dict) -> str:
             <div style="font-size:12px;color:#64748b;">Elimu Hub</div>
             {pin_html}{contact_html}
         </div>
+        {test_banner_html}
         <div style="text-align:center;font-size:13px;font-weight:800;letter-spacing:2px;color:#047857;margin-bottom:14px;">PAYMENT RECEIPT</div>
         <table style="width:100%;border-collapse:collapse;font-size:14px;">
             <tr><td style="padding:6px 0;color:#64748b;">Receipt no.</td><td style="padding:6px 0;text-align:right;font-weight:700;">{esc(r['receipt_number'])}</td></tr>
@@ -923,7 +924,7 @@ def _send_receipt_email_now(r: dict) -> str:
                     json={
                         "from": f"{SMTP_FROM_NAME} <{RESEND_FROM_EMAIL}>",
                         "to": [r["payer_email"]],
-                        "subject": f"Payment receipt {r['receipt_number']} — {RECEIPT_BUSINESS_NAME}",
+                        "subject": f"{'[TEST] ' if MPESA_ENV != 'production' else ''}Payment receipt {r['receipt_number']} — {RECEIPT_BUSINESS_NAME}",
                         "html": f"<div style='background:#f1f5f9;padding:24px;'>{_receipt_inner_html(r)}</div>",
                     },
                     timeout=15,
@@ -950,14 +951,11 @@ def _email_receipt_in_background(r: dict):
 
 
 def _receipt_visibility_sql(viewer: dict):
-    """Which receipts a signed-in user may see. Teachers: only their own.
-    School admins: the school's subscription receipts + their own. Super admin: all."""
-    role = viewer.get("role")
-    if role == "superadmin":
-        return "TRUE", ()
-    if role in ("admin", "admin_pro"):
-        return "(purpose = 'subscription' OR user_id = %s)", (viewer["id"],)
-    return "user_id = %s", (viewer["id"],)
+    """Subscription receipts belong to the school, so school admins (and the
+    super admin) may see them. Teachers and other roles may not (None)."""
+    if viewer.get("role") in ("admin", "admin_pro", "superadmin"):
+        return "purpose = 'subscription'", ()
+    return None
 
 
 @router.get("/billing/receipt/{school_id}/{receipt_id}", response_class=HTMLResponse)
@@ -969,7 +967,10 @@ def view_receipt(school_id: int, receipt_id: int, request: Request):
     if not viewer:
         raise HTTPException(status_code=401, detail="Not logged in.")
 
-    where, params = _receipt_visibility_sql(viewer)
+    visibility = _receipt_visibility_sql(viewer)
+    if visibility is None:
+        raise HTTPException(status_code=403, detail="Payment receipts are available to school administrators only.")
+    where, params = visibility
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(f"""
@@ -981,7 +982,7 @@ def view_receipt(school_id: int, receipt_id: int, request: Request):
     if not r:
         raise HTTPException(status_code=404, detail="Receipt not found.")
 
-    back_url = f"/billing/subscription/{school_id}" if r["purpose"] == "subscription" else f"/staff/wallet/{school_id}"
+    back_url = f"/billing/subscription/{school_id}"
     return f"""
     <!DOCTYPE html>
     <html>
@@ -1007,7 +1008,10 @@ def list_receipts(school_id: int, request: Request):
     if not viewer:
         raise HTTPException(status_code=401, detail="Not logged in.")
 
-    where, params = _receipt_visibility_sql(viewer)
+    visibility = _receipt_visibility_sql(viewer)
+    if visibility is None:
+        raise HTTPException(status_code=403, detail="Payment receipts are available to school administrators only.")
+    where, params = visibility
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(f"""
