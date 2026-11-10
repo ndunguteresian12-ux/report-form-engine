@@ -780,6 +780,13 @@ RECEIPT_KRA_PIN = (os.getenv("RECEIPT_KRA_PIN") or "").strip()
 RECEIPT_ADDRESS = (os.getenv("RECEIPT_ADDRESS") or "").strip()
 RECEIPT_PHONE = (os.getenv("RECEIPT_PHONE") or "").strip()
 RECEIPT_EMAIL = (os.getenv("RECEIPT_EMAIL") or "").strip()
+# The company logo printed at the top of every receipt. Served from the app's own
+# /static folder (put coredesk-logo.png there). Set RECEIPT_LOGO_URL to "none" to
+# fall back to a plain-text business name. PUBLIC_BASE_URL (e.g. https://elimuhub.onrender.com)
+# lets emails use a full web address for the logo; if it is not set, the address is
+# worked out from MPESA_CALLBACK_URL.
+RECEIPT_LOGO_URL = (os.getenv("RECEIPT_LOGO_URL") if os.getenv("RECEIPT_LOGO_URL") is not None else "/static/coredesk-logo.png").strip()
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
 
 # Same email settings the rest of Elimu Hub uses (see send_email in main.py).
 RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip() or None
@@ -790,6 +797,21 @@ SMTP_FROM_NAME = (os.getenv("SMTP_FROM_NAME") or "Elimu Hub").strip()
 def _eat_now() -> datetime.datetime:
     """Kenya time (UTC+3, no daylight saving) regardless of the server's timezone."""
     return datetime.datetime.utcnow() + datetime.timedelta(hours=3)
+
+
+def _logo_url(for_email: bool) -> str:
+    """Where the logo image lives, or '' to use the text name instead. Emails
+    need a full https:// address (a relative path means nothing in someone's inbox)."""
+    url = RECEIPT_LOGO_URL
+    if not url or url.lower() == "none":
+        return ""
+    if url.lower().startswith(("http://", "https://")) or not for_email:
+        return url
+    base = PUBLIC_BASE_URL
+    if not base:
+        m = re.match(r"^(https?://[^/]+)", MPESA_CALLBACK_URL or "")
+        base = m.group(1) if m else ""
+    return f"{base}{url}" if base else ""
 
 
 def _mask_phone(phone: str) -> str:
@@ -867,9 +889,15 @@ def _issue_receipt_safely(cur, txn: dict, mpesa_receipt_number):
         return None
 
 
-def _receipt_inner_html(r: dict) -> str:
+def _receipt_inner_html(r: dict, for_email: bool = False) -> str:
     """The receipt itself. Inline styles only, so the exact same markup works
     on the page, when printed, and inside an email."""
+    logo = _logo_url(for_email)
+    if logo:
+        brand_html = (f"<img src=\"{esc(logo)}\" alt=\"{esc(RECEIPT_BUSINESS_NAME)}\" width=\"200\" "
+                      f"style=\"display:block;margin:0 auto 4px auto;width:200px;max-width:70%;height:auto;border:0;\">")
+    else:
+        brand_html = f"<div style='font-size:20px;font-weight:800;'>{esc(RECEIPT_BUSINESS_NAME)}</div>"
     contact_bits = [b for b in (RECEIPT_ADDRESS, RECEIPT_PHONE, RECEIPT_EMAIL) if b]
     contact_html = f"<div style='font-size:12px;color:#64748b;margin-top:2px;'>{esc(' · '.join(contact_bits))}</div>" if contact_bits else ""
     pin_html = f"<div style='font-size:12px;color:#64748b;'>KRA PIN: {esc(RECEIPT_KRA_PIN)}</div>" if RECEIPT_KRA_PIN else ""
@@ -884,7 +912,7 @@ def _receipt_inner_html(r: dict) -> str:
     return f"""
     <div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;border:1px solid #e2e8f0;border-radius:14px;padding:24px;background:#ffffff;color:#0f172a;">
         <div style="text-align:center;border-bottom:2px solid #0f172a;padding-bottom:14px;margin-bottom:16px;">
-            <div style="font-size:20px;font-weight:800;">{esc(RECEIPT_BUSINESS_NAME)}</div>
+            {brand_html}
             <div style="font-size:12px;color:#64748b;">Elimu Hub</div>
             {pin_html}{contact_html}
         </div>
@@ -925,7 +953,7 @@ def _send_receipt_email_now(r: dict) -> str:
                         "from": f"{SMTP_FROM_NAME} <{RESEND_FROM_EMAIL}>",
                         "to": [r["payer_email"]],
                         "subject": f"{'[TEST] ' if MPESA_ENV != 'production' else ''}Payment receipt {r['receipt_number']} — {RECEIPT_BUSINESS_NAME}",
-                        "html": f"<div style='background:#f1f5f9;padding:24px;'>{_receipt_inner_html(r)}</div>",
+                        "html": f"<meta charset='utf-8'><div style='background:#f1f5f9;padding:24px;'>{_receipt_inner_html(r, for_email=True)}</div>",
                     },
                     timeout=15,
                 )
@@ -986,7 +1014,7 @@ def view_receipt(school_id: int, receipt_id: int, request: Request):
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Receipt {esc(r['receipt_number'])}</title>
+    <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Receipt {esc(r['receipt_number'])}</title>
     <style>body{{background:#f1f5f9;margin:0;padding:24px;font-family:Arial,Helvetica,sans-serif}}
     .bar{{max-width:520px;margin:0 auto 14px auto;display:flex;gap:10px;justify-content:space-between;align-items:center}}
     .bar a,.bar button{{font-size:13px;font-weight:700;color:#334155;background:#fff;border:1px solid #cbd5e1;border-radius:10px;padding:8px 14px;text-decoration:none;cursor:pointer}}
