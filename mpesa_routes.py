@@ -48,6 +48,7 @@ import os
 import re
 import hmac
 import math
+from decimal import Decimal, ROUND_CEILING
 import threading
 import base64
 import logging
@@ -151,6 +152,15 @@ def bootstrap_mpesa_schema():
             """)
             cur.execute("INSERT INTO billing_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;")
 
+            # Population-based subscription pricing. Purely additive, and the
+            # mode DEFAULTS TO 'flat', so deploying this changes nothing for any
+            # live school until the Super Admin deliberately switches the mode.
+            cur.execute("ALTER TABLE billing_settings ADD COLUMN IF NOT EXISTS subscription_pricing_mode VARCHAR(20) NOT NULL DEFAULT 'flat';")
+            cur.execute("ALTER TABLE billing_settings ADD COLUMN IF NOT EXISTS subscription_per_student_termly NUMERIC(10, 2) NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE billing_settings ADD COLUMN IF NOT EXISTS subscription_per_student_yearly NUMERIC(10, 2) NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE billing_settings ADD COLUMN IF NOT EXISTS subscription_minimum_termly NUMERIC(10, 2) NOT NULL DEFAULT 0;")
+            cur.execute("ALTER TABLE billing_settings ADD COLUMN IF NOT EXISTS subscription_minimum_yearly NUMERIC(10, 2) NOT NULL DEFAULT 0;")
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS mpesa_transactions (
                     id SERIAL PRIMARY KEY,
@@ -170,6 +180,13 @@ def bootstrap_mpesa_schema():
                     updated_at TIMESTAMP DEFAULT NOW()
                 );
             """)
+
+            # Snapshot of what a population-priced subscription payment was
+            # based on (learner count and per-learner rate at the moment of
+            # payment) — NULL for flat-rate payments and for every payment made
+            # before this feature existed.
+            cur.execute("ALTER TABLE mpesa_transactions ADD COLUMN IF NOT EXISTS student_count INTEGER;")
+            cur.execute("ALTER TABLE mpesa_transactions ADD COLUMN IF NOT EXISTS unit_rate NUMERIC(10, 2);")
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS scheme_print_unlocks (
@@ -237,9 +254,69 @@ def get_billing_settings() -> dict:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("SELECT * FROM billing_settings WHERE id = 1;")
             row = dict(cur.fetchone())
-    for key in ("subscription_termly_amount", "subscription_yearly_amount", "scheme_print_amount"):
+    for key in ("subscription_termly_amount", "subscription_yearly_amount", "scheme_print_amount",
+                "subscription_per_student_termly", "subscription_per_student_yearly",
+                "subscription_minimum_termly", "subscription_minimum_yearly"):
         row[key] = float(row[key])
     return row
+
+
+# ---------------------------------------------------------------------
+# Subscription pricing — flat rate OR by school population.
+#
+# The amount a school is charged is ALWAYS calculated here, on the server,
+# at the moment the payment is started. The browser never sends an amount.
+# That figure is stored on the mpesa_transactions row, and the Safaricom
+# callback is checked against that stored figure, so what the school is
+# asked to pay is exactly what gets credited.
+# ---------------------------------------------------------------------
+
+def calculate_subscription_amount(settings: dict, student_count: int, plan: str) -> dict:
+    """Pure function (no database) — easy to test.
+
+    flat mode        -> the Super Admin's flat termly/yearly amount, unchanged
+                        from how this system has always charged.
+    per_student mode -> learners x per-learner rate, but never less than the
+                        plan's minimum fee, rounded UP to a whole shilling
+                        (STK Push only accepts whole shillings).
+    """
+    if plan not in ("termly", "yearly"):
+        raise ValueError("Unknown plan.")
+    student_count = max(int(student_count or 0), 0)
+
+    if settings.get("subscription_pricing_mode") != "per_student":
+        flat = settings["subscription_termly_amount"] if plan == "termly" else settings["subscription_yearly_amount"]
+        return {"mode": "flat", "students": student_count, "rate": None,
+                "minimum": None, "minimum_applied": False, "amount": flat}
+
+    rate = Decimal(str(settings["subscription_per_student_%s" % plan]))
+    minimum = Decimal(str(settings["subscription_minimum_%s" % plan]))
+    raw = rate * student_count
+    charged = max(raw, minimum)
+    return {"mode": "per_student", "students": student_count, "rate": float(rate),
+            "minimum": float(minimum), "minimum_applied": raw < minimum,
+            "amount": int(charged.to_integral_value(rounding=ROUND_CEILING))}
+
+
+def count_billable_students(cur, school_id: int) -> int:
+    """Learners who count towards a school's subscription: every learner
+    except those already GRADUATED. This is the same definition the Super
+    Admin portal already uses for its 'Students' column, so the number a
+    school is billed on always matches the number you see there."""
+    cur.execute("""
+        SELECT COUNT(*) AS n FROM students
+        WHERE school_id = %s AND (status IS NULL OR status != 'GRADUATED');
+    """, (school_id,))
+    return int(cur.fetchone()["n"])
+
+
+def get_subscription_quotes(school_id: int, settings: dict = None) -> dict:
+    """{'termly': quote, 'yearly': quote} for one school, from a single count."""
+    settings = settings or get_billing_settings()
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            students = count_billable_students(cur, school_id)
+    return {plan: calculate_subscription_amount(settings, students, plan) for plan in ("termly", "yearly")}
 
 
 def _normalize_msisdn(phone: str) -> str:
@@ -313,13 +390,13 @@ def _initiate_stk_push(phone: str, amount: int, account_reference: str, transact
     return resp.json()
 
 
-def _page_shell(title: str, body: str) -> str:
+def _page_shell(title: str, body: str, wide: bool = False) -> str:
     return f"""
     <!DOCTYPE html>
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Elimu Hub | {esc(title)}</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
     <body class="bg-slate-100 min-h-screen p-4 sm:p-8">
-        <div class="max-w-md mx-auto space-y-4">
+        <div class="{'max-w-4xl' if wide else 'max-w-md'} mx-auto space-y-4">
             {body}
         </div>
     </body>
@@ -352,17 +429,27 @@ def subscription_billing_page(school_id: int, request: Request):
         "<div class='bg-amber-50 border border-amber-200 text-amber-800 text-xs px-4 py-2 rounded-xl'>⚠️ No active subscription</div>"
     )
 
-    plan_amounts = {
-        "termly": settings["subscription_termly_amount"],
-        "yearly": settings["subscription_yearly_amount"],
-    }
+    quotes = get_subscription_quotes(school_id, settings)
+    per_student_mode = settings.get("subscription_pricing_mode") == "per_student"
+    pricing_unavailable = per_student_mode and any(q["amount"] < 1 for q in quotes.values())
+
+    def _plan_detail(q):
+        if q["mode"] != "per_student":
+            return ""
+        line = f"{q['students']:,} learners × KES {q['rate']:,.2f}"
+        if q["minimum_applied"]:
+            line = f"Minimum fee applies (KES {q['minimum']:,.0f})"
+        return f'<span class="block text-[11px] text-slate-400 font-normal ml-5">{esc(line)}</span>'
+
     plan_options = "".join(
         f"""<label class="flex items-center justify-between p-3 border rounded-xl cursor-pointer hover:bg-slate-50">
-                <span><input type="radio" name="plan" value="{key}" {"checked" if key == "termly" else ""} class="mr-2">{esc(SUBSCRIPTION_PLAN_LABELS[key])}</span>
-                <span class="font-bold text-slate-700">KES {amount:,.0f}</span>
+                <span><input type="radio" name="plan" value="{key}" {"checked" if key == "termly" else ""} class="mr-2">{esc(SUBSCRIPTION_PLAN_LABELS[key])}{_plan_detail(q)}</span>
+                <span class="font-bold text-slate-700">KES {q["amount"]:,.0f}</span>
             </label>"""
-        for key, amount in plan_amounts.items()
+        for key, q in quotes.items()
     )
+    if per_student_mode:
+        plan_options += f"""<p class="text-[11px] text-slate-400">Your fee is based on your school's current enrolment of {quotes['termly']['students']:,} active learners (graduated learners are not counted). The final amount is confirmed when you pay.</p>"""
 
     if not BILLING_ENFORCED:
         # Not live yet — show the plans for reference, but no working
@@ -373,6 +460,12 @@ def subscription_billing_page(school_id: int, request: Request):
                 💳 Subscriptions aren't live yet — check back soon. Here's a preview of the plans:
             </div>
             <div class="space-y-2 opacity-60 pointer-events-none">{plan_options}</div>
+        """
+    elif pricing_unavailable:
+        payment_section = f"""
+            <div class="bg-amber-50 border border-amber-200 text-amber-800 text-xs px-4 py-3 rounded-xl">
+                ⚠️ Subscription pricing for your school isn't ready yet. Please contact Elimu Hub support.
+            </div>
         """
     else:
         payment_section = f"""
@@ -412,7 +505,12 @@ async def subscription_billing_pay(school_id: int, request: Request, plan: str =
 
     viewer = get_current_session_user(request)
     settings = get_billing_settings()
-    plan_amount = settings["subscription_termly_amount"] if plan == "termly" else settings["subscription_yearly_amount"]
+    quote = get_subscription_quotes(school_id, settings)[plan]
+    plan_amount = quote["amount"]
+    if quote["mode"] == "per_student" and plan_amount < 1:
+        raise HTTPException(status_code=400, detail="Subscription pricing isn't set up for this school yet. Please contact support.")
+    snapshot_students = quote["students"] if quote["mode"] == "per_student" else None
+    snapshot_rate = quote["rate"] if quote["mode"] == "per_student" else None
     plan_days = SUBSCRIPTION_PLAN_DAYS[plan]
     msisdn = _normalize_msisdn(phone_number)
     if not msisdn or len(msisdn) != 12:
@@ -450,9 +548,9 @@ async def subscription_billing_pay(school_id: int, request: Request, plan: str =
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO mpesa_transactions (school_id, initiated_by_user_id, purpose, reference_id, amount, phone_number, account_reference, merchant_request_id, checkout_request_id)
-                VALUES (%s, %s, 'subscription', %s, %s, %s, %s, %s, %s);
-            """, (school_id, viewer['id'] if viewer else None, plan_days, plan_amount, msisdn, f"EH-{school_id}", merchant_request_id, checkout_request_id))
+                INSERT INTO mpesa_transactions (school_id, initiated_by_user_id, purpose, reference_id, amount, phone_number, account_reference, merchant_request_id, checkout_request_id, student_count, unit_rate)
+                VALUES (%s, %s, 'subscription', %s, %s, %s, %s, %s, %s, %s, %s);
+            """, (school_id, viewer['id'] if viewer else None, plan_days, plan_amount, msisdn, f"EH-{school_id}", merchant_request_id, checkout_request_id, snapshot_students, snapshot_rate))
             conn.commit()
 
     return RedirectResponse(url=f"/billing/status/{checkout_request_id}", status_code=303)
@@ -844,6 +942,8 @@ def _issue_receipt(cur, txn: dict, mpesa_receipt_number):
         days = txn["reference_id"] or 30
         plan_label = next((SUBSCRIPTION_PLAN_LABELS[k] for k, d in SUBSCRIPTION_PLAN_DAYS.items() if d == days), f"{days} days")
         description = f"Elimu Hub school subscription — {plan_label}"
+        if txn.get("student_count"):
+            description += f" ({int(txn['student_count']):,} learners)"
         cur.execute("SELECT subscription_expires_at FROM schools WHERE id = %s;", (txn["school_id"],))
         row = cur.fetchone()
         if row and row["subscription_expires_at"]:
@@ -1341,6 +1441,51 @@ def superadmin_billing_settings_page(request: Request, saved: str = None):
         </div>
     """
 
+    # Price preview: what every school WOULD be charged under the per-learner
+    # rates below (shown even while the mode is still flat, so the Super Admin
+    # can check the numbers against live schools before switching anything).
+    preview_settings = dict(settings, subscription_pricing_mode="per_student")
+    rates_set = settings["subscription_per_student_termly"] > 0 and settings["subscription_per_student_yearly"] > 0
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT sc.id, sc.name, sc.status,
+                    (SELECT COUNT(*) FROM students st WHERE st.school_id = sc.id AND (st.status IS NULL OR st.status != 'GRADUATED')) AS learners
+                FROM schools sc WHERE sc.status != 'deactivated' ORDER BY sc.name ASC;
+            """)
+            preview_schools = cur.fetchall()
+    preview_rows, total_new_termly, total_flat_termly = "", 0, 0
+    for sc in preview_schools:
+        q_term = calculate_subscription_amount(preview_settings, sc["learners"], "termly")
+        q_year = calculate_subscription_amount(preview_settings, sc["learners"], "yearly")
+        total_new_termly += q_term["amount"]
+        total_flat_termly += settings["subscription_termly_amount"]
+        note = " <span class='text-[10px] text-amber-600'>(minimum)</span>" if q_term["minimum_applied"] else ""
+        preview_rows += f"""
+            <tr class="border-b border-slate-100 text-xs">
+                <td class="p-2 font-semibold text-slate-700">{esc(sc['name'])}</td>
+                <td class="p-2 text-center">{sc['learners']:,}</td>
+                <td class="p-2 text-right font-bold">{'KES {:,.0f}'.format(q_term['amount']) if rates_set else '—'}{note if rates_set else ''}</td>
+                <td class="p-2 text-right font-bold">{'KES {:,.0f}'.format(q_year['amount']) if rates_set else '—'}</td>
+                <td class="p-2 text-right text-slate-400">KES {settings['subscription_termly_amount']:,.0f}</td>
+            </tr>"""
+    preview_html = f"""
+        <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-3">
+            <h3 class="text-sm font-black text-slate-800">Price preview — by population</h3>
+            <p class="text-xs text-slate-400">What each school would pay under the per-learner rates above (active learners only; graduated learners are not counted). Nothing is charged differently until you switch the pricing method to "By population" and save.</p>
+            {"" if rates_set else "<p class='text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2'>Enter a per-learner rate for both plans and save to see the preview.</p>"}
+            <div class="overflow-x-auto"><table class="w-full text-left">
+                <thead><tr class="text-[10px] uppercase tracking-wide text-slate-400 border-b">
+                    <th class="p-2">School</th><th class="p-2 text-center">Learners</th><th class="p-2 text-right">Per term</th><th class="p-2 text-right">Per year</th><th class="p-2 text-right">Current flat (term)</th>
+                </tr></thead>
+                <tbody>{preview_rows or "<tr><td colspan='5' class='p-4 text-center text-slate-400 italic'>No schools yet.</td></tr>"}</tbody>
+            </table></div>
+            {f"<p class='text-xs text-slate-500'>If every school paid for one term: <b>KES {total_new_termly:,.0f}</b> by population vs <b>KES {total_flat_termly:,.0f}</b> flat.</p>" if rates_set and preview_schools else ""}
+        </div>
+    """
+
+    mode_is_pop = settings["subscription_pricing_mode"] == "per_student"
+
     body = f"""
         <a href="/superadmin/dashboard" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Super Admin Portal</a>
         <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
@@ -1350,13 +1495,42 @@ def superadmin_billing_settings_page(request: Request, saved: str = None):
             <a href="/superadmin/billing/mpesa-diagnostic" class="text-xs font-bold text-indigo-700 hover:text-indigo-900 inline-block">🔍 Check M-Pesa environment variables</a>
             {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2 rounded-xl'>✅ Saved.</div>" if saved else ""}
             <form method="post" action="/superadmin/billing/settings" class="space-y-4">
-                <div>
-                    <label class="text-xs font-bold text-slate-500">School subscription — Per Term (KES)</label>
-                    <input type="number" step="1" min="0" name="subscription_termly_amount" value="{settings['subscription_termly_amount']:.0f}" required class="w-full p-2.5 border rounded-lg mt-1 bg-white">
+                <div class="border rounded-xl p-4 space-y-2 bg-slate-50">
+                    <label class="text-xs font-bold text-slate-500">How are schools charged for their subscription?</label>
+                    <select name="subscription_pricing_mode" class="w-full p-2.5 border rounded-lg bg-white">
+                        <option value="flat" {"" if mode_is_pop else "selected"}>Flat rate — the same fee for every school</option>
+                        <option value="per_student" {"selected" if mode_is_pop else ""}>By population — per learner</option>
+                    </select>
+                    <p class="text-[11px] text-slate-400">Population = each school's active learners (graduated learners are not counted). Check the preview below before switching.</p>
                 </div>
-                <div>
-                    <label class="text-xs font-bold text-slate-500">School subscription — Per Year (KES)</label>
-                    <input type="number" step="1" min="0" name="subscription_yearly_amount" value="{settings['subscription_yearly_amount']:.0f}" required class="w-full p-2.5 border rounded-lg mt-1 bg-white">
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="text-xs font-bold text-slate-500">Per learner — Per Term (KES)</label>
+                        <input type="number" step="0.01" min="0" name="subscription_per_student_termly" value="{settings['subscription_per_student_termly']:.2f}" class="w-full p-2.5 border rounded-lg mt-1 bg-white">
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-500">Per learner — Per Year (KES)</label>
+                        <input type="number" step="0.01" min="0" name="subscription_per_student_yearly" value="{settings['subscription_per_student_yearly']:.2f}" class="w-full p-2.5 border rounded-lg mt-1 bg-white">
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-500">Minimum fee — Per Term (KES)</label>
+                        <input type="number" step="1" min="0" name="subscription_minimum_termly" value="{settings['subscription_minimum_termly']:.0f}" class="w-full p-2.5 border rounded-lg mt-1 bg-white">
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-500">Minimum fee — Per Year (KES)</label>
+                        <input type="number" step="1" min="0" name="subscription_minimum_yearly" value="{settings['subscription_minimum_yearly']:.0f}" class="w-full p-2.5 border rounded-lg mt-1 bg-white">
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-3 border-t pt-4">
+                    <div>
+                        <label class="text-xs font-bold text-slate-500">Flat rate — Per Term (KES)</label>
+                        <input type="number" step="1" min="0" name="subscription_termly_amount" value="{settings['subscription_termly_amount']:.0f}" required class="w-full p-2.5 border rounded-lg mt-1 bg-white">
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-500">Flat rate — Per Year (KES)</label>
+                        <input type="number" step="1" min="0" name="subscription_yearly_amount" value="{settings['subscription_yearly_amount']:.0f}" required class="w-full p-2.5 border rounded-lg mt-1 bg-white">
+                    </div>
+                    <p class="col-span-2 text-[11px] text-slate-400">Flat rates are only used while the method above is "Flat rate".</p>
                 </div>
                 <div>
                     <label class="text-xs font-bold text-slate-500">Scheme of work print/download — per teacher, per scheme, per year (KES)</label>
@@ -1365,8 +1539,9 @@ def superadmin_billing_settings_page(request: Request, saved: str = None):
                 <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-2.5 rounded-xl text-sm font-bold transition">Save Prices</button>
             </form>
         </div>
+        {preview_html}
     """
-    return _page_shell("Billing Settings", body)
+    return _page_shell("Billing Settings", body, wide=True)
 
 
 @router.post("/superadmin/billing/settings")
@@ -1375,6 +1550,13 @@ def superadmin_billing_settings_save(
     subscription_termly_amount: float = Form(...),
     subscription_yearly_amount: float = Form(...),
     scheme_print_amount: float = Form(...),
+    # New fields arrive as text so a blank or missing value (e.g. an old
+    # cached copy of the form) keeps the current setting instead of zeroing it.
+    subscription_pricing_mode: str = Form(""),
+    subscription_per_student_termly: str = Form(""),
+    subscription_per_student_yearly: str = Form(""),
+    subscription_minimum_termly: str = Form(""),
+    subscription_minimum_yearly: str = Form(""),
 ):
     auth_error = require_superadmin_session(request)
     if auth_error:
@@ -1385,8 +1567,33 @@ def superadmin_billing_settings_save(
         ("Per Year subscription", subscription_yearly_amount),
         ("Scheme print/download", scheme_print_amount),
     ]:
-        if value < 0:
+        if value < 0 or not math.isfinite(value):
             raise HTTPException(status_code=400, detail=f"{label} price cannot be negative.")
+
+    current = get_billing_settings()
+
+    def _money(label, raw, keep):
+        raw = (raw or "").strip()
+        if raw == "":
+            return keep
+        try:
+            value = float(raw)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{label} must be a number.")
+        if value < 0 or not math.isfinite(value):
+            raise HTTPException(status_code=400, detail=f"{label} cannot be negative.")
+        return value
+
+    per_student_termly = _money("Per-learner term rate", subscription_per_student_termly, current["subscription_per_student_termly"])
+    per_student_yearly = _money("Per-learner year rate", subscription_per_student_yearly, current["subscription_per_student_yearly"])
+    minimum_termly = _money("Per-term minimum fee", subscription_minimum_termly, current["subscription_minimum_termly"])
+    minimum_yearly = _money("Per-year minimum fee", subscription_minimum_yearly, current["subscription_minimum_yearly"])
+
+    mode = (subscription_pricing_mode or "").strip() or current["subscription_pricing_mode"]
+    if mode not in ("flat", "per_student"):
+        raise HTTPException(status_code=400, detail="Unknown pricing method.")
+    if mode == "per_student" and (per_student_termly <= 0 or per_student_yearly <= 0):
+        raise HTTPException(status_code=400, detail="Set a per-learner rate for both Per Term and Per Year before switching to population-based pricing.")
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
@@ -1395,9 +1602,15 @@ def superadmin_billing_settings_save(
                 SET subscription_termly_amount = %s,
                     subscription_yearly_amount = %s,
                     scheme_print_amount = %s,
+                    subscription_pricing_mode = %s,
+                    subscription_per_student_termly = %s,
+                    subscription_per_student_yearly = %s,
+                    subscription_minimum_termly = %s,
+                    subscription_minimum_yearly = %s,
                     updated_at = NOW()
                 WHERE id = 1;
-            """, (subscription_termly_amount, subscription_yearly_amount, scheme_print_amount))
+            """, (subscription_termly_amount, subscription_yearly_amount, scheme_print_amount,
+                  mode, per_student_termly, per_student_yearly, minimum_termly, minimum_yearly))
             conn.commit()
 
     return RedirectResponse(url="/superadmin/billing/settings?saved=1", status_code=303)
