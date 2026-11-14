@@ -47,6 +47,8 @@ Environment variables (set these on Render):
 import os
 import re
 import hmac
+import csv
+import io
 import math
 from decimal import Decimal, ROUND_CEILING
 import threading
@@ -55,7 +57,7 @@ import logging
 import datetime
 import requests
 from fastapi import APIRouter, Request, HTTPException, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from shared import (
@@ -1334,6 +1336,187 @@ def superadmin_mpesa_transactions(request: Request):
     return _page_shell("M-Pesa Transactions", body)
 
 
+# ---------------------------------------------------------------------
+# Super Admin: every payment receipt, across every school.
+# Read-only — nothing here can create, change or delete a receipt.
+# ---------------------------------------------------------------------
+RECEIPTS_PER_PAGE = 50
+
+
+def _parse_date_or_none(raw):
+    try:
+        return datetime.datetime.strptime((raw or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _receipt_filters(school_id, date_from, date_to, q):
+    """Builds the WHERE clause shared by the list page and the CSV export.
+    Every value goes through query parameters — nothing is pasted into SQL."""
+    where, params = ["1=1"], []
+    if (school_id or "").strip().isdigit():
+        where.append("pr.school_id = %s")
+        params.append(int(school_id))
+    d_from, d_to = _parse_date_or_none(date_from), _parse_date_or_none(date_to)
+    if d_from:
+        where.append("pr.issued_at >= %s")
+        params.append(d_from)
+    if d_to:
+        where.append("pr.issued_at < %s::date + INTERVAL '1 day'")
+        params.append(d_to)
+    q = (q or "").strip()
+    if q:
+        where.append("(pr.receipt_number ILIKE %s OR pr.mpesa_receipt_number ILIKE %s OR s.name ILIKE %s OR pr.payer_name ILIKE %s OR pr.payer_phone ILIKE %s)")
+        params.extend([f"%{q}%"] * 5)
+    return " AND ".join(where), params, d_from, d_to, q
+
+
+@router.get("/superadmin/billing/receipts", response_class=HTMLResponse)
+def superadmin_all_receipts(request: Request, school_id: str = "", date_from: str = "", date_to: str = "",
+                            q: str = "", page: int = 1):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+
+    where, params, d_from, d_to, q = _receipt_filters(school_id, date_from, date_to, q)
+    page = max(int(page or 1), 1)
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT COUNT(*) AS n, COALESCE(SUM(pr.amount), 0) AS total
+                FROM payment_receipts pr JOIN schools s ON s.id = pr.school_id WHERE {where};
+            """, tuple(params))
+            agg = cur.fetchone()
+            cur.execute(f"""
+                SELECT pr.id, pr.receipt_number, pr.issued_at, pr.description, pr.amount, pr.payer_name,
+                       pr.mpesa_receipt_number, pr.email_status, s.name AS school_name
+                FROM payment_receipts pr JOIN schools s ON s.id = pr.school_id
+                WHERE {where} ORDER BY pr.id DESC LIMIT %s OFFSET %s;
+            """, tuple(params) + (RECEIPTS_PER_PAGE, (page - 1) * RECEIPTS_PER_PAGE))
+            rows = cur.fetchall()
+            cur.execute("SELECT id, name FROM schools ORDER BY name ASC;")
+            schools = cur.fetchall()
+
+    total_count, total_amount = int(agg["n"]), float(agg["total"])
+    pages = max((total_count + RECEIPTS_PER_PAGE - 1) // RECEIPTS_PER_PAGE, 1)
+
+    from urllib.parse import urlencode
+    def _qs(**extra):
+        base = {"school_id": school_id, "date_from": d_from or "", "date_to": d_to or "", "q": q}
+        base.update(extra)
+        return urlencode({k: v for k, v in base.items() if v not in ("", None)})
+
+    school_options = '<option value="">All schools</option>' + "".join(
+        f'<option value="{s["id"]}" {"selected" if str(s["id"]) == (school_id or "").strip() else ""}>{esc(s["name"])}</option>' for s in schools)
+
+    items = "".join(f"""
+        <tr class="border-b text-xs">
+            <td class="p-2 font-mono"><a class="text-emerald-700 font-bold" href="/superadmin/billing/receipt/{r['id']}">{esc(r['receipt_number'])}</a></td>
+            <td class="p-2 text-slate-500 whitespace-nowrap">{r['issued_at']:%d %b %Y}</td>
+            <td class="p-2 font-semibold text-slate-700">{esc(r['school_name'])}</td>
+            <td class="p-2">{esc(r['description'])}</td>
+            <td class="p-2 text-slate-500">{esc(r['payer_name'] or '—')}</td>
+            <td class="p-2 font-mono">{esc(r['mpesa_receipt_number'] or '—')}</td>
+            <td class="p-2 font-bold text-right whitespace-nowrap">KES {float(r['amount']):,.2f}</td>
+            <td class="p-2 text-slate-400">{esc(r['email_status'] or '—')}</td>
+        </tr>""" for r in rows) or "<tr><td colspan='8' class='p-6 text-center text-xs text-slate-400'>No receipts match these filters.</td></tr>"
+
+    prev_link = f'<a class="px-3 py-1.5 border rounded-lg text-xs font-bold" href="?{_qs(page=page - 1)}">← Previous</a>' if page > 1 else ""
+    next_link = f'<a class="px-3 py-1.5 border rounded-lg text-xs font-bold" href="?{_qs(page=page + 1)}">Next →</a>' if page < pages else ""
+
+    body = f"""
+        <a href="/superadmin/dashboard" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Super Admin Portal</a>
+        <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+            <div class="flex items-center justify-between flex-wrap gap-2">
+                <h2 class="text-lg font-black text-slate-800">🧾 All Payment Receipts</h2>
+                <a href="/superadmin/billing/receipts.csv?{_qs()}" class="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-3 py-2 rounded-lg">⬇ Download CSV</a>
+            </div>
+            <form method="get" action="/superadmin/billing/receipts" class="grid grid-cols-2 md:grid-cols-5 gap-2">
+                <select name="school_id" class="p-2 border rounded-lg text-xs bg-white md:col-span-2">{school_options}</select>
+                <input type="date" name="date_from" value="{d_from or ''}" class="p-2 border rounded-lg text-xs" title="From">
+                <input type="date" name="date_to" value="{d_to or ''}" class="p-2 border rounded-lg text-xs" title="To">
+                <input type="text" name="q" value="{esc(q)}" placeholder="Receipt no., M-Pesa code, payer…" class="p-2 border rounded-lg text-xs md:col-span-4">
+                <button type="submit" class="bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold rounded-lg px-3 py-2">Filter</button>
+            </form>
+            <div class="grid grid-cols-2 gap-3">
+                <div class="bg-emerald-50 rounded-xl p-3 text-center"><div class="text-[10px] font-bold text-emerald-700 uppercase">Receipts</div><div class="text-xl font-black">{total_count:,}</div></div>
+                <div class="bg-emerald-50 rounded-xl p-3 text-center"><div class="text-[10px] font-bold text-emerald-700 uppercase">Total</div><div class="text-xl font-black">KES {total_amount:,.0f}</div></div>
+            </div>
+            <div class="overflow-x-auto"><table class="w-full min-w-[820px] text-left">
+                <thead><tr class="border-b-2 text-[11px] uppercase text-slate-400"><th class="p-2">Receipt</th><th class="p-2">Date</th><th class="p-2">School</th><th class="p-2">For</th><th class="p-2">Payer</th><th class="p-2">M-Pesa code</th><th class="p-2 text-right">Amount</th><th class="p-2">Email</th></tr></thead>
+                <tbody>{items}</tbody>
+            </table></div>
+            <div class="flex items-center justify-between text-xs text-slate-400">
+                <span>Page {page} of {pages}</span><span class="flex gap-2">{prev_link}{next_link}</span>
+            </div>
+        </div>
+    """
+    return _page_shell("All Receipts", body, wide=True)
+
+
+def _csv_safe(value):
+    """Stops a school/payer name starting with = + - @ from running as a
+    formula when the CSV is opened in Excel."""
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+
+
+@router.get("/superadmin/billing/receipts.csv")
+def superadmin_all_receipts_csv(request: Request, school_id: str = "", date_from: str = "", date_to: str = "", q: str = ""):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    where, params, *_ = _receipt_filters(school_id, date_from, date_to, q)
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT pr.receipt_number, pr.issued_at, s.name AS school_name, pr.description, pr.period_note,
+                       pr.payer_name, pr.payer_phone, pr.mpesa_receipt_number, pr.amount
+                FROM payment_receipts pr JOIN schools s ON s.id = pr.school_id
+                WHERE {where} ORDER BY pr.id DESC;
+            """, tuple(params))
+            rows = cur.fetchall()
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["Receipt no.", "Date (EAT)", "School", "For", "Note", "Payer", "Payer phone", "M-Pesa code", "Amount (KES)"])
+    for r in rows:
+        writer.writerow([_csv_safe(r["receipt_number"]), r["issued_at"].strftime("%Y-%m-%d %H:%M"), _csv_safe(r["school_name"]),
+                         _csv_safe(r["description"]), _csv_safe(r["period_note"]), _csv_safe(r["payer_name"]),
+                         _csv_safe(r["payer_phone"]), _csv_safe(r["mpesa_receipt_number"]), f"{float(r['amount']):.2f}"])
+    return Response(content="\ufeff" + out.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="elimu-hub-receipts-{_eat_now():%Y%m%d}.csv"'})
+
+
+@router.get("/superadmin/billing/receipt/{receipt_id}", response_class=HTMLResponse)
+def superadmin_view_receipt(receipt_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT pr.*, s.name AS school_name FROM payment_receipts pr
+                JOIN schools s ON s.id = pr.school_id WHERE pr.id = %s;
+            """, (receipt_id,))
+            r = cur.fetchone()
+    if not r:
+        raise HTTPException(status_code=404, detail="Receipt not found.")
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Receipt {esc(r['receipt_number'])}</title>
+    <style>body{{background:#f1f5f9;margin:0;padding:24px;font-family:Arial,Helvetica,sans-serif}}
+    .bar{{max-width:520px;margin:0 auto 14px auto;display:flex;gap:10px;justify-content:space-between;align-items:center}}
+    .bar a,.bar button{{font-size:13px;font-weight:700;color:#334155;background:#fff;border:1px solid #cbd5e1;border-radius:10px;padding:8px 14px;text-decoration:none;cursor:pointer}}
+    @media print{{body{{background:#fff;padding:0}} .bar{{display:none}}}}</style></head>
+    <body>
+        <div class="bar"><a href="/superadmin/billing/receipts">← All receipts</a><button onclick="window.print()">🖨️ Print / Save as PDF</button></div>
+        {_receipt_inner_html(r)}
+    </body>
+    </html>
+    """
+
+
 @router.get("/superadmin/billing/mpesa-diagnostic", response_class=HTMLResponse)
 def superadmin_mpesa_diagnostic(request: Request):
     """Shows whether the RUNNING process actually sees each MPESA_*
@@ -1391,6 +1574,7 @@ def superadmin_mpesa_diagnostic(request: Request):
                 <thead><tr class="border-b-2"><th class="p-3 text-left">Variable</th><th class="p-3 text-left">Status</th><th class="p-3 text-left"></th></tr></thead>
                 <tbody>{rows}</tbody>
             </table>
+            <a href="/superadmin/billing/receipts" class="block text-center w-full bg-emerald-600 hover:bg-emerald-700 text-white text-xs py-2.5 rounded-xl font-semibold transition mb-2">🧾 View All Payment Receipts</a>
             <a href="/superadmin/billing/mpesa-transactions" class="block text-center w-full bg-indigo-600 hover:bg-indigo-700 text-white text-xs py-2.5 rounded-xl font-semibold transition">📋 View Recent Transactions</a>
         </div>
     """
