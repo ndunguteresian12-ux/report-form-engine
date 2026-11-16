@@ -26,7 +26,7 @@ except ImportError:
     PIL_AVAILABLE = False
 
 from fastapi import FastAPI, HTTPException, Request, Form, File, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse, Response, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from supabase import create_client
 from dotenv import load_dotenv
@@ -911,6 +911,11 @@ def bootstrap_database_schema():
                 -- admin-only until a school's admin deliberately extends
                 -- that ability to their own staff/teachers too.
                 ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS allow_staff_past_cycle_editing BOOLEAN NOT NULL DEFAULT FALSE;
+
+                -- Off by default: the Edit / Delete buttons in Bulk Marks
+                -- Entry stay hidden for everyone until the school's admin
+                -- deliberately switches them on.
+                ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS allow_marks_edit_delete BOOLEAN NOT NULL DEFAULT FALSE;
 
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -3355,6 +3360,7 @@ def fix_school_settings_columns(request: Request):
             cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS marks_entry_deadline TIMESTAMP;")
             cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS allow_staff_past_cycle_editing BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS is_ecde_single_stream BOOLEAN NOT NULL DEFAULT FALSE;")
+            cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS allow_marks_edit_delete BOOLEAN NOT NULL DEFAULT FALSE;")
             conn.commit()
 
     return RedirectResponse(url="/superadmin/db-diagnostic?table=school_settings", status_code=303)
@@ -7431,6 +7437,10 @@ def educators_bulk_entry_grid(
 
             cur.execute("SELECT active_term, active_year, active_cycle, marks_entry_deadline, allow_staff_past_cycle_editing FROM school_settings WHERE school_id = %s;", (school_id,))
             settings_row = cur.fetchone()
+            cur.execute("SELECT allow_marks_edit_delete FROM school_settings WHERE school_id = %s;", (school_id,))
+            _marks_tools_row = cur.fetchone()
+            marks_tools_on = bool(_marks_tools_row and _marks_tools_row['allow_marks_edit_delete'])
+            viewer_is_admin = bool(viewer and viewer.get('role') in MARKS_ADMIN_ROLES)
             active_term = (settings_row['active_term'] if settings_row else None) or 'Term 1'
             active_year = (settings_row['active_year'] if settings_row else None) or 2026
             # Locked to whatever the school's active assessment phase
@@ -7481,6 +7491,9 @@ def educators_bulk_entry_grid(
             # never blocks it either.
             deadline = settings_row['marks_entry_deadline'] if settings_row else None
             deadline_passed = bool(is_restricted_staff and deadline and kenya_now() > deadline)
+            # The Edit / Delete buttons exist only while an admin has the
+            # switch ON — and, for staff, only while entry is still open.
+            marks_tools_active = bool(marks_tools_on and not deadline_passed)
             
             # Fetch relevant subjects matched by the educational segment level
             cur.execute("SELECT id, name FROM learning_areas WHERE education_level = %s ORDER BY name ASC;", (education_level,))
@@ -7577,14 +7590,25 @@ def educators_bulk_entry_grid(
     for s in students:
         search_key = f"{full_student_name(s)} {s['admission_number']}".lower()
         if is_paper_mode:
+            _p_row = paper_map.get(s['id'])
+            has_mark = bool(_p_row and (_p_row['paper1_marks'] is not None or _p_row['paper2_marks'] is not None))
+        else:
+            has_mark = s['id'] in score_map
+        show_mark_tools = bool(marks_tools_active and has_mark)
+        lock_attr = " readonly data-locked='1'" if show_mark_tools else ""
+        actions_html = (
+            "<button type='button' data-mark-action='1' onclick='marksToolEdit(this)' title='Edit this mark' class='w-8 h-8 shrink-0 rounded-lg border bg-white hover:bg-indigo-50 text-sm'>✏️</button>"
+            "<button type='button' data-mark-action='1' onclick='marksToolDelete(this)' title='Delete this mark' class='w-8 h-8 shrink-0 rounded-lg border bg-white hover:bg-rose-50 text-sm'>🗑️</button>"
+        ) if show_mark_tools else ""
+        if is_paper_mode:
             p = paper_map.get(s['id'])
             p1_val = p['paper1_marks'] if (p and p['paper1_marks'] is not None) else ""
             p2_val = p['paper2_marks'] if (p and p['paper2_marks'] is not None) else ""
             input_html = f"""
             <div class="flex items-center gap-2 shrink-0">
-                <input type="number" inputmode="decimal" step="0.01" min="0" name="paper1_{s['id']}" value="{p1_val}" class="border-2 p-2 rounded-xl w-16 focus:border-emerald-600 font-bold text-center text-sm" placeholder="P1">
+                <input type="number" inputmode="decimal" step="0.01" min="0" name="paper1_{s['id']}" value="{p1_val}" class="border-2 p-2 rounded-xl w-16 focus:border-emerald-600 font-bold text-center text-sm" placeholder="P1"{lock_attr}>
                 <span class="text-slate-300 text-xs">/</span>
-                <input type="number" inputmode="decimal" step="0.01" min="0" name="paper2_{s['id']}" value="{p2_val}" class="border-2 p-2 rounded-xl w-16 focus:border-emerald-600 font-bold text-center text-sm" placeholder="P2">
+                <input type="number" inputmode="decimal" step="0.01" min="0" name="paper2_{s['id']}" value="{p2_val}" class="border-2 p-2 rounded-xl w-16 focus:border-emerald-600 font-bold text-center text-sm" placeholder="P2"{lock_attr}>
             </div>
             """
         else:
@@ -7600,17 +7624,46 @@ def educators_bulk_entry_grid(
                 existing_val = existing['raw_score']
             else:
                 existing_val = ""
-            input_html = f'<input type="number" inputmode="decimal" step="0.01" min="0" max="{shared_out_of:.0f}" name="score_{s["id"]}" value="{existing_val}" class="border-2 p-2.5 rounded-xl w-24 shrink-0 focus:border-emerald-600 font-bold text-center text-base" placeholder="-">'
+            input_html = f'<input type="number" inputmode="decimal" step="0.01" min="0" max="{shared_out_of:.0f}" name="score_{s["id"]}" value="{existing_val}" class="border-2 p-2.5 rounded-xl w-24 shrink-0 focus:border-emerald-600 font-bold text-center text-base" placeholder="-"{lock_attr}>'
 
         student_rows += f"""
-        <div class="student-row flex items-center justify-between gap-3 p-3.5 border-b last:border-0" data-search="{esc(search_key)}">
+        <div class="student-row flex items-center justify-between gap-3 p-3.5 border-b last:border-0" data-search="{esc(search_key)}" data-student-id="{s['id']}" data-name="{esc(full_student_name(s))}">
             <div class="min-w-0">
                 <p class="font-bold text-slate-800 text-sm truncate">{esc(full_student_name(s))}</p>
                 <p class="text-xs text-slate-400 font-mono">#{esc(s['admission_number'])}</p>
             </div>
-            {input_html}
+            <div class="flex items-center gap-1.5 shrink-0">{input_html}{actions_html}</div>
         </div>
         """
+
+    def _hid(name, value):
+        return f'<input type="hidden" name="{name}" value="{esc(str(value))}">'
+    _toggle_fields = "".join([
+        _hid("grade_name", grade_name), _hid("education_level", education_level), _hid("stream", stream),
+        _hid("learning_area_id", selected_area_id or ""),
+        _hid("edit_term", active_term if is_editing_past_cycle else ""),
+        _hid("edit_year", active_year if is_editing_past_cycle else ""),
+        _hid("edit_cycle", active_cycle if is_editing_past_cycle else ""),
+    ])
+    marks_tools_panel_html = ""
+    if viewer_is_admin:
+        marks_tools_panel_html = f'''<div class="bg-white p-4 rounded-2xl border shadow-xs flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div>
+                <p class="text-sm font-bold text-slate-800">✏️🗑️ Edit &amp; Delete marks — <span class="{'text-emerald-700' if marks_tools_on else 'text-slate-400'}">{'ON' if marks_tools_on else 'OFF'}</span></p>
+                <p class="text-[11px] text-slate-400 mt-0.5">{'Edit and Delete buttons now appear beside every saved mark, for you and for staff of this school. Switch OFF when you are done.' if marks_tools_on else 'Switch ON to show Edit and Delete buttons beside saved marks, so wrongly entered marks can be corrected or removed. Applies to this whole school.'}</p>
+            </div>
+            <form method="post" action="/staff/bulk-entry/{school_id}/marks-tools">
+                {_toggle_fields}
+                <input type="hidden" name="enable" value="{'0' if marks_tools_on else '1'}">
+                <button type="submit" class="{'bg-slate-700 hover:bg-slate-800' if marks_tools_on else 'bg-indigo-700 hover:bg-indigo-800'} text-white text-xs font-bold px-4 py-2.5 rounded-xl transition">{'Turn OFF' if marks_tools_on else 'Turn ON'}</button>
+            </form>
+        </div>'''
+    if marks_tools_active:
+        marks_tools_panel_html += '''<style>input[data-locked]{background:#f1f5f9;color:#64748b;}</style>
+        <div class="bg-indigo-50 border border-indigo-200 text-indigo-800 text-xs px-4 py-3 rounded-xl">
+            ✏️ Tap <b>✏️</b> beside a saved mark to change it (then press <b>Batch Commit</b>), or <b>🗑️</b> to delete it. Deleted marks disappear from reports and the deletion is recorded in the audit log.
+        </div>'''
+    marks_tools_js = MARKS_TOOLS_JS.replace("__SID__", str(school_id)) if marks_tools_active else ""
 
     commit_button_html = (
         "<div class='p-4 bg-slate-50 border-t'><button type='submit' disabled class='w-full bg-slate-300 text-slate-500 font-bold py-3.5 px-6 rounded-xl text-sm cursor-not-allowed'>🔒 Entry Closed — Deadline Passed</button></div>"
@@ -7694,7 +7747,9 @@ def educators_bulk_entry_grid(
             🔒 Marks entry for this Assessment Phase closed on {deadline.strftime('%d %b %Y, %H:%M')}. Ask your admin to enter or correct marks, or extend the deadline under School Settings.
         </div>''' if deadline_passed else ''}
 
-        <form action="/api/v1/scores/bulk-save/{school_id}" method="post" class="bg-white rounded-2xl border shadow-xs overflow-hidden" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){{b.disabled=true; b.textContent='Saving...'; b.style.opacity='0.7';}}">
+        {marks_tools_panel_html}
+
+        <form id="marksForm" action="/api/v1/scores/bulk-save/{school_id}" method="post" class="bg-white rounded-2xl border shadow-xs overflow-hidden" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){{b.disabled=true; b.textContent='Saving...'; b.style.opacity='0.7';}}">
             <input type="hidden" name="grade_name" value="{esc(grade_name)}">
             <input type="hidden" name="education_level" value="{esc(education_level)}">
             <input type="hidden" name="stream" value="{esc(stream)}">
@@ -7734,6 +7789,7 @@ def educators_bulk_entry_grid(
         </form>
 
         <script>
+            {marks_tools_js}
             function filterStudentRows(query) {{
                 const q = query.trim().toLowerCase();
                 const rows = document.querySelectorAll('#studentRowsContainer .student-row');
@@ -7749,6 +7805,177 @@ def educators_bulk_entry_grid(
     </body>
     </html>
     """
+
+
+# === MARKS TOOLS BEGIN ===
+MARKS_ADMIN_ROLES = ('admin', 'admin_pro', 'superadmin')
+
+MARKS_TOOLS_JS = """
+function marksToolUnlock(row) {
+    row.querySelectorAll('input[data-locked]').forEach(function(i) { i.removeAttribute('readonly'); i.removeAttribute('data-locked'); });
+}
+function marksToolEdit(btn) {
+    var row = btn.closest('.student-row');
+    marksToolUnlock(row);
+    var first = row.querySelector('input[type=number]');
+    if (first) { first.focus(); first.select(); }
+    btn.disabled = true; btn.style.opacity = '0.4';
+}
+async function marksToolDelete(btn) {
+    var row = btn.closest('.student-row');
+    var name = row.getAttribute('data-name') || 'this learner';
+    if (!confirm('Delete the saved mark for ' + name + '?\\n\\nIt will be removed from reports and cannot be undone. Other marks you have typed on this page are not affected.')) return;
+    var form = document.getElementById('marksForm');
+    var fd = new FormData();
+    ['grade_name', 'education_level', 'stream', 'learning_area_id', 'edit_term', 'edit_year', 'edit_cycle'].forEach(function(k) {
+        if (form.elements[k]) fd.append(k, form.elements[k].value);
+    });
+    fd.append('student_id', row.getAttribute('data-student-id'));
+    btn.disabled = true;
+    try {
+        var resp = await fetch('/staff/bulk-entry/__SID__/delete-mark', { method: 'POST', body: fd, credentials: 'same-origin' });
+        var data = await resp.json().catch(function() { return {}; });
+        if (!resp.ok || !data.ok) { alert(data.detail || 'Could not delete this mark. Please refresh and try again.'); btn.disabled = false; return; }
+        marksToolUnlock(row);
+        row.querySelectorAll('input[type=number]').forEach(function(i) { i.value = ''; });
+        row.querySelectorAll('[data-mark-action]').forEach(function(b) { b.remove(); });
+    } catch (e) {
+        alert('Network problem — nothing was deleted. Please try again.');
+        btn.disabled = false;
+    }
+}
+"""
+
+
+@app.post("/staff/bulk-entry/{school_id}/marks-tools")
+def bulk_entry_toggle_marks_tools(
+    school_id: int, request: Request,
+    enable: str = Form("0"), grade_name: str = Form(""), education_level: str = Form(""), stream: str = Form(""),
+    learning_area_id: str = Form(""), edit_term: str = Form(""), edit_year: str = Form(""), edit_cycle: str = Form(""),
+):
+    """Admin-only master switch for the Edit / Delete buttons. Off by default."""
+    auth_error = require_school_session(request, school_id)
+    if auth_error:
+        return auth_error
+    viewer = get_current_session_user(request)
+    if not viewer or viewer.get('role') not in MARKS_ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="Only a school admin can turn Edit & Delete marks on or off.")
+    turn_on = (enable == "1")
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE school_settings SET allow_marks_edit_delete = %s WHERE school_id = %s;", (turn_on, school_id))
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=400, detail="Please save your School Settings once before using this.")
+            log_audit_action(cur, request, school_id, "marks_edit_delete_toggled", "Edit & Delete marks switched " + ("ON" if turn_on else "OFF"))
+            conn.commit()
+    params = {"grade_name": grade_name, "education_level": education_level, "stream": stream,
+              "learning_area_id": learning_area_id, "edit_term": edit_term, "edit_year": edit_year, "edit_cycle": edit_cycle}
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v not in ("", None)})
+    return RedirectResponse(url=f"/staff/bulk-entry/{school_id}?{query}", status_code=303)
+
+
+@app.post("/staff/bulk-entry/{school_id}/delete-mark")
+def bulk_entry_delete_mark(
+    school_id: int, request: Request,
+    student_id: int = Form(...), learning_area_id: int = Form(...),
+    grade_name: str = Form(...), education_level: str = Form(...), stream: str = Form(...),
+    edit_term: str = Form(""), edit_year: str = Form(""), edit_cycle: str = Form(""),
+):
+    """Deletes ONE learner's mark for ONE subject in the phase being viewed.
+    Every rule below is enforced here on the server — hiding the button is
+    only cosmetic, since a request can always be crafted by hand."""
+    def refuse(message, status):
+        return JSONResponse({"ok": False, "detail": message}, status_code=status)
+
+    if require_school_session(request, school_id):
+        return refuse("Your session has expired. Please log in again.", 401)
+    viewer = get_current_session_user(request)
+    if not viewer:
+        return refuse("Your session has expired. Please log in again.", 401)
+    role = viewer.get('role')
+    is_staff = (role == 'staff')
+    if not is_staff and role not in MARKS_ADMIN_ROLES:
+        return refuse("You don't have permission to delete marks.", 403)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""SELECT active_term, active_year, marks_entry_deadline, allow_staff_past_cycle_editing, allow_marks_edit_delete
+                           FROM school_settings WHERE school_id = %s;""", (school_id,))
+            st = cur.fetchone()
+            if not st or not st['allow_marks_edit_delete']:
+                return refuse("Edit & Delete marks is switched off. Ask your admin to turn it on.", 403)
+
+            if is_staff:
+                allowed_class_keys = get_teacher_class_keys(cur, school_id, viewer['id'])
+                if not teacher_can_access_class(allowed_class_keys, grade_name, education_level, stream):
+                    return refuse("You aren't assigned to this class.", 403)
+                allowed_subject_ids = get_teacher_learning_area_ids(cur, school_id, viewer['id'], grade_name, education_level, stream)
+                if allowed_subject_ids is not None and learning_area_id not in allowed_subject_ids:
+                    return refuse("You aren't assigned to teach this subject for this class.", 403)
+                if st['marks_entry_deadline'] and kenya_now() > st['marks_entry_deadline']:
+                    return refuse("Marks entry for this phase has closed. Ask your admin to make the correction.", 403)
+
+            # Same target-phase rules as saving marks: always the level's
+            # active phase, unless a permitted user is deliberately working
+            # on a past phase.
+            term, year = st['active_term'] or 'Term 1', st['active_year'] or 2026
+            cycle_name = get_active_cycle_for_level(school_id, education_level)
+            can_edit_past = (not is_staff) or bool(st['allow_staff_past_cycle_editing'])
+            if can_edit_past and edit_term and edit_year and edit_cycle:
+                try:
+                    edit_year_int = int(edit_year)
+                except ValueError:
+                    edit_year_int = None
+                if edit_term in ("Term 1", "Term 2", "Term 3") and edit_year_int:
+                    cur.execute("SELECT 1 FROM school_custom_cycles WHERE school_id = %s AND cycle_name = %s;", (school_id, edit_cycle))
+                    if edit_cycle in ("Opener", "Midterm", "End Term") or cur.fetchone():
+                        term, year, cycle_name = edit_term, edit_year_int, edit_cycle
+
+            cur.execute("SELECT name FROM learning_areas WHERE id = %s AND education_level = %s;", (learning_area_id, education_level))
+            area = cur.fetchone()
+            if not area:
+                return refuse("That subject doesn't belong to this class level.", 400)
+
+            # The learner must be in THIS school AND in THIS class — stricter
+            # than the save route, so a crafted student_id can't reach marks
+            # outside the class the user is allowed to work on.
+            cur.execute("""
+                SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name
+                FROM students s JOIN classes c ON s.class_id = c.id
+                WHERE s.id = %s AND s.school_id = %s AND c.grade_name = %s AND s.stream = %s;
+            """, (student_id, school_id, grade_name, stream))
+            learner = cur.fetchone()
+            if not learner:
+                return refuse("That learner isn't in this class.", 404)
+
+            cur.execute("""
+                SELECT raw_score, entered_marks, entered_out_of FROM student_scores
+                WHERE student_id = %s AND learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;
+            """, (student_id, learning_area_id, cycle_name, term, year))
+            old = cur.fetchone()
+            cur.execute("""
+                SELECT paper1_marks, paper1_max, paper2_marks, paper2_max FROM paper_based_scores
+                WHERE student_id = %s AND learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;
+            """, (student_id, learning_area_id, cycle_name, term, year))
+            old_paper = cur.fetchone()
+            if not old and not old_paper:
+                return JSONResponse({"ok": True, "deleted": 0})
+
+            was = ""
+            if old_paper:
+                was = f"Paper 1 {old_paper['paper1_marks']}/{old_paper['paper1_max']}, Paper 2 {old_paper['paper2_marks']}/{old_paper['paper2_max']}"
+            elif old:
+                was = (f"{float(old['entered_marks']):g}/{float(old['entered_out_of']):g}" if old['entered_marks'] is not None and old['entered_out_of'] is not None
+                       else f"{float(old['raw_score']):g}%")
+            for table in ("student_scores", "paper_based_scores"):
+                cur.execute(f"DELETE FROM {table} WHERE student_id = %s AND learning_area_id = %s AND cycle_name = %s AND term = %s AND year = %s;",
+                            (student_id, learning_area_id, cycle_name, term, year))
+            log_audit_action(cur, request, school_id, "marks_deleted",
+                             f"Deleted mark — {full_student_name(learner)} (#{learner['admission_number']}), {area['name']}, "
+                             f"{cycle_name} {term} {year}; was {was}")
+            conn.commit()
+    return JSONResponse({"ok": True, "deleted": 1})
+# === MARKS TOOLS END ===
 
 
 def get_active_cycle_for_level(school_id: int, education_level: str) -> str:
