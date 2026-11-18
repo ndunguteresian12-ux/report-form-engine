@@ -25,6 +25,18 @@ Senior School stream's subject list actually comes from its combination
 (currently, those still show every subject tagged with the education
 level, same as any other level). Marks entry and report cards for
 Senior School are a separate, later phase entirely.
+
+CBC alignment (Ministry of Education circular, 8 August 2025): a Senior
+School learner takes 7 EXAMINABLE subjects — 4 compulsory (English,
+Kiswahili or Kenyan Sign Language for learners with hearing disabilities,
+Core or Essential Mathematics, Community Service Learning) plus 3
+electives, at least 2 of them from the learner's chosen pathway (STEM,
+Social Sciences, or Arts & Sports Science). Physical Education, ICT Skills
+and a Pastoral/Religious Programme of Instruction are taught to everyone
+but are NOT examined. Core Mathematics is for STEM learners, Essential
+Mathematics for the other two pathways. The checks added in this file are
+ADVISORY ONLY (they flag, never block or change what a school has already
+set up), so live schools' existing combinations keep working untouched.
 """
 
 import urllib.parse
@@ -102,6 +114,137 @@ STANDARD_KCSE_COMBINATIONS = [
 ]
 
 
+# Official Senior School subjects added to the pool (additive — existing
+# subjects are never renamed or removed, since live combinations, timetable
+# slots and marks point at them by id). These are the names on the
+# Ministry's published list that the original pool didn't have.
+CBC_OFFICIAL_ADDITIONS = [
+    'Music and Dance', 'Fine Arts', 'Sports and Recreation',
+    'Aviation', 'Electricity', 'Metalwork', 'Woodwork', 'Power Mechanics',
+    'Media Technology', 'Marine and Fisheries Technology',
+]
+
+CBC_ELECTIVES_REQUIRED = 3
+
+# Which CBC pathway each subject belongs to. Includes this platform's
+# older names (so existing combinations are still understood) — those are
+# marked in CBC_NON_OFFICIAL below so the advisory can point them out.
+SUBJECT_PATHWAY = {
+    # STEM
+    'Biology': 'STEM', 'Chemistry': 'STEM', 'Physics': 'STEM', 'General Science': 'STEM',
+    'Agriculture': 'STEM', 'Computer Studies': 'STEM', 'Home Science': 'STEM',
+    'Aviation': 'STEM', 'Building and Construction': 'STEM', 'Electricity': 'STEM',
+    'Metalwork': 'STEM', 'Power Mechanics': 'STEM', 'Woodwork': 'STEM',
+    'Media Technology': 'STEM', 'Marine and Fisheries Technology': 'STEM',
+    'Aviation Technology': 'STEM', 'Electrical Technology': 'STEM', 'Mechanical Technology': 'STEM',
+    'Woodwork / Metalwork': 'STEM', 'Drawing and Design': 'STEM',
+    # Social Sciences
+    'History and Citizenship': 'Social Sciences', 'Geography': 'Social Sciences',
+    'Christian Religious Education': 'Social Sciences', 'Islamic Religious Education': 'Social Sciences',
+    'Hindu Religious Education': 'Social Sciences', 'Business Studies': 'Social Sciences',
+    'Literature in English': 'Social Sciences', 'Fasihi ya Kiswahili': 'Social Sciences',
+    'Indigenous Languages': 'Social Sciences', 'Kenyan Sign Language': 'Social Sciences',
+    'Arabic': 'Social Sciences', 'French': 'Social Sciences', 'German': 'Social Sciences',
+    'Mandarin': 'Social Sciences', 'Economics': 'Social Sciences',
+    # Arts & Sports Science
+    'Music and Dance': 'Arts & Sports Science', 'Theatre and Film': 'Arts & Sports Science',
+    'Fine Arts': 'Arts & Sports Science', 'Sports and Recreation': 'Arts & Sports Science',
+    'Music': 'Arts & Sports Science', 'Fine Art': 'Arts & Sports Science', 'Art and Design': 'Arts & Sports Science',
+    'Sports and Recreation Science': 'Arts & Sports Science', 'Photography & Media Arts': 'Arts & Sports Science',
+}
+
+# Names this platform used before aligning with the Ministry's list. They
+# keep working exactly as before; the advisory just notes they aren't the
+# official name / aren't on the official list.
+CBC_NON_OFFICIAL = {
+    'Music', 'Fine Art', 'Art and Design', 'Sports and Recreation Science', 'Aviation Technology',
+    'Electrical Technology', 'Mechanical Technology', 'Woodwork / Metalwork', 'Drawing and Design',
+    'Economics', 'Photography & Media Arts', 'Advanced Mathematics',
+}
+
+
+def cbc_advisories(subject_rows):
+    """Plain-language notes on how one saved combination lines up with the
+    CBC Senior School structure. Purely informational — never blocks a save
+    and never edits anything. `subject_rows` are dicts with subject_name and
+    is_compulsory (as loaded for the combinations page)."""
+    notes = []
+    electives = [r['subject_name'] for r in subject_rows if not r['is_compulsory']]
+    compulsory = [r['subject_name'] for r in subject_rows if r['is_compulsory']]
+
+    if len(electives) != CBC_ELECTIVES_REQUIRED:
+        notes.append(f"Has {len(electives)} elective(s) — CBC learners take exactly {CBC_ELECTIVES_REQUIRED} electives (7 examinable subjects in all).")
+
+    counts = {}
+    for name in electives:
+        p = SUBJECT_PATHWAY.get(name)
+        if p:
+            counts[p] = counts.get(p, 0) + 1
+    if len(electives) == CBC_ELECTIVES_REQUIRED and counts and max(counts.values()) < 2:
+        notes.append("CBC requires at least 2 electives from the learner's chosen pathway.")
+
+    unofficial = sorted(n for n in electives + compulsory if n in CBC_NON_OFFICIAL)
+    if unofficial:
+        notes.append("Not on the Ministry's Senior School list (or not under its official name): " + ", ".join(unofficial) + ".")
+
+    math = [n for n in compulsory if n in MATHEMATICS_VARIANTS]
+    if len(math) > 1:
+        notes.append("More than one Mathematics variant is set (" + ", ".join(math) + ") — a learner takes one: Core (STEM) or Essential (other pathways).")
+    elif math and counts:
+        top = max(counts, key=counts.get)
+        if math[0] == 'Mathematics (Essential)' and counts.get('STEM', 0) >= 2:
+            notes.append("Mostly STEM electives — STEM learners take Core Mathematics.")
+        if math[0] == 'Mathematics (Core)' and top != 'STEM' and counts.get('STEM', 0) == 0:
+            notes.append("No STEM electives — non-STEM learners normally take Essential Mathematics (Core is allowed only where Junior School results support it).")
+    return notes
+
+
+def _drop_other_math_variants(cur, school_id, grade_name, stream, keep_variant_name):
+    """A combination has ONE Mathematics variant. Re-saving or re-importing
+    a combination with a different variant used to leave the old one behind
+    too (so it ended up with, say, both Core and Essential). This removes
+    only the OTHER variants for that exact grade + combination."""
+    others = [v for v in MATHEMATICS_VARIANTS if v != keep_variant_name]
+    cur.execute("""
+        DELETE FROM combination_subjects
+        WHERE school_id = %s AND grade_name = %s AND stream = %s
+          AND learning_area_id IN (SELECT id FROM learning_areas WHERE education_level = 'Senior School' AND name = ANY(%s));
+    """, (school_id, grade_name, stream, others))
+
+
+def carry_combinations_forward(cur, school_id):
+    """Called inside 'Advance All Classes' right after learners move up.
+    A Senior School learner keeps the SAME combination (stream) from Grade
+    10 through 12, but each grade has its own combination definition. If
+    the grade they just moved INTO has no definition for their combination,
+    copy the previous grade's subjects across so they don't suddenly show
+    'no subjects defined'. Only fills genuine gaps — never overwrites or
+    changes a definition that already exists. Returns rows added."""
+    added = 0
+    cur.execute("SAVEPOINT combo_carry_forward;")
+    try:
+        for from_grade, to_grade, to_class_id in (("Grade 10", "Grade 11", 13), ("Grade 11", "Grade 12", 14)):
+            cur.execute("""
+                INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
+                SELECT cs.school_id, %s, cs.stream, cs.learning_area_id, cs.is_compulsory
+                FROM combination_subjects cs
+                WHERE cs.school_id = %s AND cs.grade_name = %s
+                  AND cs.stream IN (SELECT DISTINCT s.stream FROM students s
+                                    WHERE s.school_id = %s AND s.class_id = %s AND s.stream IS NOT NULL AND s.stream != '')
+                  AND NOT EXISTS (SELECT 1 FROM combination_subjects t
+                                  WHERE t.school_id = cs.school_id AND t.grade_name = %s AND t.stream = cs.stream)
+                ON CONFLICT (school_id, grade_name, stream, learning_area_id) DO NOTHING;
+            """, (to_grade, school_id, from_grade, school_id, to_class_id, to_grade))
+            added += max(cur.rowcount or 0, 0)
+        cur.execute("RELEASE SAVEPOINT combo_carry_forward;")
+    except Exception:
+        # Convenience step only — it must never be able to break the advance.
+        cur.execute("ROLLBACK TO SAVEPOINT combo_carry_forward;")
+        cur.execute("RELEASE SAVEPOINT combo_carry_forward;")
+        return 0
+    return added
+
+
 def bootstrap_senior_school_schema():
     """Creates/upgrades everything this module owns: the classes
     (Grade 10-12), the Senior School subject pool, and the
@@ -146,6 +289,7 @@ def bootstrap_senior_school_schema():
                 'Woodwork / Metalwork', 'Home Science', 'Economics',
                 'Indigenous Languages', 'Photography & Media Arts',
             ]
+            subjects_payload += CBC_OFFICIAL_ADDITIONS
             for name in subjects_payload:
                 cur.execute("INSERT INTO learning_areas (education_level, name) VALUES ('Senior School', %s) ON CONFLICT (education_level, name) DO NOTHING;", (name,))
             conn.commit()
@@ -240,6 +384,8 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
 
     existing_html = ""
     for combo_name, subjects in combinations.items():
+        _notes = cbc_advisories(subjects)
+        advisory_html = ("<ul class='mt-2 space-y-1'>" + "".join(f"<li class='text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5'>⚠ {esc(n)}</li>" for n in _notes) + "</ul>") if _notes else "<p class='mt-2 text-[11px] text-emerald-700'>✓ Matches the CBC structure (4 compulsory + 3 electives)</p>"
         subject_chips = "".join(
             f"<span class='text-[11px] font-semibold px-2 py-1 rounded-full {'bg-indigo-100 text-indigo-700' if s['is_compulsory'] else 'bg-slate-100 text-slate-600'} mr-1 mb-1 inline-block'>{esc(s['subject_name'])}{' *' if s['is_compulsory'] else ''}</span>"
             for s in subjects
@@ -263,6 +409,7 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
                 </div>
             </div>
             <div class="mt-2">{subject_chips}</div>
+            {advisory_html}
         </div>
         """
 
@@ -299,6 +446,10 @@ def subject_combinations_view(school_id: int, request: Request, grade_name: str 
                     <div class="flex gap-2">{grade_tabs}</div>
                     <a href="/timetable/combinations/import/{school_id}" class="ml-auto text-xs font-bold text-indigo-700 hover:underline whitespace-nowrap">📤 Bulk Import from CSV</a>
                 </div>
+            </div>
+
+            <div class="bg-indigo-50 border border-indigo-200 text-indigo-900 text-xs rounded-2xl px-4 py-3 leading-relaxed">
+                <b>CBC Senior School structure.</b> Each learner takes <b>7 examinable subjects</b>: 4 compulsory (English, Kiswahili — or Kenyan Sign Language for learners with hearing disabilities — Core or Essential Mathematics, and Community Service Learning) plus <b>3 electives</b>, at least 2 from the learner's chosen pathway (STEM, Social Sciences, or Arts &amp; Sports Science). Core Mathematics is for STEM; Essential Mathematics for the other pathways. Physical Education, ICT Skills and the Pastoral/Religious Programme are taught to everyone but are not examined. Notes below are advisory — they never change what you've saved.
             </div>
 
             <div>
@@ -377,6 +528,7 @@ async def save_subject_combination(school_id: int, request: Request):
             )
             compulsory_ids = [r['id'] for r in cur.fetchall()]
 
+            _drop_other_math_variants(cur, school_id, grade_name, stream, math_variant)
             for lid in compulsory_ids:
                 cur.execute("""
                     INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
@@ -558,6 +710,7 @@ def import_standard_combinations(request: Request, school_id: int):
                 math_variant_id = subject_name_to_id.get(math_variant)
                 elective_ids = [subject_name_to_id[e] for e in electives if e in subject_name_to_id]
                 for grade_name in ["Grade 10", "Grade 11", "Grade 12"]:
+                    _drop_other_math_variants(cur, school_id, grade_name, stream, math_variant)
                     for lid in compulsory_ids + ([math_variant_id] if math_variant_id else []):
                         cur.execute("""
                             INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
@@ -572,7 +725,7 @@ def import_standard_combinations(request: Request, school_id: int):
                             ON CONFLICT (school_id, grade_name, stream, learning_area_id)
                             DO UPDATE SET is_compulsory = FALSE;
                         """, (school_id, grade_name, stream, eid))
-                    imported_count += 1
+                imported_count += 1   # one per combination (it is added to all 3 grades)
             conn.commit()
 
     return RedirectResponse(url=f"/timetable/combinations/import/{school_id}?imported={imported_count}", status_code=303)
@@ -642,7 +795,7 @@ async def combinations_import_save(school_id: int, request: Request, csv_file: U
                 if row_has_unknown_subject:
                     continue
 
-                parsed_rows.append((grade_name, stream, math_variant_id, elective_ids))
+                parsed_rows.append((grade_name, stream, math_variant_id, elective_ids, math_variant))
 
             if errors:
                 error_text = f"Found {len(errors)} problem(s) — nothing was imported. Fix these and try again:\n\n" + "\n".join(errors[:30])
@@ -650,7 +803,8 @@ async def combinations_import_save(school_id: int, request: Request, csv_file: U
                     error_text += f"\n... and {len(errors) - 30} more."
                 return RedirectResponse(url=f"/timetable/combinations/import/{school_id}?error={urllib.parse.quote(error_text)}", status_code=303)
 
-            for grade_name, stream, math_variant_id, elective_ids in parsed_rows:
+            for grade_name, stream, math_variant_id, elective_ids, math_variant_name in parsed_rows:
+                _drop_other_math_variants(cur, school_id, grade_name, stream, math_variant_name)
                 for lid in compulsory_ids + ([math_variant_id] if math_variant_id else []):
                     cur.execute("""
                         INSERT INTO combination_subjects (school_id, grade_name, stream, learning_area_id, is_compulsory)
