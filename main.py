@@ -917,6 +917,12 @@ def bootstrap_database_schema():
                 -- deliberately switches them on.
                 ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS allow_marks_edit_delete BOOLEAN NOT NULL DEFAULT FALSE;
 
+                -- One-time permission a SUPER ADMIN can grant so a school may
+                -- run "Advance All Classes" again before its yearly lock
+                -- expires. Cleared automatically the moment it is used.
+                ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS advance_authorised_at TIMESTAMP;
+                ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS advance_authorised_by_user_id INTEGER;
+
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
                     email VARCHAR(255) UNIQUE NOT NULL,
@@ -3361,6 +3367,8 @@ def fix_school_settings_columns(request: Request):
             cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS allow_staff_past_cycle_editing BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS is_ecde_single_stream BOOLEAN NOT NULL DEFAULT FALSE;")
             cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS allow_marks_edit_delete BOOLEAN NOT NULL DEFAULT FALSE;")
+            cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS advance_authorised_at TIMESTAMP;")
+            cur.execute("ALTER TABLE school_settings ADD COLUMN IF NOT EXISTS advance_authorised_by_user_id INTEGER;")
             conn.commit()
 
     return RedirectResponse(url="/superadmin/db-diagnostic?table=school_settings", status_code=303)
@@ -4441,7 +4449,7 @@ def superadmin_revert_admin_pro(user_id: int, request: Request):
 
 
 @app.get("/superadmin/school/{school_id}", response_class=HTMLResponse)
-def superadmin_school_detail(school_id: int, request: Request, undone: str = None):
+def superadmin_school_detail(school_id: int, request: Request, undone: str = None, authorised: str = None, revoked: str = None):
     """Per-school management page for Super Admin — staff contact details
     (with phone numbers, for reaching a teacher directly) and the ability
     to undo a school's most recent "Advance All Classes" run, in case it
@@ -4472,6 +4480,7 @@ def superadmin_school_detail(school_id: int, request: Request, undone: str = Non
                 ORDER BY performed_at DESC LIMIT 5;
             """, (school_id,))
             promotion_runs = cur.fetchall()
+            advance_status = get_class_advance_status(cur, school_id)
 
     admins = [u for u in all_users if u['role'] == 'admin']
     staff = [u for u in all_users if u['role'] == 'staff']
@@ -4524,6 +4533,25 @@ def superadmin_school_detail(school_id: int, request: Request, undone: str = Non
         </div>
         """
 
+    if advance_status["authorised"]:
+        advance_auth_html = f'''
+        <div class="bg-white rounded-2xl border border-emerald-200 shadow-xs p-5">
+            <h2 class="text-sm font-black text-emerald-700 mb-1">✅ Class advance authorised</h2>
+            <p class="text-xs text-slate-500 mb-3">This school may advance its classes once more. The permission expires on <b>{advance_status["authorised_until"].strftime("%d %b %Y, %H:%M")}</b> if unused, and is cleared as soon as they advance.</p>
+            <form action="/api/v1/superadmin/school/{school_id}/revoke-advance-authorisation" method="post"><button type="submit" class="w-full bg-slate-700 hover:bg-slate-800 text-white text-sm font-bold py-2.5 rounded-xl transition">Revoke Authorisation</button></form>
+        </div>'''
+    elif advance_status["locked"]:
+        advance_auth_html = f'''
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-xs p-5">
+            <h2 class="text-sm font-black text-slate-700 mb-1">🔒 Class advance locked</h2>
+            <p class="text-xs text-slate-500 mb-3">Last advanced {advance_status["last_run_at"].strftime("%d %b %Y")}. The school's button unlocks by itself on {advance_status["unlocks_at"].strftime("%d %b %Y")}. Authorise only if the school truly needs to advance again before then (if the earlier advance was a mistake, use <b>Undo</b> above instead — that unlocks it too).</p>
+            <form action="/api/v1/superadmin/school/{school_id}/authorise-advance" method="post" onsubmit="return confirm('Allow {esc(school["name"])} to advance ALL classes one more time? Every learner will move up another grade.');">
+                <button type="submit" class="w-full bg-amber-500 hover:bg-amber-600 text-white text-sm font-bold py-2.5 rounded-xl transition">Authorise One More Advance</button>
+            </form>
+        </div>'''
+    else:
+        advance_auth_html = ""
+
     return f"""
     <!DOCTYPE html>
     <html>
@@ -4537,8 +4565,12 @@ def superadmin_school_detail(school_id: int, request: Request, undone: str = Non
             </div>
 
             {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2.5 rounded-xl'>✅ Promotion undone successfully.</div>" if undone else ""}
+            {"<div class='bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2.5 rounded-xl'>✅ One more class advance authorised for this school.</div>" if authorised else ""}
+            {"<div class='bg-slate-50 border border-slate-200 text-slate-700 text-xs px-4 py-2.5 rounded-xl'>Authorisation revoked.</div>" if revoked else ""}
 
             {promotion_html}
+
+            {advance_auth_html}
 
             <div class="bg-white rounded-2xl border shadow-xs p-5">
                 <h2 class="text-sm font-black text-slate-800 mb-3">👤 Admin Contact</h2>
@@ -5447,6 +5479,7 @@ def graduated_students_archive(school_id: int, request: Request, year: str = Non
             <td class="p-3 text-sm font-bold text-slate-800">{_full_name(st)}</td>
             <td class="p-3 text-xs text-slate-500">{esc(st['last_grade']) if st.get('last_grade') else '—'}</td>
             <td class="p-3 text-xs text-slate-500">{st['graduated_at'].strftime('%d %b %Y') if st.get('graduated_at') else '—'}</td>
+            <td class="p-3 text-xs"><a href="/finance/student/{school_id}/{st['id']}" class="text-indigo-700 font-bold hover:underline">💰 Fees &amp; receipts</a></td>
         </tr>
     """ for st in selected_group)
 
@@ -5458,6 +5491,7 @@ def graduated_students_archive(school_id: int, request: Request, year: str = Non
         <div class="max-w-5xl mx-auto">
             <div class="flex items-center justify-between mb-6">
                 <h1 class="text-xl font-black text-slate-800">🎓 Graduated Students Archive</h1>
+                <a href="/finance/graduates/{school_id}" class="inline-block mt-2 text-xs font-bold text-indigo-700 hover:underline">💰 Graduates' finance — balances &amp; payments →</a>
                 <a href="/admin/dashboard/{school_id}" class="text-xs font-bold text-slate-500 hover:text-slate-800">← Back to Dashboard</a>
             </div>
             <div class="flex flex-wrap gap-2 mb-4">
@@ -5468,7 +5502,7 @@ def graduated_students_archive(school_id: int, request: Request, year: str = Non
                 <div class="overflow-x-auto">
                     <table class="w-full text-left">
                         <thead><tr class="bg-slate-50 text-[11px] uppercase text-slate-400 border-b">
-                            <th class="p-3">Adm No.</th><th class="p-3">Full Name</th><th class="p-3">Last Class</th><th class="p-3">Graduated On</th>
+                            <th class="p-3">Adm No.</th><th class="p-3">Full Name</th><th class="p-3">Last Class</th><th class="p-3">Graduated On</th><th class="p-3">Finance</th>
                         </tr></thead>
                         <tbody>{rows_html}</tbody>
                     </table>
@@ -8890,6 +8924,7 @@ def school_settings_page(school_id: int, request: Request):
             settings = cur.fetchone()
             cur.execute("SELECT id, cycle_name FROM school_custom_cycles WHERE school_id = %s ORDER BY cycle_name ASC;", (school_id,))
             custom_cycles = cur.fetchall()
+            advance_status = get_class_advance_status(cur, school_id)
 
             school_levels = get_education_levels_for_school(cur, school_id)
             cur.execute("SELECT education_level, active_cycle FROM school_level_cycles WHERE school_id = %s;", (school_id,))
@@ -8897,6 +8932,22 @@ def school_settings_page(school_id: int, request: Request):
 
     st = settings or {'active_term': 'Term 1', 'active_cycle': 'End Term', 'opening_date': '', 'closing_date': '', 'is_single_stream': False}
     is_single_stream = st.get('is_single_stream', False)
+
+    if advance_status["can_advance"]:
+        _auth_note = (f'<p class="text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 mb-3">✅ A super admin has authorised one more advance for your school (valid until {advance_status["authorised_until"].strftime("%d %b %Y")}).</p>'
+                      if advance_status["locked"] and advance_status["authorised"] else "")
+        advance_block_html = f'''{_auth_note}<form action="/api/v1/school/promote-classes/{school_id}" method="post"
+                      onsubmit="if (!confirm('CRITICAL WARNING: Advance ALL classes up one grade level?\\n\\n- Every learner moves up one grade, keeping all their records and fee balances.\\n- Grade 9 moves into Graduated status (still viewable, including finances).\\n- This can only be done ONCE a year.')) return false; this.querySelector('button').disabled = true; this.querySelector('button').textContent = 'Advancing… please wait'; return true;">
+                    <button type="submit" class="w-full bg-amber-50 border border-amber-200/80 text-amber-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-amber-100/70 transition cursor-pointer">
+                        🔄 Advance All Classes 1 Year
+                    </button>
+                </form>'''
+    else:
+        advance_block_html = f'''<div class="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 space-y-1">
+                    <p class="text-xs font-bold text-slate-700">🔒 Classes already advanced on {advance_status["last_run_at"].strftime("%d %b %Y")}</p>
+                    <p class="text-[11px] text-slate-500">To protect your records, classes can only be advanced once a year. This button unlocks automatically from <b>{advance_status["unlocks_at"].strftime("%d %b %Y")}</b>.</p>
+                    <p class="text-[11px] text-slate-400">Advanced by mistake, or need an exception? Contact Elimu Hub support — a super admin can authorise one more advance.</p>
+                </div>'''
 
     return f"""
     <!DOCTYPE html>
@@ -9034,13 +9085,8 @@ def school_settings_page(school_id: int, request: Request):
 
             <div class="bg-white rounded-2xl border border-amber-200/80 shadow-xs p-6">
                 <h2 class="text-sm font-black text-amber-700 mb-1">🔄 Advance All Classes</h2>
-                <p class="text-xs text-slate-400 mb-3">Promotes every active student up one grade level. Grade 9 cohorts move into Graduated status. This also automatically carries forward every student's fee balance from the current term into the next, before anyone's class changes.</p>
-                <form action="/api/v1/school/promote-classes/{school_id}" method="post"
-                      onsubmit="return confirm('CRITICAL WARNING: Are you sure you want to promote all active student cohorts up 1 Grade Level? Grade 9 cohorts will safely move into Graduated Status.');">
-                    <button type="submit" class="w-full bg-amber-50 border border-amber-200/80 text-amber-700 text-xs py-2.5 rounded-xl font-semibold hover:bg-amber-100/70 transition cursor-pointer">
-                        🔄 Advance All Classes 1 Year
-                    </button>
-                </form>
+                <p class="text-xs text-slate-400 mb-3">Promotes every active student up one grade level. Grade 9 cohorts move into Graduated status — their records and fee balances stay accessible to admins. Classes can only be advanced once a year. This also automatically carries forward every student's fee balance from the current term into the next, before anyone's class changes.</p>
+                {advance_block_html}
                 <p class="text-[10px] text-slate-400 mt-2">Note: this does NOT include PP1/PP2 (ECDE) learners — promote them separately below, since moving into Grade 1 needs a stream picked for each learner.</p>
             </div>
 
@@ -10671,6 +10717,76 @@ async def promote_pp2_to_grade1(school_id: int, request: Request):
     return RedirectResponse(url=f"/admin/promote-ecde/{school_id}?promoted=1", status_code=303)
 
 
+# === CLASS ADVANCE GUARD BEGIN ===
+# "Advance All Classes" moves every learner in a school, so it is
+# deliberately hard to repeat. Once a (non-undone) advance exists, the
+# school is locked for ADVANCE_LOCK_DAYS — about ten months, which cleanly
+# separates a double-click / second attempt (minutes to weeks later) from the
+# genuine yearly advance (about twelve months later). Only a super admin can
+# lift the lock early, one time, via the school's super admin page.
+ADVANCE_LOCK_DAYS = 300
+ADVANCE_AUTH_VALID_DAYS = 7
+
+
+def _row_to_dict(cur, row):
+    """Same code works whether the cursor returns tuples or dicts."""
+    if row is None or isinstance(row, dict):
+        return row
+    return dict(zip([d[0] for d in cur.description], row))
+
+
+def get_class_advance_status(cur, school_id: int) -> dict:
+    """Is this school currently allowed to advance its classes? All time
+    comparisons use the database clock (NOW()) so they can't be skewed by
+    the web server's clock or timezone."""
+    cur.execute("""
+        SELECT id, performed_at,
+               performed_at + make_interval(days => %s) AS unlocks_at,
+               (NOW() < performed_at + make_interval(days => %s)) AS locked
+        FROM class_promotion_history
+        WHERE school_id = %s AND reverted_at IS NULL
+        ORDER BY performed_at DESC, id DESC LIMIT 1;
+    """, (ADVANCE_LOCK_DAYS, ADVANCE_LOCK_DAYS, school_id))
+    last = _row_to_dict(cur, cur.fetchone())
+    cur.execute("""
+        SELECT advance_authorised_at,
+               advance_authorised_at + make_interval(days => %s) AS auth_until,
+               (advance_authorised_at IS NOT NULL AND NOW() < advance_authorised_at + make_interval(days => %s)) AS auth_valid
+        FROM school_settings WHERE school_id = %s;
+    """, (ADVANCE_AUTH_VALID_DAYS, ADVANCE_AUTH_VALID_DAYS, school_id))
+    auth = _row_to_dict(cur, cur.fetchone()) or {}
+    locked = bool(last and last['locked'])
+    authorised = bool(auth.get('auth_valid'))
+    return {
+        "last_run_at": last['performed_at'] if last else None,
+        "unlocks_at": last['unlocks_at'] if last else None,
+        "locked": locked,
+        "authorised": authorised,
+        "authorised_until": auth.get('auth_until') if authorised else None,
+        "can_advance": (not locked) or authorised,
+    }
+
+
+def _advance_locked_page(school_id: int, status: dict) -> HTMLResponse:
+    last = status['last_run_at'].strftime('%d %b %Y') if status.get('last_run_at') else 'earlier'
+    unlock = status['unlocks_at'].strftime('%d %b %Y') if status.get('unlocks_at') else 'later'
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Classes already advanced</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
+        <div class="max-w-md mx-auto bg-white rounded-2xl border border-amber-200 shadow-xs p-6 space-y-3">
+            <h1 class="text-lg font-black text-amber-700">🔒 Classes were already advanced</h1>
+            <p class="text-sm text-slate-600">Your classes were advanced on <b>{last}</b>. Nothing was changed just now — no learner was moved and no fee balance was touched.</p>
+            <p class="text-xs text-slate-500">To protect your records, classes can only be advanced <b>once a year</b>. The button unlocks automatically from <b>{unlock}</b>.</p>
+            <p class="text-xs text-slate-500">If the earlier advance was a mistake, or you have a genuine reason to advance again, please contact Elimu Hub support — only a super admin can authorise another advance.</p>
+            <a href="/admin/school-settings/{school_id}" class="block text-center bg-slate-800 text-white text-xs font-bold py-2.5 rounded-xl">← Back to School Settings</a>
+        </div>
+    </body>
+    </html>
+    """, status_code=409)
+
+
 @app.post("/api/v1/school/promote-classes/{school_id}")
 def promote_school_classes(school_id: int, request: Request):
     auth_error = require_admin_session(request, school_id)
@@ -10678,124 +10794,152 @@ def promote_school_classes(school_id: int, request: Request):
         return auth_error
 
     # Map current class_id to the next consecutive class_id
-    # 1: Grade 1 -> 2: Grade 2, ..., 9: Grade 9
-    promotion_map = {
-        1: 2,
-        2: 3,
-        3: 4,
-        4: 5,
-        5: 6,
-        6: 7,
-        7: 8,
-        8: 9
-    }
-    
+    # 1: Grade 1 -> 2: Grade 2, ..., 8: Grade 8 -> 9: Grade 9
+    promotion_map = {1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8, 8: 9}
+    audit_lines = []
+
     with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            # Carry forward every student's real over/under-payment from
-            # the CURRENT term into the next one, BEFORE promotion changes
-            # anyone's class — fee amounts are looked up via each
-            # student's current class, so this must run first, using
-            # everyone's still-correct (pre-promotion) grade, or it would
-            # use each student's new (already-promoted) grade's fee amount
-            # instead of the grade they were actually billed at.
-            cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
-            settings_row = cur.fetchone()
-            old_term, old_year, next_term, next_year = None, None, None, None
-            if settings_row:
-                old_term, old_year = settings_row[0], settings_row[1]
-                from finance_routes import run_carry_forward_balances, _next_term_year
-                next_term, next_year = _next_term_year(old_term, old_year)
-                recorded_by = request.cookies.get("session_user_id")
-                carried_count = run_carry_forward_balances(
-                    cur, school_id, old_term, old_year, next_term, next_year,
-                    recorded_by, note_prefix="Carried forward (class promotion)"
-                )
-                conn.commit()
-                log_audit_action(cur, request, school_id, "fee_balances_carried_forward", f"{old_term} {old_year} -> {next_term} {next_year} (promotion): {carried_count} balance(s) carried")
-                conn.commit()
+        try:
+            with conn.cursor() as cur:
+                # Everything below happens in ONE transaction, behind a
+                # per-school lock. Two clicks (a double-click, two browser
+                # tabs, two admins) can't both run: the second waits here,
+                # then sees the first one's record and is turned away.
+                cur.execute("SELECT pg_advisory_xact_lock(%s, %s);", (4217, school_id))
+                status = get_class_advance_status(cur, school_id)
+                if not status["can_advance"]:
+                    conn.rollback()
+                    return _advance_locked_page(school_id, status)
+                used_authorisation = bool(status["locked"] and status["authorised"])
 
-                # Roll the school's active term/year forward to match, in
-                # the SAME transaction as the carry-forward above. Without
-                # this, a Settings save done afterward would see the term
-                # as still "changing" from old -> new and recompute the
-                # exact same carry-forward a second time — but by then
-                # every student's class already reflects their NEW
-                # (promoted) grade, so that second run would silently
-                # overwrite the correct value just written above with a
-                # wrong one. Keeping both updates together in one place
-                # closes that gap structurally rather than relying on
-                # anyone clicking things in a particular order.
-                cur.execute("UPDATE school_settings SET active_term = %s, active_year = %s WHERE school_id = %s;", (next_term, next_year, school_id))
+                # Carry forward every student's real over/under-payment from
+                # the CURRENT term into the next one, BEFORE promotion changes
+                # anyone's class — fee amounts are looked up via each
+                # student's current class, so this must run first. Grade 9
+                # learners are still in Grade 9 at this point, so their
+                # balances are carried forward too (graduates keep owing /
+                # being credited — it travels with them).
+                cur.execute("SELECT active_term, active_year FROM school_settings WHERE school_id = %s;", (school_id,))
+                settings_row = cur.fetchone()
+                old_term, old_year, next_term, next_year = None, None, None, None
+                if settings_row:
+                    old_term, old_year = settings_row[0], settings_row[1]
+                    from finance_routes import run_carry_forward_balances, _next_term_year
+                    next_term, next_year = _next_term_year(old_term, old_year)
+                    recorded_by = request.cookies.get("session_user_id")
+                    carried_count = run_carry_forward_balances(
+                        cur, school_id, old_term, old_year, next_term, next_year,
+                        recorded_by, note_prefix="Carried forward (class promotion)"
+                    )
+                    audit_lines.append(("fee_balances_carried_forward", f"{old_term} {old_year} -> {next_term} {next_year} (promotion): {carried_count} balance(s) carried"))
 
-                # Same automatic scheme-of-work rollover as a manual
-                # Settings save triggers — see roll_forward_scheme_copies's
-                # docstring. Safe to call from both places (confirmed
-                # idempotent): whichever one runs first for a given
-                # school does the actual work, the other is a no-op.
-                if old_year != next_year:
-                    roll_forward_scheme_copies(cur, school_id, old_year, next_year)
+                    # Roll the school's active term/year forward in the SAME
+                    # transaction, so a later Settings save can't recompute
+                    # the carry-forward against already-promoted classes.
+                    cur.execute("UPDATE school_settings SET active_term = %s, active_year = %s WHERE school_id = %s;", (next_term, next_year, school_id))
+                    if old_year != next_year:
+                        roll_forward_scheme_copies(cur, school_id, old_year, next_year)
 
-                conn.commit()
-
-            # --- Snapshot every student about to be affected, BEFORE any
-            # changes are made. This is what lets a super admin precisely
-            # undo this exact run later if a school triggers it by
-            # mistake — restoring exactly the students this run actually
-            # touched, rather than blindly shifting everyone back a grade
-            # (which would incorrectly demote students who were already
-            # in that grade before this promotion, not moved there by
-            # it). Note: this snapshot does NOT capture the fee carry-
-            # forward above — undoing a promotion restores class
-            # assignments and the term/year setting, but any fee balances
-            # already carried forward need a separate manual check. ---
-            cur.execute("""
-                SELECT id, class_id, status FROM students
-                WHERE school_id = %s AND class_id BETWEEN 1 AND 9
-                  AND (status IS NULL OR status != 'GRADUATED');
-            """, (school_id,))
-            affected_students = cur.fetchall()
-
-            performed_by = request.cookies.get("session_user_id")
-            cur.execute("""
-                INSERT INTO class_promotion_history (school_id, performed_by_user_id, old_active_term, old_active_year, new_active_term, new_active_year)
-                VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
-            """, (school_id, performed_by, old_term, old_year, next_term, next_year))
-            history_id = cur.fetchone()[0]
-
-            for student_id, current_class_id, current_status in affected_students:
-                if current_class_id == 9:
-                    new_class_id, new_status = None, 'GRADUATED'
-                else:
-                    new_class_id, new_status = promotion_map.get(current_class_id), current_status
+                # Snapshot every student about to be affected, BEFORE any
+                # change — this is what lets a super admin precisely undo
+                # this exact run later (see undo_last_promotion).
                 cur.execute("""
-                    INSERT INTO class_promotion_history_students (history_id, student_id, old_class_id, old_status, new_class_id, new_status)
-                    VALUES (%s, %s, %s, %s, %s, %s);
-                """, (history_id, student_id, current_class_id, current_status, new_class_id, new_status))
-            conn.commit()
-            log_audit_action(cur, request, school_id, "classes_advanced", f"{len(affected_students)} student(s) advanced — history id {history_id}, reversible by super admin")
-            conn.commit()
-
-            # Step 1: Safely graduate Grade 9 out of the active pool
-            cur.execute("""
-                UPDATE students 
-                SET class_id = NULL, status = 'GRADUATED' 
-                WHERE school_id = %s AND class_id = 9;
-            """, (school_id,))
-            
-            # Step 2: Update remaining cohorts starting from the top down
-            for current_class, next_class in sorted(promotion_map.items(), reverse=True):
-                cur.execute("""
-                    UPDATE students 
-                    SET class_id = %s 
-                    WHERE school_id = %s AND class_id = %s 
+                    SELECT id, class_id, status FROM students
+                    WHERE school_id = %s AND class_id BETWEEN 1 AND 9
                       AND (status IS NULL OR status != 'GRADUATED');
-                """, (next_class, school_id, current_class))
-                
+                """, (school_id,))
+                affected_students = cur.fetchall()
+
+                performed_by = request.cookies.get("session_user_id")
+                cur.execute("""
+                    INSERT INTO class_promotion_history (school_id, performed_by_user_id, old_active_term, old_active_year, new_active_term, new_active_year)
+                    VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
+                """, (school_id, performed_by, old_term, old_year, next_term, next_year))
+                history_id = cur.fetchone()[0]
+
+                for student_id, current_class_id, current_status in affected_students:
+                    if current_class_id == 9:
+                        new_class_id, new_status = None, 'GRADUATED'
+                    else:
+                        new_class_id, new_status = promotion_map.get(current_class_id), current_status
+                    cur.execute("""
+                        INSERT INTO class_promotion_history_students (history_id, student_id, old_class_id, old_status, new_class_id, new_status)
+                        VALUES (%s, %s, %s, %s, %s, %s);
+                    """, (history_id, student_id, current_class_id, current_status, new_class_id, new_status))
+
+                # Step 1: Grade 9 leaves the active pool as GRADUATED. Their
+                # records, marks and fee history all stay on file, tied to
+                # the same student id.
+                cur.execute("""
+                    UPDATE students SET class_id = NULL, status = 'GRADUATED'
+                    WHERE school_id = %s AND class_id = 9 AND (status IS NULL OR status != 'GRADUATED');
+                """, (school_id,))
+
+                # Step 2: everyone else moves up one grade, top down so no
+                # learner can be moved twice.
+                for current_class, next_class in sorted(promotion_map.items(), reverse=True):
+                    cur.execute("""
+                        UPDATE students SET class_id = %s
+                        WHERE school_id = %s AND class_id = %s AND (status IS NULL OR status != 'GRADUATED');
+                    """, (next_class, school_id, current_class))
+
+                # Any super admin authorisation is single-use: spent now.
+                cur.execute("UPDATE school_settings SET advance_authorised_at = NULL, advance_authorised_by_user_id = NULL WHERE school_id = %s;", (school_id,))
+
+                # ONE commit for the whole advance. If anything above fails,
+                # nothing is saved — the school is never left half-advanced.
+                conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        # Audit entries are written after the advance is safely committed,
+        # so an audit hiccup can never undo or block the advance itself.
+        audit_lines.append(("classes_advanced", f"{len(affected_students)} student(s) advanced — history id {history_id}, reversible by super admin"
+                            + (" — used a one-time super admin authorisation" if used_authorisation else "")))
+        with conn.cursor() as cur:
+            for action, detail in audit_lines:
+                log_audit_action(cur, request, school_id, action, detail)
             conn.commit()
-            
+
     # Redirect cleanly back to the administrative control panel
     return RedirectResponse(url=f"/admin/dashboard/{school_id}", status_code=303)
+
+
+@app.post("/api/v1/superadmin/school/{school_id}/authorise-advance")
+def superadmin_authorise_advance(school_id: int, request: Request):
+    """Super admin lifts a school's yearly lock ONE time. The permission
+    expires on its own after ADVANCE_AUTH_VALID_DAYS if it isn't used, and
+    is cleared the moment an advance runs."""
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    viewer = get_current_session_user(request)
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE school_settings SET advance_authorised_at = NOW(), advance_authorised_by_user_id = %s WHERE school_id = %s;",
+                        (viewer['id'] if viewer else None, school_id))
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=400, detail="This school has no settings saved yet, so there is nothing to authorise.")
+            conn.commit()
+            log_audit_action(cur, request, school_id, "class_advance_authorised", f"Super admin authorised ONE more class advance (valid {ADVANCE_AUTH_VALID_DAYS} days)")
+            conn.commit()
+    return RedirectResponse(url=f"/superadmin/school/{school_id}?authorised=1", status_code=303)
+
+
+@app.post("/api/v1/superadmin/school/{school_id}/revoke-advance-authorisation")
+def superadmin_revoke_advance_authorisation(school_id: int, request: Request):
+    auth_error = require_superadmin_session(request)
+    if auth_error:
+        return auth_error
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE school_settings SET advance_authorised_at = NULL, advance_authorised_by_user_id = NULL WHERE school_id = %s;", (school_id,))
+            conn.commit()
+            log_audit_action(cur, request, school_id, "class_advance_authorisation_revoked", "Super admin revoked the class-advance authorisation")
+            conn.commit()
+    return RedirectResponse(url=f"/superadmin/school/{school_id}?revoked=1", status_code=303)
+# === CLASS ADVANCE GUARD END ===
 
 
 # ============================================================

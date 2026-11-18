@@ -296,6 +296,90 @@ def _compute_balance_after(cur, school_id, student_id, grade_name, category_id, 
     return fee_amount + opening_amount - total_paid
 
 
+# ---------------------------------------------------------------------
+# Graduates and past terms.
+#
+# When classes are advanced, Grade 9 learners become GRADUATED and lose
+# their class_id, and everyone else moves up a grade. Two things must stay
+# true for finance anyway:
+#   1. A graduate's fee statement, receipts and payments stay reachable to
+#      admins forever (so these helpers LEFT JOIN classes instead of
+#      requiring a current class).
+#   2. A past term is priced at the grade the learner was ACTUALLY in during
+#      that term, not whatever grade they were promoted into afterwards.
+#      The "Advance All Classes" history already records, per learner, the
+#      class they were in up to the end of each advanced term, so we read
+#      the answer from there.
+# ---------------------------------------------------------------------
+_TERM_ORDER = {"Term 1": 1, "Term 2": 2, "Term 3": 3}
+
+
+def _period_key(term, year):
+    try:
+        y = int(year)
+    except (TypeError, ValueError):
+        y = 0
+    return (y, _TERM_ORDER.get(term, 0))
+
+
+def _fetch_dicts(cur):
+    rows = cur.fetchall()
+    if rows and not isinstance(rows[0], dict):
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in rows]
+    return rows
+
+
+def _get_student_with_grade(cur, school_id, student_id):
+    """The student plus a grade_name that also works for graduates (their
+    last class, taken from the advance history) and an is_graduated flag.
+    Works with plain and dict cursors. Returns None if not in this school."""
+    cur.execute("""
+        SELECT s.*, COALESCE(c.grade_name, lc.grade_name) AS grade_name,
+               COALESCE(s.status = 'GRADUATED', FALSE) AS is_graduated
+        FROM students s
+        LEFT JOIN classes c ON s.class_id = c.id
+        LEFT JOIN LATERAL (
+            SELECT cl.grade_name
+            FROM class_promotion_history_students hs
+            JOIN class_promotion_history h ON h.id = hs.history_id AND h.reverted_at IS NULL
+            LEFT JOIN classes cl ON cl.id = hs.old_class_id
+            WHERE hs.student_id = s.id AND hs.new_status = 'GRADUATED'
+            ORDER BY h.performed_at DESC LIMIT 1
+        ) lc ON s.class_id IS NULL
+        WHERE s.id = %s AND s.school_id = %s;
+    """, (student_id, school_id))
+    rows = _fetch_dicts(cur)
+    return rows[0] if rows else None
+
+
+def _resolve_grade_for_period(cur, school_id, student_id, current_grade, is_graduated, term, year):
+    """Returns (grade_name, billable) for one learner in one term/year.
+
+    An advance run records, for every learner it moved, the class they were
+    in up to the end of that run's old term/year. The earliest run whose old
+    term is on/after the requested term therefore tells us the class during
+    the requested term. If no run covers it, the learner is still in their
+    current class — unless they have graduated, in which case nothing is
+    billed after graduation (only brought-forward balances and payments
+    apply)."""
+    cur.execute("""
+        SELECT h.old_active_term, h.old_active_year, h.performed_at, cl.grade_name
+        FROM class_promotion_history_students hs
+        JOIN class_promotion_history h ON h.id = hs.history_id AND h.reverted_at IS NULL
+        LEFT JOIN classes cl ON cl.id = hs.old_class_id
+        WHERE hs.student_id = %s AND h.school_id = %s AND h.old_active_year IS NOT NULL;
+    """, (student_id, school_id))
+    runs = sorted(_fetch_dicts(cur), key=lambda r: (_period_key(r['old_active_term'], r['old_active_year']), r['performed_at']))
+    wanted = _period_key(term, year)
+    for r in runs:
+        if wanted <= _period_key(r['old_active_term'], r['old_active_year']):
+            return (r['grade_name'], True)
+    if is_graduated:
+        return (None, False)
+    return (current_grade, True)
+
+
 def _get_school_and_settings(cur, school_id):
     cur.execute("SELECT * FROM schools WHERE id = %s;", (school_id,))
     school = cur.fetchone()
@@ -547,6 +631,7 @@ def finance_dashboard(school_id: int, request: Request, term: str = None, year: 
             <div class="flex items-center gap-2 flex-wrap">
                 <a href="/finance/categories/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">🏷️ Fee Categories</a>
                 <a href="/finance/expenditures/{school_id}?term={urllib.parse.quote(term)}&year={year}" class="bg-white hover:bg-slate-50 text-rose-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">💸 Expenditure</a>
+                <a href="/finance/graduates/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">🎓 Graduates' Finance</a>
                 <a href="/finance/import/{school_id}" class="bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 px-4 py-2 rounded-xl text-xs font-bold transition">📥 Import History</a>
                 <a href="/finance/carry-forward/{school_id}" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 px-4 py-2 rounded-xl text-xs font-bold transition">🔁 Carry Forward Balances</a>
                 <a href="{get_dashboard_url(request, school_id)}" class="bg-slate-800 hover:bg-slate-900 text-white px-4 py-2 rounded-xl text-xs font-bold transition">← Back to Dashboard</a>
@@ -652,9 +737,9 @@ def carry_forward_view(school_id: int, request: Request, done: str = None):
     """
 
 
-@router.post("/api/v1/finance/carry-forward/{school_id}")
 def run_carry_forward_balances(cur, school_id: int, from_term: str, from_year: int, to_term: str, to_year: int, recorded_by=None, note_prefix: str = "Carried forward"):
-    """For every active student and every fee category, computes the
+    """For every student (graduates included — what they owe or are
+    owed must keep travelling with them) and every fee category, computes the
     student's real closing balance for the From term (fee amount + old
     opening balance - amount paid) and writes that as their opening
     balance for the To term — positive if they underpaid (they now owe
@@ -689,9 +774,9 @@ def run_carry_forward_balances(cur, school_id: int, from_term: str, from_year: i
                    COALESCE((SELECT amount FROM fee_opening_balances fob WHERE fob.student_id = s.id AND fob.fee_category_id = %s AND fob.term = %s AND fob.year = %s), 0) AS old_opening,
                    COALESCE((SELECT SUM(fp.amount) FROM fee_payments fp WHERE fp.student_id = s.id AND fp.fee_category_id = %s AND fp.term = %s AND fp.year = %s), 0) AS paid
             FROM students s
-            JOIN classes c ON s.class_id = c.id
+            LEFT JOIN classes c ON s.class_id = c.id
             LEFT JOIN fee_structures fs ON fs.school_id = s.school_id AND fs.fee_category_id = %s AND fs.grade_name = c.grade_name AND fs.term = %s AND fs.year = %s
-            WHERE s.school_id = %s AND (s.status IS NULL OR s.status != 'GRADUATED');
+            WHERE s.school_id = %s;
         """, (cat_id, from_term, from_year, cat_id, from_term, from_year, cat_id, from_term, from_year, school_id))
         rows = cur.fetchall()
 
@@ -768,6 +853,97 @@ async def carry_forward_balances(school_id: int, request: Request, from_term: st
 # ============================================================
 
 EXPENDITURE_CATEGORIES = ["Salaries & Wages", "Utilities", "Learning Materials", "Maintenance & Repairs", "Transport", "Food & Catering", "Administration", "Other"]
+
+
+@router.get("/finance/graduates/{school_id}", response_class=HTMLResponse)
+def graduates_finance_view(school_id: int, request: Request, term: str = None, year: int = None):
+    """Every graduated learner's fee position, for any term, any time.
+    Graduating never hides money: what a graduate owes or is owed keeps
+    travelling with them, and they stay reachable here."""
+    auth_error = require_admin_session(request, school_id)
+    if auth_error:
+        return auth_error
+    if not FINANCE_MODULE_ENABLED:
+        return _coming_soon_page(school_id, request)
+
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            school, active_term, active_year = _get_school_and_settings(cur, school_id)
+            term = term or active_term
+            year = year or active_year
+            cur.execute("""
+                SELECT s.id, s.admission_number, s.first_name, s.middle_name, s.last_name,
+                       lc.grade_name AS last_grade, lc.graduated_at,
+                       COALESCE((SELECT SUM(fob.amount) FROM fee_opening_balances fob WHERE fob.student_id = s.id AND fob.term = %s AND fob.year = %s), 0) AS opening,
+                       COALESCE((SELECT SUM(fp.amount) FROM fee_payments fp WHERE fp.student_id = s.id AND fp.term = %s AND fp.year = %s), 0) AS paid
+                FROM students s
+                LEFT JOIN LATERAL (
+                    SELECT cl.grade_name, h.performed_at AS graduated_at
+                    FROM class_promotion_history_students hs
+                    JOIN class_promotion_history h ON h.id = hs.history_id AND h.reverted_at IS NULL
+                    LEFT JOIN classes cl ON cl.id = hs.old_class_id
+                    WHERE hs.student_id = s.id AND hs.new_status = 'GRADUATED'
+                    ORDER BY h.performed_at DESC LIMIT 1
+                ) lc ON TRUE
+                WHERE s.school_id = %s AND s.status = 'GRADUATED'
+                ORDER BY s.admission_number ASC;
+            """, (term, year, term, year, school_id))
+            grads = cur.fetchall()
+            cur.execute("""
+                SELECT DISTINCT term, year FROM fee_payments WHERE school_id = %s
+                UNION SELECT DISTINCT term, year FROM fee_structures WHERE school_id = %s
+                UNION SELECT %s, %s ORDER BY year DESC, term DESC;
+            """, (school_id, school_id, active_term, active_year))
+            periods = cur.fetchall()
+
+    for g in grads:
+        g['balance'] = float(g['opening']) - float(g['paid'])
+    grads.sort(key=lambda g: (-g['balance'], g['admission_number'] or ""))
+    total_owed = sum(g['balance'] for g in grads if g['balance'] > 0)
+    owing_count = sum(1 for g in grads if g['balance'] > 0)
+
+    period_options = "".join(
+        f'<option value="{esc(p["term"])}|{p["year"]}" {"selected" if (p["term"], p["year"]) == (term, int(year)) else ""}>{esc(p["term"])} {p["year"]}</option>'
+        for p in periods)
+    rows = "".join(f"""
+        <tr class="grad-row border-b text-xs" data-search="{esc((full_student_name(g) + ' ' + str(g['admission_number'] or '')).lower())}">
+            <td class="p-2 font-mono">{esc(g['admission_number'] or '')}</td>
+            <td class="p-2 font-semibold text-slate-700">{esc(full_student_name(g))}</td>
+            <td class="p-2 text-slate-500">{esc(g['last_grade'] or '—')}</td>
+            <td class="p-2 text-slate-500 whitespace-nowrap">{g['graduated_at'].strftime('%d %b %Y') if g['graduated_at'] else '—'}</td>
+            <td class="p-2 text-right font-bold {'text-rose-700' if g['balance'] > 0.005 else ('text-emerald-700' if g['balance'] < -0.005 else 'text-slate-400')}">KES {g['balance']:,.0f}</td>
+            <td class="p-2"><a href="/finance/student/{school_id}/{g['id']}?term={urllib.parse.quote(term)}&year={year}" class="text-indigo-700 font-bold hover:underline">Open →</a></td>
+        </tr>""" for g in grads) or "<tr><td colspan='6' class='p-6 text-center text-slate-400 text-xs'>No graduated learners yet.</td></tr>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Graduates' Finance</title><script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script></head>
+    <body class="bg-[#F7F9F8] min-h-screen p-4 sm:p-8">
+        <div class="max-w-4xl mx-auto space-y-4">
+            <a href="/finance/dashboard/{school_id}" class="text-slate-500 hover:text-slate-700 text-xs font-bold inline-block">← Back to Finance</a>
+            <div class="bg-white p-6 rounded-2xl border shadow-xs space-y-4">
+                <div>
+                    <h1 class="text-lg font-black text-slate-800">🎓 Graduates' Finance</h1>
+                    <p class="text-xs text-slate-400 mt-1">Graduated learners keep their full fee history. Balances below are for the selected term; open a learner to see their statement, record a payment or view receipts.</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-2">
+                    <select onchange="var p=this.value.split('|'); location.href='/finance/graduates/{school_id}?term='+encodeURIComponent(p[0])+'&year='+p[1];" class="p-2 border rounded-lg text-xs bg-white">{period_options}</select>
+                    <input type="text" id="gradSearch" oninput="var q=this.value.toLowerCase(); document.querySelectorAll('.grad-row').forEach(function(r){{r.style.display = r.getAttribute('data-search').indexOf(q) > -1 ? '' : 'none';}});" placeholder="Search name or admission no…" class="flex-1 min-w-[180px] p-2 border rounded-lg text-xs">
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="bg-rose-50 rounded-xl p-3 text-center"><div class="text-[10px] font-bold text-rose-700 uppercase">Owing ({esc(term)} {year})</div><div class="text-xl font-black">KES {total_owed:,.0f}</div></div>
+                    <div class="bg-slate-50 rounded-xl p-3 text-center"><div class="text-[10px] font-bold text-slate-500 uppercase">Graduates / owing</div><div class="text-xl font-black">{len(grads):,} / {owing_count:,}</div></div>
+                </div>
+                <div class="overflow-x-auto"><table class="w-full min-w-[640px] text-left">
+                    <thead><tr class="border-b-2 text-[11px] uppercase text-slate-400"><th class="p-2">Adm No.</th><th class="p-2">Name</th><th class="p-2">Last class</th><th class="p-2">Graduated</th><th class="p-2 text-right">Balance</th><th class="p-2"></th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table></div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
 
 
 @router.get("/finance/expenditures/{school_id}", response_class=HTMLResponse)
@@ -1310,13 +1486,13 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
             term = term or active_term
             year = year or active_year
 
-            cur.execute("""
-                SELECT s.*, c.grade_name FROM students s JOIN classes c ON s.class_id = c.id
-                WHERE s.id = %s AND s.school_id = %s;
-            """, (student_id, school_id))
-            student = cur.fetchone()
+            student = _get_student_with_grade(cur, school_id, student_id)
             if not student:
                 raise HTTPException(status_code=404, detail="Student not found.")
+            # The grade this learner was in DURING the selected term (not
+            # necessarily their grade today), and whether that term is billed.
+            period_grade, period_billable = _resolve_grade_for_period(
+                cur, school_id, student_id, student['grade_name'], student['is_graduated'], term, year)
 
             cur.execute("SELECT * FROM fee_categories WHERE school_id = %s ORDER BY is_default DESC, name ASC;", (school_id,))
             categories = cur.fetchall()
@@ -1324,7 +1500,7 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
             cur.execute("""
                 SELECT fee_category_id, amount FROM fee_structures
                 WHERE school_id = %s AND grade_name = %s AND term = %s AND year = %s;
-            """, (school_id, student['grade_name'], term, year))
+            """, (school_id, period_grade, term, year))
             fee_by_category = {r['fee_category_id']: float(r['amount']) for r in cur.fetchall()}
 
             cur.execute("""
@@ -1364,6 +1540,12 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
             """, (school_id, student_id))
             available_periods = cur.fetchall()
 
+    if student['is_graduated']:
+        class_label = f"🎓 Graduated (last class: {student['grade_name'] or '—'})"
+    else:
+        class_label = student['grade_name'] or '—'
+    if period_billable and period_grade and period_grade != student['grade_name']:
+        class_label += f" — in {term} {year}: {period_grade}"
     total_fee = sum(fee_by_category.values())
     total_opening = sum(v['amount'] for v in opening_by_category.values())
     total_paid = sum(paid_by_category.values())
@@ -1421,7 +1603,7 @@ def student_fee_statement(school_id: int, student_id: int, request: Request, ter
                 <div class="flex items-center justify-between gap-3 flex-wrap">
                     <div>
                         <h2 class="text-lg font-black text-slate-800">{esc(full_student_name(student))}</h2>
-                        <p class="text-xs text-slate-400">#{esc(student['admission_number'])} — {esc(student['grade_name'])}</p>
+                        <p class="text-xs text-slate-400">#{esc(student['admission_number'])} — {esc(class_label)}</p>
                     </div>
                     <form method="get" class="flex items-center gap-2">
                         <label class="text-xs font-bold text-slate-500">Viewing period:</label>
@@ -1522,11 +1704,13 @@ def add_fee_payment(
 
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT c.grade_name FROM students s JOIN classes c ON s.class_id = c.id WHERE s.id = %s AND s.school_id = %s;", (student_id, school_id))
-            student_row = cur.fetchone()
+            student_row = _get_student_with_grade(cur, school_id, student_id)
             if not student_row:
                 raise HTTPException(status_code=404, detail="Student not found.")
-            grade_name = student_row[0]
+            # Graduates can still pay off what they owe; their fee for any
+            # term is looked up at the grade they were in during that term.
+            grade_name, _billable = _resolve_grade_for_period(
+                cur, school_id, student_id, student_row['grade_name'], student_row['is_graduated'], term, year)
 
             category_id = fee_category_id or _ensure_default_category(cur, school_id)
             recorded_by = request.cookies.get("session_user_id")
@@ -1659,10 +1843,11 @@ def view_receipt(school_id: int, payment_id: int, request: Request):
 
             cur.execute("""
                 SELECT fp.*, fc.name AS category_name, s.first_name, s.middle_name, s.last_name, s.admission_number, c.grade_name,
+                       (s.status = 'GRADUATED') AS student_graduated,
                        u.full_name AS recorded_by_name
                 FROM fee_payments fp
                 JOIN students s ON fp.student_id = s.id
-                JOIN classes c ON s.class_id = c.id
+                LEFT JOIN classes c ON s.class_id = c.id
                 LEFT JOIN fee_categories fc ON fp.fee_category_id = fc.id
                 LEFT JOIN users u ON fp.recorded_by_user_id = u.id
                 WHERE fp.id = %s AND fp.school_id = %s;
@@ -1670,6 +1855,15 @@ def view_receipt(school_id: int, payment_id: int, request: Request):
             payment = cur.fetchone()
             if not payment:
                 raise HTTPException(status_code=404, detail="Receipt not found.")
+
+            # Show (and, for old receipts, price) this payment at the grade
+            # the learner was in when the payment's term was current — the
+            # receipt must not change just because they were promoted or
+            # graduated afterwards.
+            _grade_then, _ = _resolve_grade_for_period(
+                cur, school_id, payment['student_id'], payment['grade_name'], bool(payment['student_graduated']),
+                payment['term'], payment['year'])
+            payment['grade_name'] = _grade_then or ('Graduated' if payment['student_graduated'] else (payment['grade_name'] or '—'))
 
             # Balance remaining AFTER this payment, for this category/term.
             # ALWAYS prefer the frozen snapshot taken at the moment this
